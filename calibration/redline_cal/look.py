@@ -105,24 +105,42 @@ def _trilinear_weights(rgb: np.ndarray, n: int) -> sparse.csr_matrix:
     return sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(len(rgb), n**3))
 
 
-def fit_residual_lut(base: np.ndarray, target: np.ndarray, n: int = 33, smooth: float = 2.0, prior: float = 1e-3) -> np.ndarray:
-    """Solve min |W D - (t - b_id)|^2 + smooth*|Lap D|^2 + prior*|D|^2 for D = LUT - identity."""
+def fit_residual_lut(
+    base: np.ndarray, target: np.ndarray, n: int = 33, smooth: float = 2.0, prior: float = 1e-3, robust_iters: int = 0,
+) -> np.ndarray:
+    """Solve min |W D - (t - b_id)|^2 + smooth*|Lap D|^2 + prior*|D|^2 for D = LUT - identity.
+
+    With ``robust_iters`` the data term is re-weighted (Huber, IRLS) so samples whose
+    error comes from scene-specific tone, not the look, stop dragging the LUT off.
+    """
     ident = identity_lut(n).reshape(-1, 3)
     W = _trilinear_weights(base, n)
     resid = target - W @ ident
     Lp = _laplacian_3d(n)
     scale = max(1.0, len(base) / n**3)  # keep regularization strength independent of sample count
-    A = (W.T @ W + smooth * scale * (Lp.T @ Lp) + prior * scale * sparse.identity(n**3)).tocsr()
+    reg = smooth * scale * (Lp.T @ Lp) + prior * scale * sparse.identity(n**3)
+    w = np.ones(len(base))
     D = np.zeros((n**3, 3))
-    for c in range(3):
-        D[:, c], _ = cg(A, W.T @ resid[:, c], rtol=1e-8, maxiter=2000)
+    for it in range(robust_iters + 1):
+        Ww = sparse.diags(w) @ W
+        A = (W.T @ Ww + reg).tocsr()
+        for c in range(3):
+            D[:, c], _ = cg(A, Ww.T @ resid[:, c], x0=D[:, c], rtol=1e-8, maxiter=2000)
+        if it < robust_iters:
+            e = np.linalg.norm(W @ D - resid, axis=1)
+            k = 1.5 * 1.4826 * np.median(e) + 1e-6
+            w = np.minimum(1.0, k / np.maximum(e, 1e-12))
     return np.clip(ident + D, 0.0, 1.0).reshape(n, n, n, 3)
 
 
-def fit_look(xyz: np.ndarray, target_enc: np.ndarray, n: int = 33, smooth: float = 2.0) -> Look:
+ROBUST_ITERS = 0  # set by the CLI's --robust
+
+
+def fit_look(xyz: np.ndarray, target_enc: np.ndarray, n: int = 33, smooth: float = 2.0, robust_iters: int | None = None) -> Look:
     tone = fit_tone(xyz, target_enc)
     look = Look(tone=tone, lut=identity_lut(n))
-    look.lut = fit_residual_lut(look.base(xyz), target_enc, n=n, smooth=smooth)
+    ri = ROBUST_ITERS if robust_iters is None else robust_iters
+    look.lut = fit_residual_lut(look.base(xyz), target_enc, n=n, smooth=smooth, robust_iters=ri)
     return look
 
 
@@ -244,21 +262,47 @@ def fit_look_aligned(
 
 
 def evaluate(look: Look, xyz: np.ndarray, target_enc: np.ndarray) -> dict:
+    """Hold-out metrics, with colour and lightness scored separately.
+
+    ``color_*`` is CIEDE2000 with the prediction's L* replaced by the target's, i.e. the
+    hue/chroma error alone. Lightness is scored by the median |dL*|, because the camera
+    JPEG's per-scene tone adjustments make the lightness tail a property of the scene, not
+    of the global look.
+    """
     lab_t = srgb_encoded_to_lab(target_enc)
-    de = delta_e2000(srgb_encoded_to_lab(look.render(xyz)), lab_t)
+    lab_p = srgb_encoded_to_lab(look.render(xyz))
+    de = delta_e2000(lab_p, lab_t)
+    lab_c = lab_p.copy()
+    lab_c[:, 0] = lab_t[:, 0]
+    dc = delta_e2000(lab_c, lab_t)
+    dl = np.abs(lab_p[:, 0] - lab_t[:, 0])
     sk = skin_mask(lab_t)
     return {
         "n": int(len(de)),
         "mean_de2000": float(de.mean()),
         "median_de2000": float(np.median(de)),
         "p95_de2000": float(np.percentile(de, 95)),
+        "color_mean_de2000": float(dc.mean()),
+        "median_abs_dL": float(np.median(dl)),
+        "mean_abs_dL": float(dl.mean()),
         "skin_n": int(sk.sum()),
         "skin_mean_de2000": float(de[sk].mean()) if sk.any() else None,
+        "skin_color_mean_de2000": float(dc[sk].mean()) if sk.any() else None,
     }
 
 
-def passes_gate(report: dict, mean_max: float = 2.5, skin_max: float = 2.0) -> bool:
-    return report["mean_de2000"] < mean_max and (report["skin_mean_de2000"] is None or report["skin_mean_de2000"] < skin_max)
+GATE = {"color_mean": 2.5, "skin_color_mean": 2.0, "median_de": 2.0, "median_abs_dL": 2.0}
+
+
+def passes_gate(report: dict, gate: dict = GATE) -> bool:
+    """B03 gate (v2, 2026-10-28): colour mean < 2.5, skin colour < 2.0, median dE and median |dL*| < 2.0."""
+    skin = report.get("skin_color_mean_de2000")
+    return (
+        report["color_mean_de2000"] < gate["color_mean"]
+        and (skin is None or skin < gate["skin_color_mean"])
+        and report["median_de2000"] < gate["median_de"]
+        and report["median_abs_dL"] < gate["median_abs_dL"]
+    )
 
 
 def save(look: Look, out_dir: str, title: str = "Redline Standard") -> None:

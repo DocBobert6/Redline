@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fit and score up to one exposure offset per image (absorbs Auto Lighting Optimizer / metering)",
     )
+    ap.add_argument("--robust", type=int, default=0, metavar="N", help="IRLS (Huber) re-weighting passes for the residual LUT")
     ap.add_argument(
         "--devignette",
         action="store_true",
@@ -64,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         recs = [r for r in recs if r["target_lens"]]
     if a.no_alo:
         recs = [r for r in recs if r["shot"].get("auto_lighting_optimizer") == "Off"]
+    from . import look as look_mod
+
+    look_mod.ROBUST_ITERS = a.robust
     cache = os.path.join(a.out, "cache")
     data = {"train": [], "holdout": []}
     for r in recs:
@@ -96,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         "train": evaluate(look, xt, yt),
         "holdout": evaluate(look, xh, yh),
         "holdout_per_image": {i: round(evaluate(look, x, y)["mean_de2000"], 3) for i, x, y, _ in data["holdout"] if len(x)},
-        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo, "align_exposure": a.align_exposure, "devignette": a.devignette},
+        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo, "align_exposure": a.align_exposure, "devignette": a.devignette, "robust": a.robust},
         "gains": {i: [round(g.ev, 3), round(g.k1, 3), round(g.k2, 3)] for i, g in gains.items()},
     }
     report["gate_pass"] = passes_gate(report["holdout"])
