@@ -10,6 +10,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
 import java.io.File
+import kotlin.math.abs
 
 /**
  * Builds the full [DeviceProfile] from CameraCharacteristics and MediaCodecList (PLAN 4.1).
@@ -77,7 +78,7 @@ class DeviceProfileProbe(private val context: Context) {
                 else -> HardwareLevel.UNKNOWN
             },
             capabilities = CameraNames.names(capInts, CameraNames.CAPABILITIES),
-            lenses = lensSources.map { (lid, lch) -> lens(lid, lch) },
+            lenses = lensSources.map { (lid, lch) -> lens(lid, lch, ch) },
             isoRange = iso?.let { it.lower to it.upper },
             exposureRangeNs = exposure?.let { it.lower to it.upper },
             maxFrameDurationNs = safe { ch.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION) },
@@ -107,19 +108,31 @@ class DeviceProfileProbe(private val context: Context) {
         )
     }
 
+    /**
+     * Physical cameras may omit the focus range. Borrow the logical camera's value only for the
+     * physical lens whose focal length the logical camera also reports; otherwise leave it unknown.
+     */
+    private fun minFocus(ch: CameraCharacteristics, logical: CameraCharacteristics, focals: List<Float>): Float? {
+        safe { ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) }?.let { return it }
+        val logicalFocals = safe { logical.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList() }.orEmpty()
+        val sameLens = focals.any { f -> logicalFocals.any { abs(it - f) < 0.01f } }
+        return if (sameLens) safe { logical.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) } else null
+    }
+
     private fun ints(ch: CameraCharacteristics, key: CameraCharacteristics.Key<IntArray>): List<Int> =
         safe { ch.get(key)?.toList() }.orEmpty()
 
     private fun fpsRanges(ch: CameraCharacteristics): List<Pair<Int, Int>> =
         safe { ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.map { it.lower to it.upper } }.orEmpty()
 
-    private fun lens(id: String, ch: CameraCharacteristics): LensProfile {
+    private fun lens(id: String, ch: CameraCharacteristics, logical: CameraCharacteristics): LensProfile {
+        val focals = safe { ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList() }.orEmpty()
         val size = safe { ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) }
         val pixels = safe { ch.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) }
         val active = safe { ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) }
         return LensProfile(
             cameraId = id,
-            focalLengthsMm = safe { ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList() }.orEmpty(),
+            focalLengthsMm = focals,
             apertures = safe { ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.toList() }.orEmpty(),
             sensorWidthMm = size?.width ?: 0f,
             sensorHeightMm = size?.height ?: 0f,
@@ -127,7 +140,7 @@ class DeviceProfileProbe(private val context: Context) {
             pixelArrayHeight = pixels?.height ?: 0,
             activeWidth = active?.width() ?: (pixels?.width ?: 0),
             activeHeight = active?.height() ?: (pixels?.height ?: 0),
-            minFocusDistanceDiopters = safe { ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) },
+            minFocusDistanceDiopters = minFocus(ch, logical, focals),
             hasOis = safe { ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.contains(1) } == true,
             hasDistortionModel = safe { ch.get(CameraCharacteristics.LENS_DISTORTION) } != null
         )
