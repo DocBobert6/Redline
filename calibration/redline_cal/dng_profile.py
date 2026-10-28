@@ -451,7 +451,7 @@ def color_from_dng_tags(tags: dict[str, Any]) -> ColorCalibration:
 
 def color_from_camera2(d: dict[str, Any]) -> ColorCalibration:
     """Build from the app's Camera2 export (keys = CameraCharacteristics names)."""
-    if "SENSOR_COLOR_TRANSFORM1" not in d:
+    if d.get("SENSOR_COLOR_TRANSFORM1") is None or d.get("SENSOR_REFERENCE_ILLUMINANT1") is None:
         raise ProfileError("camera reports no SENSOR_COLOR_TRANSFORM1 (no RAW calibration)")
     has2 = d.get("SENSOR_COLOR_TRANSFORM2") is not None
     cal = ColorCalibration(

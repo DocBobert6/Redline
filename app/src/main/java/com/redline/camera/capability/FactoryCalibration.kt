@@ -10,6 +10,8 @@ import android.hardware.camera2.params.ColorSpaceTransform
  */
 data class FactoryCalibration(
     val cameraId: String,
+    /** Camera whose characteristics supplied these values: the logical id, or a physical id behind it. */
+    val sourceCameraId: String = cameraId,
     val referenceIlluminant1: Int?,
     val referenceIlluminant2: Int?,
     val colorTransform1: List<Double>?,
@@ -30,6 +32,7 @@ data class FactoryCalibration(
     fun toJson(): String {
         val fields = linkedMapOf<String, Any?>(
             "camera_id" to cameraId,
+            "source_camera_id" to sourceCameraId,
             "SENSOR_REFERENCE_ILLUMINANT1" to referenceIlluminant1,
             "SENSOR_REFERENCE_ILLUMINANT2" to referenceIlluminant2,
             "SENSOR_COLOR_TRANSFORM1" to colorTransform1,
@@ -63,23 +66,34 @@ data class FactoryCalibration(
             (0 until 3).flatMap { row -> (0 until 3).map { col -> m.getElement(col, row).toDouble() } }
         }
 
-        fun read(cameraId: String, ch: CameraCharacteristics): FactoryCalibration {
-            val pattern = ch.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+        /** One key at a time, so a single vendor quirk can't hide the rest. */
+        private fun <T> safe(block: () -> T?): T? = runCatching(block).getOrNull()
+
+        fun read(cameraId: String, ch: CameraCharacteristics, sourceCameraId: String = cameraId): FactoryCalibration {
+            val pattern = safe { ch.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN) }
             return FactoryCalibration(
                 cameraId = cameraId,
-                referenceIlluminant1 = ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1),
-                referenceIlluminant2 = ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt(),
-                colorTransform1 = rowMajor(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)),
-                colorTransform2 = rowMajor(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)),
-                forwardMatrix1 = rowMajor(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1)),
-                forwardMatrix2 = rowMajor(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2)),
-                calibrationTransform1 = rowMajor(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)),
-                calibrationTransform2 = rowMajor(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2)),
-                lensDistortion = ch.get(CameraCharacteristics.LENS_DISTORTION)?.toList(),
-                lensIntrinsicCalibration = ch.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)?.toList(),
-                whiteLevel = ch.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL),
-                blackLevelPattern = pattern?.let { p -> (0 until 4).map { i -> p.getOffsetForIndex(i % 2, i / 2) } }
+                sourceCameraId = sourceCameraId,
+                referenceIlluminant1 = safe { ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) },
+                referenceIlluminant2 = safe { ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt() },
+                colorTransform1 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)) },
+                colorTransform2 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)) },
+                forwardMatrix1 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1)) },
+                forwardMatrix2 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2)) },
+                calibrationTransform1 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)) },
+                calibrationTransform2 = safe { rowMajor(ch.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2)) },
+                lensDistortion = safe { ch.get(CameraCharacteristics.LENS_DISTORTION)?.toList() },
+                lensIntrinsicCalibration = safe { ch.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)?.toList() },
+                whiteLevel = safe { ch.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) },
+                blackLevelPattern = safe { pattern?.let { p -> (0 until 4).map { i -> p.getOffsetForIndex(i % 2, i / 2) } } }
             )
         }
+
+        /**
+         * Logical multi-cameras often leave sensor calibration to their physical cameras.
+         * Use the logical camera's own values when it has them, else the first physical camera that does.
+         */
+        fun pick(candidates: List<FactoryCalibration>): FactoryCalibration? =
+            candidates.firstOrNull { it.hasColorCalibration } ?: candidates.firstOrNull()
     }
 }

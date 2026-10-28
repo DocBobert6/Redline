@@ -45,4 +45,13 @@ class CalibrationExportTest {
         assertEquals("null", FactoryCalibration.jsonValue(Double.NaN))
         assertEquals("[1, null]", FactoryCalibration.jsonValue(listOf(1, null)))
     }
+
+    @Test
+    fun pickPrefersCandidateWithColorCalibration() {
+        val logical = cal(cm1 = null)
+        val physical = cal().copy(sourceCameraId = "2")
+        assertEquals("2", FactoryCalibration.pick(listOf(logical, physical))?.sourceCameraId)
+        assertEquals("0", FactoryCalibration.pick(listOf(logical))?.cameraId)
+        assertTrue(physical.toJson().contains("\"source_camera_id\": \"2\""))
+    }
 }
