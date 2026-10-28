@@ -67,3 +67,37 @@ The Adobe DCP cross-check (PLAN 9.2) stays a local, internal step and is not par
 python -m pytest calibration -q
 REDLINE_CAL_SAMPLE_CR3=/path/to/RAW.CR3 python -m pytest calibration -q   # adds real-file exiftool + decode checks
 ```
+
+## B04: phone profiles from factory calibration (no chart)
+
+Every RAW-capable phone stores per-unit factory calibration, and writes the same values into its DNGs. B04 reads them; nothing has to be bought.
+
+1. In Pixel Camera (or any camera app that saves DNG), turn on RAW + JPEG and shoot at 1x: a plain white wall in even light (the flat field), plus a few everyday scenes under daylight and a warm lamp.
+2. In Redline, open the probe screen and tap **Share calibration** on the camera you shot with; save the JSON next to the DNGs.
+3. Run:
+
+```bash
+cd calibration
+python -m redline_cal.profile_device data/phone/*.dng \
+    --camera2 data/phone/redline_camera2_0.json --flat data/phone/wall.dng \
+    --profile-id baseline --out out/device_baseline.json --gate
+```
+
+| Check (B04 gate) | Limit |
+| --- | --- |
+| Camera2 export matrices vs the phone's DNG tags | identical (1e-3, rational rounding) |
+| Calibration constant across all DNGs | identical |
+| Camera neutral -> D50 white (forward-matrix path) | < 1 dE |
+| Forward- vs colour-matrix path agreement | warning above 3 dE |
+| Flat field: residual corner falloff after the phone's gain maps | within 0.5 EV |
+
+Modules: `dng_profile.py` (DNG 1.6 camera->XYZ with two-illuminant interpolation, noise profile + Poisson-Gaussian model, GainMap/WarpRectilinear opcode parsing, device profile JSON), `flatfield.py`, `lensfun_import.py` (ptlens distortion + pa vignetting, interpolated by focal length and aperture stop), `profile_device.py` (the gate).
+
+Notes: phones that merge bursts (HDR+) write a NoiseProfile for the merged frame, so the fitted noise model describes the delivered DNG, not a single readout. A third DNG 1.6 illuminant (custom IlluminantData3) is ignored for now; two-illuminant interpolation is used. Device profile JSON describes one specific phone and stays out of git, as do the source DNGs.
+
+Lens profile:
+
+```bash
+python -m redline_cal.lensfun_import data/lensfun/mil-canon.xml \
+    --model "Canon RF 24-70mm F2.8L IS USM" --out out/lens_rf24-70.json
+```
