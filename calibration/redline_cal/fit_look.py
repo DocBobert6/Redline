@@ -16,7 +16,7 @@ import sys
 
 import numpy as np
 
-from .look import evaluate, fit_look, passes_gate, save
+from .look import best_exposure, evaluate, fit_look, fit_look_aligned, passes_gate, save
 from .manifest import read_jsonl
 from .samples import load_jpeg, sample_pair
 
@@ -42,10 +42,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--smooth", type=float, default=2.0)
     ap.add_argument("--target-lens-only", action="store_true")
     ap.add_argument("--no-alo", action="store_true", help="exclude pairs shot with Auto Lighting Optimizer on")
+    ap.add_argument(
+        "--align-exposure",
+        action="store_true",
+        help="fit and score up to one exposure offset per image (absorbs Auto Lighting Optimizer / metering)",
+    )
+    ap.add_argument("--exclude", nargs="*", default=[], help="manifest ids to leave out (e.g. edited JPEGs)")
     ap.add_argument("--gate", action="store_true", help="exit 1 unless hold-out mean dE2000 < 2.5 and skin < 2.0")
     a = ap.parse_args(argv)
 
-    recs = [r for r in read_jsonl(a.manifest) if r["usable"]]
+    recs = [r for r in read_jsonl(a.manifest) if r["usable"] and r["id"] not in set(a.exclude)]
     if a.target_lens_only:
         recs = [r for r in recs if r["target_lens"]]
     if a.no_alo:
@@ -58,9 +64,20 @@ def main(argv: list[str] | None = None) -> int:
         print("need usable pairs in both train and holdout splits", file=sys.stderr)
         return 2
 
+    exposure: dict[str, float] = {}
+    if a.align_exposure:
+        look, ev = fit_look_aligned([(d[1], d[2]) for d in data["train"]], n=a.lut_size, smooth=a.smooth)
+        exposure = {d[0]: e for d, e in zip(data["train"], ev)}
+        for d in data["holdout"]:
+            exposure[d[0]] = best_exposure(look, d[1], d[2])
+        data = {k: [(i, x * 2.0 ** exposure[i], y) for i, x, y in v] for k, v in data.items()}
+    else:
+        look = fit_look(
+            np.concatenate([d[1] for d in data["train"]]), np.concatenate([d[2] for d in data["train"]]),
+            n=a.lut_size, smooth=a.smooth,
+        )
     xt = np.concatenate([d[1] for d in data["train"]])
     yt = np.concatenate([d[2] for d in data["train"]])
-    look = fit_look(xt, yt, n=a.lut_size, smooth=a.smooth)
     xh = np.concatenate([d[1] for d in data["holdout"]])
     yh = np.concatenate([d[2] for d in data["holdout"]])
     report = {
@@ -68,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         "train": evaluate(look, xt, yt),
         "holdout": evaluate(look, xh, yh),
         "holdout_per_image": {i: round(evaluate(look, x, y)["mean_de2000"], 3) for i, x, y in data["holdout"] if len(x)},
-        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo},
+        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo, "align_exposure": a.align_exposure},
+        "exposure_ev": {i: round(e, 3) for i, e in exposure.items()},
     }
     report["gate_pass"] = passes_gate(report["holdout"])
     save(look, a.out)

@@ -115,3 +115,16 @@ def test_sample_pair_aligns_and_filters():
 def test_center_crop_to_aspect():
     assert center_crop_to_aspect(np.zeros((100, 300, 3)), 1.5).shape[:2] == (100, 150)
     assert center_crop_to_aspect(np.zeros((300, 300, 3)), 1.5).shape[:2] == (200, 300)
+
+
+def test_exposure_alignment_recovers_offset():
+    from redline_cal.look import best_exposure, fit_look_aligned
+
+    rng = np.random.default_rng(3)
+    imgs = []
+    for ev in (-0.5, 0.0, 0.5):
+        xyz = rng.uniform(0.02, 0.6, (400, 3))
+        imgs.append((xyz * 2.0**ev, srgb_encode(np.clip(xyz @ XYZ_TO_SRGB.T, 0, 1))))
+    look, evs = fit_look_aligned(imgs, n=9)
+    assert np.allclose(evs, [0.5, 0.0, -0.5], atol=0.11)
+    assert abs(best_exposure(look, imgs[0][0] * 2.0, imgs[0][1]) - (-0.5)) < 0.11

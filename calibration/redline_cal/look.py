@@ -126,6 +126,39 @@ def fit_look(xyz: np.ndarray, target_enc: np.ndarray, n: int = 33, smooth: float
     return look
 
 
+EXPOSURE_GRID = np.linspace(-1.0, 1.0, 41)
+
+
+def best_exposure(look: Look, xyz: np.ndarray, target_enc: np.ndarray, grid: np.ndarray = EXPOSURE_GRID) -> float:
+    """Per-image exposure offset (EV) that best matches the target's lightness.
+
+    The camera's Auto Lighting Optimizer and metering choose a per-scene brightness the
+    phone's own auto-exposure will never reproduce, so the look is judged up to one global
+    exposure number per image. Median |dL*| keeps local-tone outliers from dominating.
+    """
+    if len(xyz) == 0:
+        return 0.0
+    lt = srgb_encoded_to_lab(target_enc)[:, 0]
+    errs = [np.median(np.abs(srgb_encoded_to_lab(look.render(xyz * 2.0**g))[:, 0] - lt)) for g in grid]
+    return float(grid[int(np.argmin(errs))])
+
+
+def fit_look_aligned(
+    images: list[tuple[np.ndarray, np.ndarray]], n: int = 33, smooth: float = 2.0, iters: int = 3
+) -> tuple[Look, list[float]]:
+    """Alternate between fitting the look and each training image's exposure offset."""
+    ev = [0.0] * len(images)
+    look = None
+    for _ in range(iters):
+        x = np.concatenate([a * 2.0**e for (a, _), e in zip(images, ev)])
+        y = np.concatenate([b for _, b in images])
+        look = fit_look(x, y, n=n, smooth=smooth)
+        ev = [best_exposure(look, a, b) for a, b in images]
+        m = float(np.mean(ev))  # keep the curve anchored to the camera's average metering
+        ev = [e - m for e in ev]
+    return look, ev
+
+
 def evaluate(look: Look, xyz: np.ndarray, target_enc: np.ndarray) -> dict:
     lab_t = srgb_encoded_to_lab(target_enc)
     de = delta_e2000(srgb_encoded_to_lab(look.render(xyz)), lab_t)
