@@ -46,6 +46,21 @@ The tool scans recursively, pairs each RAW with its JPEG (same folder and stem, 
 
 `redline_cal.raw.decode_linear_xyz()` demosaics a RAW to linear CIE XYZ for the B03 fitter.
 
+## B03: Standard look fit
+
+```bash
+cd calibration
+python -m redline_cal.fit_look out/manifest.jsonl --out out/look --gate
+```
+
+Model (exactly what the app's shader runs): white-balanced scene XYZ (D65) -> linear sRGB -> per-channel tone curve on a log2 grid (257 points, EV -14 to +3) -> 33^3 residual LUT -> sRGB. The tone curve is the robust median of JPEG luminance per exposure bin, made monotone. The residual LUT is a smoothness-regularized least-squares fit pulled towards identity, so colors the dataset never shows fall back to the tone curve instead of extrapolating.
+
+Pairs are sampled as flat, unclipped blocks from the central 80% of the frame (tolerant of the JPEG's crop margins and in-camera vignetting correction). Samples are cached per pair under `out/look/cache/`. The fit uses the manifest's `train` split; `report.json` gives hold-out mean / median / p95 dE2000, skin dE2000 (broad CIELAB skin region), and per-image hold-out error. `--gate` exits non-zero unless hold-out mean dE2000 < 2.5 and skin < 2.0. Options: `--target-lens-only`, `--no-alo`, `--lut-size`, `--smooth`.
+
+Outputs: `standard_look.json` (tone curve + model) and `standard_residual.cube`. CI checks the fitter on a synthetic camera model (hold-out mean dE2000 about 0.34); the real gate runs on downloaded pairs.
+
+The Adobe DCP cross-check (PLAN 9.2) stays a local, internal step and is not part of this repo.
+
 ## Tests
 
 ```bash
