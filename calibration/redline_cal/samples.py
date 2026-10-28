@@ -29,12 +29,16 @@ def sample_pair(
     center: float = 0.8,
     max_std: float = 0.03,
     raw_scale: float | None = 0.5,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_radius: bool = False,
+):
     """Block-average both images on a common grid and keep flat, unclipped blocks.
 
     Flat blocks make the pairing tolerant of the small geometric differences between
     the RAW development and the camera JPEG (crop margins, residual lens correction);
     the central region avoids the corners where in-camera vignetting correction acts.
+    With ``return_radius`` a third array gives each block's distance from the optical
+    centre, normalised to the half-diagonal of the full frame (0 centre, 1 corner), so
+    the fitter can model the camera's peripheral-illumination correction.
     """
     # LibRaw's developed frame carries a few extra border pixels compared with the camera JPEG
     # (R5 II half-size: 4111x2744 vs JPEG 8192x5464 / 2). raw_scale = RAW px per JPEG px.
@@ -57,7 +61,15 @@ def sample_pair(
     flat = (sj.reshape(-1, 3).max(axis=1) < max_std) & (rel.max(axis=1) < 0.15)
     unclipped = (mj.max(axis=1) < 0.98) & (mj.min(axis=1) > 0.02) & (mx.min(axis=1) > 0)
     keep = flat & unclipped
-    return mx[keep], mj[keep]
+    if not return_radius:
+        return mx[keep], mj[keep]
+    gh, gw = grid
+    yy, xx = np.mgrid[0:gh, 0:gw]
+    # block centres in full-frame coordinates (the sampled window is the central `center` fraction)
+    fy = (1 - center) / 2 + center * (yy + 0.5) / gh - 0.5
+    fx = ((1 - center) / 2 + center * (xx + 0.5) / gw - 0.5) * (jpeg_enc.shape[1] / jpeg_enc.shape[0])
+    rad = np.hypot(fy, fx) / np.hypot(0.5, 0.5 * jpeg_enc.shape[1] / jpeg_enc.shape[0])
+    return mx[keep], mj[keep], rad.reshape(-1)[keep]
 
 
 def load_jpeg(path: str) -> np.ndarray:

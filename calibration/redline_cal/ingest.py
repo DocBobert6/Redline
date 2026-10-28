@@ -63,8 +63,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="out/manifest.jsonl")
     ap.add_argument("--exiftool", default=None)
     ap.add_argument("--strict-alo", action="store_true", help="accept only Auto Lighting Optimizer Off")
+    ap.add_argument(
+        "--allow-dlo",
+        action="store_true",
+        help="accept Digital Lens Optimizer On/Standard (detail-domain only; flat-block colour sampling is robust to it)",
+    )
     a = ap.parse_args(argv)
-    policy = StandardPolicy(alo_allowed=frozenset({"Off"})) if a.strict_alo else StandardPolicy()
+    policy = StandardPolicy(
+        alo_allowed=frozenset({"Off"}) if a.strict_alo else StandardPolicy.alo_allowed,
+        require_dlo_off=not a.allow_dlo,
+    )
     records, summary = build(a.root, a.exiftool, policy)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     write_jsonl(a.out, records)

@@ -87,9 +87,12 @@ def test_unseen_colors_fall_back_smoothly():
 
 
 def test_gate_logic():
-    assert passes_gate({"mean_de2000": 2.4, "skin_mean_de2000": 1.9})
-    assert not passes_gate({"mean_de2000": 2.4, "skin_mean_de2000": 2.1})
-    assert not passes_gate({"mean_de2000": 2.6, "skin_mean_de2000": None})
+    ok = {"color_mean_de2000": 2.4, "skin_color_mean_de2000": 2.4, "median_de2000": 1.9, "median_abs_dL": 1.9}
+    assert passes_gate(ok)
+    assert not passes_gate({**ok, "skin_color_mean_de2000": 2.6})
+    assert not passes_gate({**ok, "color_mean_de2000": 2.6, "skin_color_mean_de2000": None})
+    assert not passes_gate({**ok, "median_abs_dL": 2.1})
+    assert not passes_gate({**ok, "median_de2000": 2.1})
 
 
 def test_save_outputs(tmp_path):
@@ -115,3 +118,44 @@ def test_sample_pair_aligns_and_filters():
 def test_center_crop_to_aspect():
     assert center_crop_to_aspect(np.zeros((100, 300, 3)), 1.5).shape[:2] == (100, 150)
     assert center_crop_to_aspect(np.zeros((300, 300, 3)), 1.5).shape[:2] == (200, 300)
+
+
+def test_exposure_alignment_recovers_offset():
+    from redline_cal.look import best_exposure, fit_look_aligned
+
+    rng = np.random.default_rng(3)
+    imgs = []
+    for ev in (-0.5, 0.0, 0.5):
+        xyz = rng.uniform(0.02, 0.6, (400, 3))
+        imgs.append((xyz * 2.0**ev, srgb_encode(np.clip(xyz @ XYZ_TO_SRGB.T, 0, 1))))
+    look, gains = fit_look_aligned(imgs, n=9)
+    assert np.allclose([g.ev for g in gains], [0.5, 0.0, -0.5], atol=0.11)
+    assert abs(best_exposure(look, imgs[0][0] * 2.0, imgs[0][1]) - (-0.5)) < 0.11
+
+
+def test_devignette_recovers_radial_falloff():
+    from redline_cal.look import fit_look_aligned
+
+    rng = np.random.default_rng(5)
+    imgs, truth = [], []
+    for k1 in (-1.0, -0.5, -1.5):
+        xyz = rng.uniform(0.02, 0.5, (1500, 3)) @ SRGB_TO_XYZ.T  # in gamut
+        r = rng.uniform(0, 0.8, 1500)
+        target = srgb_encode(np.clip(xyz @ XYZ_TO_SRGB.T, 0, 1))
+        imgs.append((xyz * (2.0 ** (k1 * r**2))[:, None], target, r))  # raw darker at the edge
+        truth.append(xyz)
+    look, gains = fit_look_aligned(imgs, n=9, exposure=False, vignette=True)
+    for g, k1 in zip(gains, (1.0, 0.5, 1.5)):  # recovered log2 gain matches the falloff it undoes
+        for rr in (0.4, 0.8):
+            assert abs(g.k1 * rr**2 + g.k2 * rr**4 - k1 * rr**2) < 0.08
+    x = np.concatenate([g.apply(a, r) for (a, _, r), g in zip(imgs, gains)])
+    y = np.concatenate([b for _, b, _ in imgs])
+    oracle = fit_look(np.concatenate(truth), y, n=9)  # same model on vignette-free input
+    assert evaluate(look, x, y)["mean_de2000"] < evaluate(oracle, np.concatenate(truth), y)["mean_de2000"] + 0.3
+
+
+def test_sample_pair_radius():
+    xyz = np.full((60, 90, 3), 0.2)
+    jpeg = np.full((60, 90, 3), 0.5)
+    x, j, r = sample_pair(xyz, jpeg, grid=(6, 9), center=0.9, raw_scale=1.0, return_radius=True)
+    assert len(r) == len(x) == 54 and r.min() > 0 and r.max() < 0.95
