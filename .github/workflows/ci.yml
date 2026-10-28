@@ -68,8 +68,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r calibration/requirements-ci.txt
-      - run: python -m pytest calibration -q
+      - run: pip install -r calibration/requirements-ci.txt rawpy
+
+      - name: Cache real-file fixtures
+        uses: actions/cache@v4
+        with:
+          path: ~/redline-fixtures
+          key: cal-fixtures-exiftool13.60-r5m2-raw-v1
+
+      - name: Fetch exiftool + EOS R5 Mark II sample (raw.pixls.us, CC0)
+        run: |
+          mkdir -p ~/redline-fixtures && cd ~/redline-fixtures
+          [ -d Image-ExifTool-13.60 ] || curl -fsSL "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-13.60.tar.gz/download" | tar xz
+          [ -f RAW.CR3 ] || curl -fsSL -o RAW.CR3 "https://raw.pixls.us/data/Canon/Canon%20EOS%20R5m2/RAW.CR3"
+          echo "$HOME/redline-fixtures/Image-ExifTool-13.60" >> "$GITHUB_PATH"
+          echo "REDLINE_CAL_SAMPLE_CR3=$HOME/redline-fixtures/RAW.CR3" >> "$GITHUB_ENV"
+
+      - run: python -m pytest calibration -q -rs
 
   instrumented:
     name: Emulator smoke test (API ${{ matrix.api }})
