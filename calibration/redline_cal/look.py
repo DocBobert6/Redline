@@ -292,7 +292,7 @@ def evaluate(look: Look, xyz: np.ndarray, target_enc: np.ndarray) -> dict:
 
 
 # skin colour is provisional at 2.5: the hold-out "skin" is a CIELAB colour box (it also
-# catches wood, sand, brick); real skin is re-checked against the chart skin patches in B04.
+# catches wood, sand, brick). No chart is available, so this stays a known limitation.
 GATE = {"color_mean": 2.5, "skin_color_mean": 2.5, "median_de": 2.0, "median_abs_dL": 2.0}
 
 
