@@ -1,0 +1,50 @@
+package com.redline.camera.capability
+
+/**
+ * Everything B11 adds on top of the static [DeviceProfile]: combination results, the self-test,
+ * the matched quirks, and debug-forced failures. Pure, so the screen and the shared report derive
+ * the same effective defaults from it.
+ */
+data class CapabilityState(
+    /** Null while the checks are still running. */
+    val combos: List<ComboResult>? = null,
+    val selfTest: SelfTestReport? = null,
+    val selfTestRunning: Boolean = false,
+    val quirks: QuirksTable = QuirksTable.EMPTY,
+    /** Feature key -> note, for quirk entries matching this phone. */
+    val quirkDisables: Map<String, String> = emptyMap(),
+    /** Debug-only forced failures ([DebugOverrides]). Always empty in release builds. */
+    val forced: Set<String> = emptySet(),
+    /** Debug repeat-run progress, e.g. "37/40 runs passed". */
+    val repeatStatus: String? = null
+) {
+    fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
+
+    fun effectiveSelfTest(): SelfTestReport? = DebugOverrides.applySelfTest(selfTest, forced)
+
+    fun policy(profile: DeviceProfile?): PolicyResult {
+        return FeaturePolicy.evaluate(profile, effectiveCombos(), effectiveSelfTest(), quirkDisables)
+    }
+}
+
+object CapabilityReport {
+    /** The B10 profile plus the B11 sections: self_test, combinations, effective_defaults, demotions, quirks. */
+    fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
+        val policy = state.policy(profile)
+        val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
+        out["self_test"] = state.effectiveSelfTest()?.toMap()
+        out["combinations"] = state.effectiveCombos().map { it.toMap() }
+        out["effective_defaults"] = policy.defaults.toMap()
+        out["demotions"] = policy.demotions.map { it.toMap() }
+        out["policy_notes"] = policy.notes
+        out["quirks"] = linkedMapOf(
+            "source" to state.quirks.source,
+            "version" to state.quirks.version,
+            "disabled" to state.quirkDisables
+        )
+        if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
+        return out
+    }
+
+    fun toJson(profile: DeviceProfile?, state: CapabilityState): String = Json.value(toMap(profile, state))
+}

@@ -27,7 +27,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 | Build | Tag | Scope | Acceptance gate |
 | --- | --- | --- | --- |
-| [ ] B10 | `v0.1.0-alpha.1` | Full DeviceProfile (all keys in PLAN 4.1), equivalent focal per physical lens, JSON capability report export/share | Report matches manual readout on baseline device |
+| [x] B10 | `v0.1.0-alpha.1` | Full DeviceProfile (all keys in PLAN 4.1), equivalent focal per physical lens, JSON capability report export/share | Report matches manual readout on baseline device |
 | [ ] B11 | `v0.1.1-alpha.1` | Feature-combination checks (session-config query + CameraX feature groups), first-launch self-test, demotion rules, remote quirks table | Self-test passes 100/100 on baseline; forced failures demote cleanly |
 | [ ] B12 | `v0.1.2-alpha.1` | Camera2 preview in 3:2, permissions, zoom ring 24*/28/35/50/70 with crop and honest labels | 30 fps preview, cold start < 1 s to first frame |
 | [ ] B13 | `v0.1.3-alpha.1` | Single-shot JPEG + RAW/DNG capture, MediaStore save, EXIF incl. look tag (no make/model spoof) | 500 consecutive captures, zero failures |
