@@ -53,12 +53,7 @@ fun CapabilityScreen(
 }
 
 @Composable
-private fun CameraCard(
-    c: CameraFacts,
-    cal: FactoryCalibration?,
-    onShare: (FactoryCalibration) -> Unit,
-    full: CameraProfile? = null
-) {
+private fun CameraCard(c: CameraFacts, cal: FactoryCalibration?, onShare: (FactoryCalibration) -> Unit, full: CameraProfile? = null) {
     Card(modifier = Modifier.padding(top = 12.dp)) {
         Column(modifier = Modifier.padding(12.dp)) {
             Text("Camera ${c.id} (${c.facing}) - tier ${TierRules.tierOf(c)}", style = MaterialTheme.typography.titleMedium)

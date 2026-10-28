@@ -49,7 +49,13 @@ class DeviceProfileProbe(private val context: Context) {
         }
         val aeInts = safe { ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)?.toList() }.orEmpty()
         val physicalIds = safe { ch.physicalCameraIds.toList() }.orEmpty()
-        val lensSources = if (physicalIds.isEmpty()) listOf(id to ch) else physicalIds.mapNotNull { pid -> safe { pid to manager.getCameraCharacteristics(pid) } }
+        val lensSources = if (physicalIds.isEmpty()) {
+            listOf(id to ch)
+        } else {
+            physicalIds.mapNotNull { pid ->
+                safe { pid to manager.getCameraCharacteristics(pid) }
+            }
+        }
         val iso = safe { ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) }
         val exposure = safe { ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) }
         val aeComp = safe { ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) }
@@ -78,13 +84,13 @@ class DeviceProfileProbe(private val context: Context) {
             outputSizes = sizes(map),
             maxResolutionSizes = sizes(maxResMap),
             formats = CameraNames.names(safe { map?.outputFormats?.toList() }.orEmpty(), CameraNames.FORMATS),
-            fpsRanges = safe { ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.map { it.lower to it.upper } }.orEmpty(),
+            fpsRanges = fpsRanges(ch),
             highSpeedFps = safe { map?.highSpeedVideoFpsRanges?.map { it.lower to it.upper }?.distinct() }.orEmpty(),
             aeModes = CameraNames.names(aeInts, CameraNames.AE_MODES),
-            afModes = CameraNames.names(safe { ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toList() }.orEmpty(), CameraNames.AF_MODES),
-            awbModes = CameraNames.names(safe { ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList() }.orEmpty(), CameraNames.AWB_MODES),
+            afModes = CameraNames.names(ints(ch, CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES), CameraNames.AF_MODES),
+            awbModes = CameraNames.names(ints(ch, CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES), CameraNames.AWB_MODES),
             videoStabilization = CameraNames.names(
-                safe { ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.toList() }.orEmpty(),
+                ints(ch, CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES),
                 CameraNames.VIDEO_STABILIZATION
             ),
             aeCompensation = aeComp?.let { it.lower to it.upper },
@@ -100,6 +106,12 @@ class DeviceProfileProbe(private val context: Context) {
             }
         )
     }
+
+    private fun ints(ch: CameraCharacteristics, key: CameraCharacteristics.Key<IntArray>): List<Int> =
+        safe { ch.get(key)?.toList() }.orEmpty()
+
+    private fun fpsRanges(ch: CameraCharacteristics): List<Pair<Int, Int>> =
+        safe { ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.map { it.lower to it.upper } }.orEmpty()
 
     private fun lens(id: String, ch: CameraCharacteristics): LensProfile {
         val size = safe { ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) }

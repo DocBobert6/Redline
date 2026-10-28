@@ -32,11 +32,7 @@ data class DeviceProfile(
     }
 }
 
-data class Encoders(
-    val hevcMain10: Boolean,
-    val av1: Boolean,
-    val apv: Boolean
-) {
+data class Encoders(val hevcMain10: Boolean, val av1: Boolean, val apv: Boolean) {
     fun toMap(): Map<String, Any?> = linkedMapOf("hevc_main10" to hevcMain10, "av1" to av1, "apv" to apv)
 }
 
