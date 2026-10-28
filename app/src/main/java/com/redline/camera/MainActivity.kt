@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import com.redline.camera.capability.CapabilityProbe
+import com.redline.camera.capability.DeviceProfileProbe
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.ui.CapabilityScreen
 
@@ -22,17 +23,28 @@ class MainActivity : ComponentActivity() {
             }
             FactoryCalibration.pick(candidates)?.let { c.id to it }
         }.toMap()
+        val profileProbe = DeviceProfileProbe(this)
+        val profile = runCatching { profileProbe.build() }.getOrNull()
         setContent {
-            CapabilityScreen(cameras, calibrations) { cal -> share(cal) }
+            CapabilityScreen(
+                cameras = cameras,
+                calibrations = calibrations,
+                onShareCalibration = { cal -> share("redline_camera2_${cal.cameraId}.json", cal.toJson(), "Share calibration") },
+                profile = profile,
+                onShareReport = {
+                    val json = runCatching { profileProbe.cachedJson() }.getOrElse { profile?.toJson().orEmpty() }
+                    share("redline_capability_report.json", json, "Share capability report")
+                }
+            )
         }
     }
 
-    private fun share(cal: FactoryCalibration) {
+    private fun share(name: String, json: String, title: String) {
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "application/json"
-            putExtra(Intent.EXTRA_SUBJECT, "redline_camera2_${cal.cameraId}.json")
-            putExtra(Intent.EXTRA_TEXT, cal.toJson())
+            putExtra(Intent.EXTRA_SUBJECT, name)
+            putExtra(Intent.EXTRA_TEXT, json)
         }
-        startActivity(Intent.createChooser(send, "Share calibration"))
+        startActivity(Intent.createChooser(send, title))
     }
 }
