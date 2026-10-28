@@ -136,7 +136,7 @@ def test_devignette_recovers_radial_falloff():
     rng = np.random.default_rng(5)
     imgs, truth = [], []
     for k1 in (-1.0, -0.5, -1.5):
-        xyz = rng.uniform(0.02, 0.5, (1500, 3))
+        xyz = rng.uniform(0.02, 0.5, (1500, 3)) @ SRGB_TO_XYZ.T  # in gamut
         r = rng.uniform(0, 0.8, 1500)
         target = srgb_encode(np.clip(xyz @ XYZ_TO_SRGB.T, 0, 1))
         imgs.append((xyz * (2.0 ** (k1 * r**2))[:, None], target, r))  # raw darker at the edge
