@@ -21,7 +21,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | [x] B01 | `v0.0.2-alpha.1` | Gradle wrapper (checksum-pinned, validated in CI); ktlint; emulator instrumented smoke test in CI; release keystore in repo secrets (detekt deferred until a release supports Kotlin 2.4) | CI green incl. emulator job; signed release APK once secrets are set |
 | [x] B02 | `v0.0.3-alpha.1` | Calibration ingest: CR3 decode (rawpy), MakerNotes via exiftool (Picture Style, sharpness, ALO/HTP, lens corrections, WB), dataset manifest; filter to Standard/default pairs | Manifest of usable RAW+JPEG pairs with parameters; CI runs on tiny fixtures |
 | [x] B03 | `v0.0.4-alpha.1` | Fit tone curve + 33^3 residual LUT (scene XYZ -> Standard), hold-out report, `.cube` export; Adobe DCP cross-check (internal only) | Hold-out (gate v2, colour and lightness scored separately): colour dE2000 < 2.5, skin colour < 2.5 (provisional), median dE2000 < 2.0, median abs dL* < 2.0. Result on 88 real R5 II pairs: colour 1.51, skin colour 2.49, median 1.61, median abs dL* 1.30 |
-| [ ] B04 | `v0.0.5-alpha.1` | Lens profile JSON from lensfun (distortion ptlens, vignetting pa, all stops); noise model from published data; baseline-phone ColorChecker + flat-field + noise profiling scripts and outputs | Baseline phone chart mean dE2000 < 2.0, chart skin patches < 2.0 after the Standard look; profiles load in unit tests |
+| [ ] B04 | `v0.0.5-alpha.1` | Lens profile JSON from lensfun (distortion ptlens, vignetting pa, all stops); noise model from published data; baseline-phone factory-calibration dump (forward/colour/calibration matrices, reference illuminants, noise profile, shading map) + DNG cross-check script; free white-wall flat-field check | Dumped matrices identical to the phone's own DNG tags; neutral patch maps to D65/D50 white within 1 dE; profiles load in unit tests (no chart required) |
 
 ## Phase 1: Capability engine and baseline camera (`v0.1.x`)
 
@@ -38,7 +38,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | Build | Tag | Scope | Acceptance gate |
 | --- | --- | --- | --- |
 | [ ] B20 | `v0.2.0-alpha.1` | NDK/CMake native module (C++/Halide), GPU LUT in live preview | Preview LUT <= 8 ms per frame |
-| [ ] B21 | `v0.2.1-alpha.1` | RAW color pipeline: phone matrices -> XYZ -> Standard LUT, tone curve, highlight shoulder, Canon-style AWB warmth | Chart shots match fitted target within dE2000 3.0 |
+| [ ] B21 | `v0.2.1-alpha.1` | RAW color pipeline: phone matrices -> XYZ -> Standard LUT, tone curve, highlight shoulder, Canon-style AWB warmth | Phone DNG -> XYZ -> Standard matches the reference (Python) pipeline within dE2000 1.0 on the same frames; neutrals stay neutral |
 | [ ] B22 | `v0.2.2-alpha.1` | RAW burst capture (8-12 frames, under-exposed), tile align + merge, background processing queue | 24/35mm save < 3 s; no shutter blocking |
 | [ ] B23 | `v0.2.3-alpha.1` | Handheld multi-frame super-resolution at 50/70mm; per-stop output sizes | 50/70mm save < 5 s; resolution chart gain measured |
 | [ ] B24 | `v0.2.4-alpha.1` | Vignetting (in-camera residual), distortion (off by default, RAW-feel toggle), sharpening, grain; full Picture Style set | Visual sign-off on shoot list |

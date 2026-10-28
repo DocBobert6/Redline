@@ -298,8 +298,9 @@ Pro path (baseline device and up):
     super-resolution, Wronski et al. 2019).
  3. Black/white level, lens shading (phone's own) correction, demosaic
     (skipped at super-res stops; the merge reconstructs RGB directly).
- 4. Camera RGB -> XYZ via our ColorChecker-fitted baseline matrices (9.6),
-    falling back to the HAL's SENSOR_COLOR_TRANSFORM on other phones;
+ 4. Camera RGB -> XYZ via the HAL's factory colour calibration
+    (SENSOR_FORWARD_MATRIX1/2 + CALIBRATION_TRANSFORM1/2, interpolated
+    by scene white between the two reference illuminants; 9.6);
     chromatic adaptation to scene white with Canon-style warmth
     retention.
  5. XYZ -> Canon Standard via fitted tone curve + 33^3 LUT (9.1).
@@ -413,7 +414,8 @@ tone curve, then steps 5-9 (labelled "Standard").
 ======================================================================
 9. CALIBRATION WITHOUT THE CAMERA
 ======================================================================
-plus one ~$100 chart for your own phones.
+and no paid hardware: phones are profiled from their own factory
+calibration metadata (9.6).
 
 9.1 Paired RAW + in-camera JPEG files (the color/tone "answer key")
 - Sources: DPReview R5 II sample gallery (42 images, Sep 12, 2024;
@@ -472,13 +474,20 @@ same lens, same full-frame RF mount, so it transfers directly to R5 II]
 9.5 Sensor noise [MEASURED - Photons to Photos, Bill Claff]
 - See Section 19.4. Use to synthesize matching grain per ISO.
 
-9.6 Your phones (the only thing you must measure yourself)
-- Buy a ColorChecker Classic (~$100) or Passport. Shoot it in RAW on
-  each test phone under daylight, shade, and tungsten; fit phone
-  camera RGB -> XYZ (3x3 per illuminant + small residual LUT).
-  Also shoot a white wall at each lens to measure phone vignetting
-  and a grid/door frame for distortion (or trust LENS_DISTORTION
-  metadata).
+9.6 Your phones (no chart required)
+- Every Camera2 RAW-capable phone ships per-unit factory colour
+  calibration: SENSOR_REFERENCE_ILLUMINANT1/2, SENSOR_FORWARD_MATRIX1/2,
+  SENSOR_COLOR_TRANSFORM1/2 and SENSOR_CALIBRATION_TRANSFORM1/2 (the
+  same tags a DNG carries). Use them for phone camera RGB -> XYZ,
+  interpolating between the two illuminants by the AWB white point.
+- Noise: SENSOR_NOISE_PROFILE gives the per-channel (S, O) noise model
+  for every capture; log it across ISOs on the baseline device.
+- Shading: the HAL's LENS_SHADING_MAP (STATISTICS_LENS_SHADING_MAP_MODE
+  ON) gives the gain map it applies; flat-field self-check = shoot a
+  plain white wall/overcast sky through white paper (free).
+- Distortion: LENS_DISTORTION + LENS_INTRINSIC_CALIBRATION metadata.
+- Optional, never required: a ColorChecker shot later can refine the
+  matrices with a small residual; the app must not depend on it.
 - Chain: phone RAW -> phone->XYZ (9.6) -> XYZ->Canon Standard
   (9.1/9.2) -> lens model (9.4) -> grain (9.5).
 
@@ -494,10 +503,11 @@ Legal note: Do NOT ship Canon .pf2 Picture Style files, Canon LUTs,
 or Adobe DCP data. Ship only LUTs you fitted yourself. Avoid Canon
 trademarks in branding unless licensed.
 9.8 Baseline device calibration (Phase 0, maintainer task)
-- ColorChecker Classic: shoot RAW (DNG) on the baseline device main and front
-  cameras (ultrawide optional) under daylight, open shade, tungsten,
-  and one LED; fit camera RGB -> XYZ per illuminant + small residual
-  LUT; target mean deltaE2000 < 2.0 on the chart.
+- Factory calibration dump: record the baseline device's reference
+  illuminants, forward/colour/calibration matrices and noise profile
+  for each camera (main, front; ultrawide optional) from the capability
+  probe; check them against the matrices embedded in the phone's own
+  DNGs (they must be identical) and sanity-check white/neutral mapping.
 - Flat-field: evenly lit white wall/defocused screen at each camera to
   measure the baseline device's own shading after HAL correction.
 - Distortion: read LENS_DISTORTION; if absent, shoot a grid.
@@ -563,9 +573,10 @@ trademarks in branding unless licensed.
 ======================================================================
 Phase 0 - Calibration + name check (3-4 weeks)
   R5 II RAW+JPEG fit (tone curve + LUT), lensfun import, noise model,
-  baseline device ColorChecker / flat-field / noise profiling. Check
+  baseline device factory-calibration / flat-field / noise dump. Check
   "Redline" on Play Store and USPTO.
-  Gate: XYZ->Standard hold-out mean dE2000 < 2.5; baseline chart < 2.0.
+  Gate: XYZ->Standard hold-out gate v2 (see BUILD_PLAN B03); baseline
+  calibration dump validated against the phone's own DNG tags.
 Phase 1 - Capability engine + baseline camera (4-6 weeks)
   DeviceProfile, self-test, quirks table, capability report export,
   preview, RAW/JPEG capture, all [BASELINE-VERIFY] items answered.
@@ -602,8 +613,9 @@ vignette stills, no bokeh, no video look) ~2-3 months, fully baseline-ready.
 ======================================================================
 15. BUDGET (ROUGH)
 ======================================================================
-- R5 II + RF 24-70: not needed. ColorChecker Classic/Passport ~$100;
-  sample packs ~$1-5. LibRaw, lensfun, exiftool, DNG Converter: free.
+- R5 II + RF 24-70: not needed. No colour chart needed (factory
+  calibration metadata); a ColorChecker is an optional later refinement.
+  Sample packs ~$1-5 (optional). LibRaw, lensfun, exiftool, DNG Converter: free.
 - Baseline device: owned. Flagship access: remote device labs (Firebase Test
   Lab pay-as-you-go; Samsung Remote Test Lab free) before buying any
   used flagship (~$600-1,000 each).

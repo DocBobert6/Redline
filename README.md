@@ -11,7 +11,7 @@ Redline's calibration target is the rendering of the Canon EOS R5 Mark II with t
 1. **Never applies a configuration a phone can't run.** At first launch Redline reads every camera through Camera2 (hardware level, RAW, manual control, stream sizes, frame rates, 10-bit, ultra-high-res sensors, physical lenses), verifies feature *combinations*, and runs a short self-test before offering anything.
 2. **Ships defaults that work on a mid-range baseline.** Every setting that is on by default is built and tested against a baseline device profile: Camera2 FULL, RAW, 12 MP maximum output, 8-bit video, no telephoto.
 3. **Unlocks flagship capabilities when a phone has them.** 10-bit HLG and log video, HDR10/Dolby Vision, the APV codec, 48-200 MP sources, native telephoto lenses for the 70mm stop, 4K120 and 8K are detected and offered only on hardware that proves it can run them.
-4. **Renders the look from data, not guesswork.** The color/tone model is fitted from public RAW + in-camera JPEG pairs, lens behaviour comes from measured lensfun data, and sensor noise from published measurements. Each test phone is profiled with a ColorChecker.
+4. **Renders the look from data, not guesswork.** The color/tone model is fitted from public RAW + in-camera JPEG pairs, lens behaviour comes from measured lensfun data, and sensor noise from published measurements. Each test phone is profiled from its own factory colour calibration (Camera2 / DNG metadata), so no colour chart is needed.
 
 ## Docs
 
