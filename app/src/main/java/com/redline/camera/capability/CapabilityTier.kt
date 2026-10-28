@@ -24,11 +24,16 @@ data class CameraFacts(
     val equivalentFocalLengthsMm: List<Float>,
     val maxJpegWidth: Int,
     val maxJpegHeight: Int,
-    val fpsRanges: List<Pair<Int, Int>>,
+    val fpsRanges: List<Pair<Int, Int>>
 )
 
 enum class HardwareLevel(val rank: Int) {
-    LEGACY(0), EXTERNAL(1), LIMITED(2), FULL(3), LEVEL_3(4), UNKNOWN(-1)
+    LEGACY(0),
+    EXTERNAL(1),
+    LIMITED(2),
+    FULL(3),
+    LEVEL_3(4),
+    UNKNOWN(-1)
 }
 
 object TierRules {

@@ -53,7 +53,7 @@ class CapabilityProbe(context: Context) {
             equivalentFocalLengthsMm = focals.map { TierRules.equivalentFocalMm(it, diag) },
             maxJpegWidth = jpeg?.width ?: 0,
             maxJpegHeight = jpeg?.height ?: 0,
-            fpsRanges = fps,
+            fpsRanges = fps
         )
     }
 }

@@ -32,11 +32,13 @@ docs/           Plan, build roadmap, release process
 
 ## Building
 
-Requirements: JDK 21, Android SDK (platform 37), Gradle 9.8+.
+Requirements: JDK 21 and the Android SDK (platform 37). The Gradle wrapper downloads Gradle 9.8.2.
 
 ```bash
-gradle :app:assembleDebug          # debug APK in app/build/outputs/apk/debug/
-gradle :app:testDebugUnitTest      # unit tests
+./gradlew :app:assembleDebug            # debug APK in app/build/outputs/apk/debug/
+./gradlew :app:testDebugUnitTest        # unit tests
+./gradlew :app:ktlintCheck              # code style (ktlintFormat to fix)
+./gradlew :app:connectedDebugAndroidTest  # instrumented tests on a device/emulator
 pip install -r calibration/requirements-ci.txt && python -m pytest calibration
 ```
 
