@@ -85,7 +85,7 @@ python -m redline_cal.profile_device data/phone/*.dng \
 
 | Check (B04 gate) | Limit |
 | --- | --- |
-| Camera2 export matrices vs the phone's DNG tags | identical (1e-3, rational rounding) |
+| Camera2 export matrices vs the phone's DNG tags | identical (1e-3, rational rounding) when Camera2 exposes them; skipped when every colour key is null |
 | Calibration constant across all DNGs | identical |
 | Camera neutral -> D50 white (forward-matrix path) | < 1 dE |
 | Forward- vs colour-matrix path agreement | warning above 3 dE |
@@ -101,3 +101,11 @@ Lens profile:
 python -m redline_cal.lensfun_import data/lensfun/mil-canon.xml \
     --model "Canon RF 24-70mm F2.8L IS USM" --out out/lens_rf24-70.json
 ```
+
+### When Camera2 hides the calibration
+
+Some phones (the baseline device among them) leave every `SENSOR_COLOR_TRANSFORM*`, `SENSOR_FORWARD_MATRIX*`, `SENSOR_CALIBRATION_TRANSFORM*`, `SENSOR_REFERENCE_ILLUMINANT*` and `LENS_DISTORTION` key null for third-party apps. The stock camera still writes them into its DNGs. On those phones:
+
+- the device profile comes from the stock camera's DNG tags (`profile_device.py` without `--camera2`);
+- Redline's own RAW capture (B13) has to write the matrices from that bundled profile, because `DngCreator` has nothing to copy;
+- an unprofiled phone with no Camera2 calibration falls back to the generic sRGB path, and its profile is labelled as uncalibrated.
