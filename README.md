@@ -32,7 +32,7 @@ docs/           Plan, build roadmap, release process
 
 ## Building
 
-Requirements: JDK 21, Android SDK (platform 36), Gradle 9.8+.
+Requirements: JDK 21, Android SDK (platform 37), Gradle 9.8+.
 
 ```bash
 gradle :app:assembleDebug          # debug APK in app/build/outputs/apk/debug/

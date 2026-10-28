@@ -18,7 +18,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | Build | Tag | Scope | Acceptance gate |
 | --- | --- | --- | --- |
 | [~] B00 | `v0.0.1-alpha.1` | Repo, README, plan, CI + Release workflows, Compose app skeleton with capability probe screen, tier rules + unit tests, calibration toolkit seed (lens math, LUT I/O) | CI green; release APK installs and lists every camera with its tier |
-| [ ] B01 | `v0.0.2-alpha.1` | Commit Gradle wrapper; release keystore in repo secrets; ktlint/detekt; emulator instrumented-test job; compile/target SDK to latest stable | Signed release APK from CI; instrumented smoke test passes on emulator |
+| [ ] B01 | `v0.0.2-alpha.1` | Commit Gradle wrapper; release keystore in repo secrets; ktlint/detekt; emulator instrumented-test job | Signed release APK from CI; instrumented smoke test passes on emulator |
 | [ ] B02 | `v0.0.3-alpha.1` | Calibration ingest: CR3 decode (rawpy), MakerNotes via exiftool (Picture Style, sharpness, ALO/HTP, lens corrections, WB), dataset manifest; filter to Standard/default pairs | Manifest of usable RAW+JPEG pairs with parameters; CI runs on tiny fixtures |
 | [ ] B03 | `v0.0.4-alpha.1` | Fit tone curve + 33^3 residual LUT (scene XYZ -> Standard), hold-out report, `.cube` export; Adobe DCP cross-check (internal only) | Hold-out mean dE2000 < 2.5 (skin < 2.0) |
 | [ ] B04 | `v0.0.5-alpha.1` | Lens profile JSON from lensfun (distortion ptlens, vignetting pa, all stops); noise model from published data; baseline-phone ColorChecker + flat-field + noise profiling scripts and outputs | Baseline phone chart mean dE2000 < 2.0; profiles load in unit tests |

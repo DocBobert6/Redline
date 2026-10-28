@@ -9,12 +9,12 @@ val redlineVersionCode: Int = ((findProperty("redline.versionCode") as String?) 
 
 android {
     namespace = "com.redline.camera"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.redline.camera"
         minSdk = 29
-        targetSdk = 36
+        targetSdk = 37
         versionCode = redlineVersionCode
         versionName = redlineVersionName
     }
