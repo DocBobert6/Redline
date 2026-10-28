@@ -127,15 +127,11 @@ def fit_look(xyz: np.ndarray, target_enc: np.ndarray, n: int = 33, smooth: float
 
 
 EXPOSURE_GRID = np.linspace(-1.0, 1.0, 41)
+CENTRE_R = 0.35
 
 
 def best_exposure(look: Look, xyz: np.ndarray, target_enc: np.ndarray, grid: np.ndarray = EXPOSURE_GRID) -> float:
-    """Per-image exposure offset (EV) that best matches the target's lightness.
-
-    The camera's Auto Lighting Optimizer and metering choose a per-scene brightness the
-    phone's own auto-exposure will never reproduce, so the look is judged up to one global
-    exposure number per image. Median |dL*| keeps local-tone outliers from dominating.
-    """
+    """Per-image exposure offset (EV) that best matches the target's lightness (median |dL*|)."""
     if len(xyz) == 0:
         return 0.0
     lt = srgb_encoded_to_lab(target_enc)[:, 0]
@@ -143,20 +139,108 @@ def best_exposure(look: Look, xyz: np.ndarray, target_enc: np.ndarray, grid: np.
     return float(grid[int(np.argmin(errs))])
 
 
-def fit_look_aligned(
-    images: list[tuple[np.ndarray, np.ndarray]], n: int = 33, smooth: float = 2.0, iters: int = 3
-) -> tuple[Look, list[float]]:
-    """Alternate between fitting the look and each training image's exposure offset."""
-    ev = [0.0] * len(images)
-    look = None
+def implied_log2_gain(look: Look, xyz: np.ndarray, target_enc: np.ndarray) -> np.ndarray:
+    """log2 of the gain on each sample that makes its tone-mapped green match the target's.
+
+    Inverts the (monotone) tone curve on the green channel, which carries most luminance.
+    """
+    lin_g = np.clip((xyz @ XYZ_TO_SRGB.T)[:, 1], 2.0**EV_MIN, None)
+    tone = np.maximum.accumulate(look.tone)
+    t = np.clip(target_enc[:, 1], tone[0], tone[-1])
+    ev_t = np.interp(t, tone + np.arange(len(tone)) * 1e-9, look.tone_ev)
+    return ev_t - np.log2(lin_g)
+
+
+@dataclass
+class Gain:
+    """Per-image nuisance gain: log2 g(r) = ev + k1 r^2 + k2 r^4 (r = normalised radius)."""
+
+    ev: float = 0.0
+    k1: float = 0.0
+    k2: float = 0.0
+
+    def apply(self, xyz: np.ndarray, r: np.ndarray | None) -> np.ndarray:
+        if r is None:
+            return xyz * 2.0**self.ev
+        lg = self.ev + self.k1 * r**2 + self.k2 * r**4
+        return xyz * (2.0**lg)[:, None]
+
+
+def fit_gain(
+    look: Look, xyz: np.ndarray, target_enc: np.ndarray, r: np.ndarray | None,
+    exposure: bool = True, vignette: bool = True, iters: int = 5,
+) -> Gain:
+    """Robust (IRLS, Huber) fit of the per-image exposure and radial falloff.
+
+    The camera JPEG has the lens's peripheral illumination corrected and its exposure set by
+    the camera's metering/ALO; neither belongs to the colour look, and the phone handles both
+    with its own lens shading and auto-exposure. Samples in the tone curve's flat ends carry
+    no gain information and are ignored.
+    """
+    if len(xyz) < 8 or not (exposure or (vignette and r is not None)):
+        return Gain()
+    y = implied_log2_gain(look, xyz, target_enc)
+    t = target_enc[:, 1]
+    ok = (t > 0.05) & (t < 0.95) & np.isfinite(y)
+    if ok.sum() < 8:
+        return Gain()
+    cols = []
+    if exposure:
+        cols.append(np.ones(ok.sum()))
+    if vignette and r is not None:
+        cols += [r[ok] ** 2, r[ok] ** 4]
+    A = np.stack(cols, axis=1)
+    yb = y[ok]
+    w = np.ones(len(yb))
+    p = np.zeros(A.shape[1])
     for _ in range(iters):
-        x = np.concatenate([a * 2.0**e for (a, _), e in zip(images, ev)])
-        y = np.concatenate([b for _, b in images])
+        sw = np.sqrt(w)
+        p, *_ = np.linalg.lstsq(A * sw[:, None], yb * sw, rcond=None)
+        res = np.abs(yb - A @ p)
+        scale = 1.4826 * np.median(res) + 1e-6
+        w = np.minimum(1.0, 1.5 * scale / np.maximum(res, 1e-12))
+    i = 0
+    g = Gain()
+    if exposure:
+        g.ev = float(p[0])
+        i = 1
+    if vignette and r is not None:
+        g.k1, g.k2 = float(p[i]), float(p[i + 1])
+    return g
+
+
+def fit_look_aligned(
+    images: list[tuple], n: int = 33, smooth: float = 2.0, iters: int = 3,
+    exposure: bool = True, vignette: bool = False,
+) -> tuple[Look, list[Gain]]:
+    """Alternate between fitting the look and each training image's nuisance gain.
+
+    ``images`` holds (xyz, target) or (xyz, target, radius) tuples.
+    """
+    imgs = [(im[0], im[1], im[2] if len(im) > 2 else None) for im in images]
+    gains = [Gain() for _ in imgs]
+    look = None
+    centred = vignette and all(r is not None for _, _, r in imgs)
+    for _ in range(iters):
+        x = np.concatenate([g.apply(a, r) for (a, _, r), g in zip(imgs, gains)])
+        y = np.concatenate([b for _, b, _ in imgs])
+        if centred:
+            # The falloff is only identifiable against a look anchored where there is none:
+            # fit the look on the image centres, then the radial gains against it.
+            c = np.concatenate([r for _, _, r in imgs]) < CENTRE_R
+            if c.sum() > 1000:
+                x, y = x[c], y[c]
         look = fit_look(x, y, n=n, smooth=smooth)
-        ev = [best_exposure(look, a, b) for a, b in images]
-        m = float(np.mean(ev))  # keep the curve anchored to the camera's average metering
-        ev = [e - m for e in ev]
-    return look, ev
+        # implied gains are relative to the raw samples, so each fit is the total gain
+        gains = [fit_gain(look, a, b, r, exposure=exposure, vignette=vignette) for a, b, r in imgs]
+        if exposure:  # keep the curve anchored to the camera's average metering
+            m = float(np.mean([g.ev for g in gains]))
+            for g in gains:
+                g.ev -= m
+    if centred:  # final look from every (now devignetted) sample
+        x = np.concatenate([g.apply(a, r) for (a, _, r), g in zip(imgs, gains)])
+        look = fit_look(x, np.concatenate([b for _, b, _ in imgs]), n=n, smooth=smooth)
+    return look, gains
 
 
 def evaluate(look: Look, xyz: np.ndarray, target_enc: np.ndarray) -> dict:

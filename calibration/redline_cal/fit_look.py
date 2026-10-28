@@ -16,22 +16,25 @@ import sys
 
 import numpy as np
 
-from .look import best_exposure, evaluate, fit_look, fit_look_aligned, passes_gate, save
+from .look import evaluate, fit_gain, fit_look, fit_look_aligned, passes_gate, save
 from .manifest import read_jsonl
 from .samples import load_jpeg, sample_pair
 
 
-def samples_for(rec: dict, cache_dir: str) -> tuple[np.ndarray, np.ndarray]:
-    path = os.path.join(cache_dir, f"{rec['id']}.npz")
+CACHE_VERSION = 2  # v2 adds per-block radius
+
+
+def samples_for(rec: dict, cache_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    path = os.path.join(cache_dir, f"{rec['id']}.v{CACHE_VERSION}.npz")
     if os.path.exists(path):
         z = np.load(path)
-        return z["xyz"], z["jpeg"]
+        return z["xyz"], z["jpeg"], z["r"]
     from .raw import decode_linear_xyz
 
-    xyz, jpg = sample_pair(decode_linear_xyz(rec["raw"]), load_jpeg(rec["jpeg"]))
+    xyz, jpg, r = sample_pair(decode_linear_xyz(rec["raw"]), load_jpeg(rec["jpeg"]), return_radius=True)
     os.makedirs(cache_dir, exist_ok=True)
-    np.savez_compressed(path, xyz=xyz, jpeg=jpg)
-    return xyz, jpg
+    np.savez_compressed(path, xyz=xyz, jpeg=jpg, r=r)
+    return xyz, jpg, r
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,6 +49,11 @@ def main(argv: list[str] | None = None) -> int:
         "--align-exposure",
         action="store_true",
         help="fit and score up to one exposure offset per image (absorbs Auto Lighting Optimizer / metering)",
+    )
+    ap.add_argument(
+        "--devignette",
+        action="store_true",
+        help="fit and remove each image's radial falloff (the JPEG has peripheral illumination corrected, the RAW does not)",
     )
     ap.add_argument("--exclude", nargs="*", default=[], help="manifest ids to leave out (e.g. edited JPEGs)")
     ap.add_argument("--gate", action="store_true", help="exit 1 unless hold-out mean dE2000 < 2.5 and skin < 2.0")
@@ -64,13 +72,16 @@ def main(argv: list[str] | None = None) -> int:
         print("need usable pairs in both train and holdout splits", file=sys.stderr)
         return 2
 
-    exposure: dict[str, float] = {}
-    if a.align_exposure:
-        look, ev = fit_look_aligned([(d[1], d[2]) for d in data["train"]], n=a.lut_size, smooth=a.smooth)
-        exposure = {d[0]: e for d, e in zip(data["train"], ev)}
+    gains: dict = {}
+    if a.align_exposure or a.devignette:
+        look, gl = fit_look_aligned(
+            [(d[1], d[2], d[3]) for d in data["train"]], n=a.lut_size, smooth=a.smooth,
+            exposure=a.align_exposure, vignette=a.devignette,
+        )
+        gains = {d[0]: g for d, g in zip(data["train"], gl)}
         for d in data["holdout"]:
-            exposure[d[0]] = best_exposure(look, d[1], d[2])
-        data = {k: [(i, x * 2.0 ** exposure[i], y) for i, x, y in v] for k, v in data.items()}
+            gains[d[0]] = fit_gain(look, d[1], d[2], d[3], exposure=a.align_exposure, vignette=a.devignette)
+        data = {k: [(i, gains[i].apply(x, r), y, r) for i, x, y, r in v] for k, v in data.items()}
     else:
         look = fit_look(
             np.concatenate([d[1] for d in data["train"]]), np.concatenate([d[2] for d in data["train"]]),
@@ -84,9 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         "pairs": {"train": len(data["train"]), "holdout": len(data["holdout"])},
         "train": evaluate(look, xt, yt),
         "holdout": evaluate(look, xh, yh),
-        "holdout_per_image": {i: round(evaluate(look, x, y)["mean_de2000"], 3) for i, x, y in data["holdout"] if len(x)},
-        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo, "align_exposure": a.align_exposure},
-        "exposure_ev": {i: round(e, 3) for i, e in exposure.items()},
+        "holdout_per_image": {i: round(evaluate(look, x, y)["mean_de2000"], 3) for i, x, y, _ in data["holdout"] if len(x)},
+        "settings": {"lut_size": a.lut_size, "smooth": a.smooth, "target_lens_only": a.target_lens_only, "no_alo": a.no_alo, "align_exposure": a.align_exposure, "devignette": a.devignette},
+        "gains": {i: [round(g.ev, 3), round(g.k1, 3), round(g.k2, 3)] for i, g in gains.items()},
     }
     report["gate_pass"] = passes_gate(report["holdout"])
     save(look, a.out)
