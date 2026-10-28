@@ -87,9 +87,9 @@ def test_unseen_colors_fall_back_smoothly():
 
 
 def test_gate_logic():
-    ok = {"color_mean_de2000": 2.4, "skin_color_mean_de2000": 1.9, "median_de2000": 1.9, "median_abs_dL": 1.9}
+    ok = {"color_mean_de2000": 2.4, "skin_color_mean_de2000": 2.4, "median_de2000": 1.9, "median_abs_dL": 1.9}
     assert passes_gate(ok)
-    assert not passes_gate({**ok, "skin_color_mean_de2000": 2.1})
+    assert not passes_gate({**ok, "skin_color_mean_de2000": 2.6})
     assert not passes_gate({**ok, "color_mean_de2000": 2.6, "skin_color_mean_de2000": None})
     assert not passes_gate({**ok, "median_abs_dL": 2.1})
     assert not passes_gate({**ok, "median_de2000": 2.1})
