@@ -17,7 +17,9 @@ data class DeviceProfile(
     val cameras: List<CameraProfile>,
     val encoders: Encoders
 ) {
-    fun toJson(): String = Json.obj(
+    fun toJson(): String = Json.value(toMap())
+
+    fun toMap(): Map<String, Any?> = linkedMapOf(
         "schema" to schema,
         "manufacturer" to manufacturer,
         "model" to model,
