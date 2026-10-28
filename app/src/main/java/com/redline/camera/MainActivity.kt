@@ -17,7 +17,10 @@ class MainActivity : ComponentActivity() {
         val cameras = runCatching { CapabilityProbe(this).probeAll() }.getOrDefault(emptyList())
         val manager = getSystemService(CAMERA_SERVICE) as CameraManager
         val calibrations = cameras.mapNotNull { c ->
-            runCatching { c.id to FactoryCalibration.read(c.id, manager.getCameraCharacteristics(c.id)) }.getOrNull()
+            val candidates = (listOf(c.id) + c.physicalIds).mapNotNull { id ->
+                runCatching { FactoryCalibration.read(c.id, manager.getCameraCharacteristics(id), id) }.getOrNull()
+            }
+            FactoryCalibration.pick(candidates)?.let { c.id to it }
         }.toMap()
         setContent {
             CapabilityScreen(cameras, calibrations) { cal -> share(cal) }

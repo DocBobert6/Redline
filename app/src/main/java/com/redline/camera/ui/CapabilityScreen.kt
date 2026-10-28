@@ -49,8 +49,9 @@ private fun CameraCard(c: CameraFacts, cal: FactoryCalibration?, onShare: (Facto
             Text("Equivalent focal ${c.equivalentFocalLengthsMm.joinToString { "%.1fmm".format(it) }}")
             if (c.physicalIds.isNotEmpty()) Text("Physical cameras ${c.physicalIds.joinToString()}")
             val hasCal = cal?.hasColorCalibration == true
-            Text("Factory colour calibration ${if (hasCal) "yes" else "no"}")
-            if (cal != null && hasCal) {
+            val via = if (cal != null && cal.sourceCameraId != c.id) " (from physical camera ${cal.sourceCameraId})" else ""
+            Text("Factory colour calibration ${if (hasCal) "yes" else "no"}$via")
+            if (cal != null) {
                 OutlinedButton(onClick = { onShare(cal) }, modifier = Modifier.padding(top = 8.dp)) {
                     Text("Share calibration")
                 }
