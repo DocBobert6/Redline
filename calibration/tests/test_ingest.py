@@ -134,3 +134,9 @@ def test_real_cr3_decode():
     assert info.white_level > max(info.black_levels)
     xyz = decode_linear_xyz(os.environ["REDLINE_CAL_SAMPLE_CR3"])
     assert xyz.ndim == 3 and xyz.shape[2] == 3 and 0 < float(xyz.mean()) < 1
+
+
+def test_allow_dlo():
+    s = Shot.from_exif(exif(**{"Canon:HighlightTonePriority": "Off", "Canon:DigitalLensOptimizerSetting": "On"}))
+    assert StandardPolicy().evaluate(s) == ["dlo:On"]
+    assert StandardPolicy(require_dlo_off=False).evaluate(s) == []
