@@ -47,7 +47,7 @@ data class LensProfile(
     val pixelArrayHeight: Int,
     val activeWidth: Int,
     val activeHeight: Int,
-    /** Diopters; 0 means fixed focus. */
+    /** Diopters; 0 means fixed focus, null means the HAL did not report it. */
     val minFocusDistanceDiopters: Float?,
     val hasOis: Boolean,
     val hasDistortionModel: Boolean
@@ -67,7 +67,8 @@ data class LensProfile(
     val horizontalFovDeg: Float
         get() = FocalMath.horizontalFovDeg(focalLengthsMm.minOrNull() ?: 0f, activeWidthMm)
 
-    val fixedFocus: Boolean get() = (minFocusDistanceDiopters ?: 0f) == 0f
+    /** True only when the HAL reports 0 diopters; null when focus range is unreported (never guessed). */
+    val fixedFocus: Boolean? get() = minFocusDistanceDiopters?.let { it == 0f }
 
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "camera_id" to cameraId,

@@ -2,6 +2,7 @@ package com.redline.camera.capability
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,7 +59,13 @@ class DeviceProfileTest {
         // 3:2 by width: 4.5 * 36 / 6.4 = 25.3 mm (PLAN 3.3 estimates ~26)
         assertEquals(25.3f, main.equivalent32Mm, 0.05f)
         assertEquals(70.8f, main.horizontalFovDeg, 0.2f)
-        assertFalse(main.fixedFocus)
+        assertEquals(false, main.fixedFocus)
+    }
+
+    @Test
+    fun unreportedFocusRangeIsUnknownNotFixed() {
+        assertNull(main.copy(minFocusDistanceDiopters = null).fixedFocus)
+        assertEquals(true, main.copy(minFocusDistanceDiopters = 0f).fixedFocus)
     }
 
     @Test

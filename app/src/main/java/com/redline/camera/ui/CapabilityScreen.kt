@@ -65,7 +65,7 @@ private fun CameraCard(c: CameraFacts, cal: FactoryCalibration?, onShare: (Facto
             full?.lenses?.forEach { l ->
                 val f = l.apertures.minOrNull()?.let { " f/$it" }.orEmpty()
                 val ois = if (l.hasOis) ", OIS" else ""
-                val focus = if (l.fixedFocus) ", fixed focus" else ""
+                val focus = if (l.fixedFocus == true) ", fixed focus" else ""
                 Text(
                     "Lens ${l.cameraId}: ${"%.1f".format(l.equivalentDiagonalMm)}mm eq " +
                         "(3:2 ${"%.1f".format(l.equivalent32Mm)}mm)$f$ois$focus"
