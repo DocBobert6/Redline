@@ -14,9 +14,6 @@ on:
 permissions:
   contents: write
 
-env:
-  GRADLE_VERSION: "9.8.2"
-
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -42,8 +39,6 @@ jobs:
       # ubuntu-latest ships the Android SDK (ANDROID_HOME); AGP downloads missing platforms.
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: ${{ env.GRADLE_VERSION }}
 
       - name: Decode release keystore (optional)
         env:
@@ -63,7 +58,7 @@ jobs:
           REDLINE_KEY_ALIAS: ${{ secrets.REDLINE_KEY_ALIAS }}
           REDLINE_KEY_PASSWORD: ${{ secrets.REDLINE_KEY_PASSWORD }}
         run: >
-          gradle --stacktrace
+          ./gradlew --stacktrace
           -Predline.versionName=${{ steps.tag.outputs.version }}
           -Predline.versionCode=${{ github.run_number }}
           :app:testDebugUnitTest :app:assembleRelease :app:bundleRelease
