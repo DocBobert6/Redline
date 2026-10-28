@@ -1,0 +1,7 @@
+# Full desktop calibration toolchain (Phase 0). exiftool must be installed separately.
+numpy>=2.0
+scipy>=1.13
+rawpy>=0.22
+colour-science>=0.4.6
+opencv-python-headless>=4.10
+pytest>=8.0

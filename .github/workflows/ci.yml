@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_VERSION: "9.8.2"
+
+jobs:
+  android:
+    name: Build, lint, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Build version info
+        id: ver
+        run: |
+          echo "name=0.0.0-ci.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble debug, unit tests, lint
+        run: >
+          gradle --stacktrace
+          -Predline.versionName=${{ steps.ver.outputs.name }}
+          -Predline.versionCode=${{ steps.ver.outputs.code }}
+          :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: redline-debug-${{ steps.ver.outputs.code }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ steps.ver.outputs.code }}
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          retention-days: 14
+
+  calibration:
+    name: Calibration toolkit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r calibration/requirements-ci.txt
+      - run: python -m pytest calibration -q

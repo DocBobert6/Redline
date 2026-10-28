@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.keystore
+*.jks
+# calibration data (large, licensed separately - never commit)
+calibration/data/
+calibration/out/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
