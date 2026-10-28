@@ -40,16 +40,23 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Decode release keystore (optional)
+      - name: Prepare release keystore
         env:
           KEYSTORE_B64: ${{ secrets.REDLINE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.REDLINE_KEYSTORE_PASSWORD }}
         run: |
+          KS="$RUNNER_TEMP/redline.jks"
           if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/redline.jks"
-            echo "REDLINE_KEYSTORE_PATH=$RUNNER_TEMP/redline.jks" >> "$GITHUB_ENV"
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+          elif [ -n "$KEYSTORE_PASSWORD" ] && [ -f signing/redline-release.jks.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 \
+              -in signing/redline-release.jks.enc -out "$KS" -pass env:KEYSTORE_PASSWORD
+          fi
+          if [ -s "$KS" ]; then
+            echo "REDLINE_KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
             echo "Signing with the Redline release key."
           else
-            echo "::warning::No REDLINE_KEYSTORE_BASE64 secret - release APK is signed with a debug key (sideload only)."
+            echo "::warning::No release keystore available - release APK is signed with a debug key (sideload only)."
           fi
 
       - name: Build release APK + AAB

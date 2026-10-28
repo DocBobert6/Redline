@@ -11,14 +11,21 @@ Version name comes from the tag (`v0.1.2-alpha.1` -> `0.1.2-alpha.1`); version c
 
 ## Signing
 
-Add these repository secrets (Settings -> Secrets and variables -> Actions) to sign releases with the Redline key:
+The release keystore is committed **encrypted** at `signing/redline-release.jks.enc` (AES-256-CBC, PBKDF2 with 600,000 iterations). The Release workflow decrypts it with the `REDLINE_KEYSTORE_PASSWORD` secret. Required repository secrets (Settings -> Secrets and variables -> Actions):
 
-- `REDLINE_KEYSTORE_BASE64`: the `.jks` keystore, base64-encoded (`base64 -w0 redline.jks`)
-- `REDLINE_KEYSTORE_PASSWORD`
+- `REDLINE_KEYSTORE_PASSWORD`: keystore password, also the decryption passphrase
 - `REDLINE_KEY_ALIAS`
 - `REDLINE_KEY_PASSWORD`
 
-Without them, release builds are signed with a debug key: they install for sideload testing but cannot go to Google Play, and the workflow prints a warning. Keep the keystore backed up outside GitHub; losing it means a new app listing.
+Optional: `REDLINE_KEYSTORE_BASE64` (a base64 `.jks`) overrides the committed file, for rotating to a different key.
+
+Without a keystore, release builds are signed with a debug key: they install for sideload testing but cannot go to Google Play, and the workflow prints a warning. Keep an offline backup of the keystore and its password; losing them means a new app listing (or a Play App Signing key reset).
+
+Decrypt locally:
+
+```bash
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in signing/redline-release.jks.enc -out redline.jks
+```
 
 ## Cutting a release
 
