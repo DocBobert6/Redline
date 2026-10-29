@@ -64,7 +64,7 @@ class MainActivity : ComponentActivity() {
                 },
                 state = state.value,
                 onRunSelfTest = { runChecks(force = true) },
-                onRepeatSelfTest = if (BuildConfig.DEBUG) ({ repeatSelfTest(REPEAT_RUNS) }) else null
+                onRepeatSelfTest = { repeatSelfTest(REPEAT_RUNS) }
             )
         }
 
@@ -92,7 +92,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Debug-only: run the self-test [runs] times in a row and count clean passes (the B11 100/100 gate). */
+    /** Run the self-test [runs] times in a row and count clean passes (the B11 100/100 gate). */
     private fun repeatSelfTest(runs: Int) {
         val app = applicationContext
         val camera = FeaturePolicy.defaultCamera(profile)
