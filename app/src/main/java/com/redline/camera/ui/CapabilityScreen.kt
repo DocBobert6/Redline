@@ -114,9 +114,9 @@ fun CapabilityScreen(
                             v.status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         }
                         if (onToggleStabilization != null) {
-                            val next = v?.stabilizationOverride?.let { !it } ?: !policy.defaults.previewStabilization
+                            val next = v?.stabilizationOverride?.let { !it } ?: !policy.defaults.previewStabilizationOnByDefault
                             OutlinedButton(onClick = onToggleStabilization, modifier = Modifier.padding(top = 8.dp)) {
-                                Text("Test: turn preview stabilization ${if (next) "on" else "off"}")
+                                Text("Turn preview stabilization ${if (next) "on" else "off"} (default off)")
                             }
                         }
                         state.zoomPlan?.stops?.forEach { s ->
@@ -138,7 +138,10 @@ fun CapabilityScreen(
                     SectionCard("Effective defaults") {
                         val d = policy.defaults
                         Text("Still path ${d.stillPath}, video ${d.videoFps} fps")
-                        Text("Preview stabilization ${d.previewStabilization}, stabilized 60 fps ${d.stabilized60fps}")
+                        Text(
+                            "Preview stabilization available ${d.previewStabilization}, " +
+                                "on by default ${d.previewStabilizationOnByDefault}, stabilized 60 fps ${d.stabilized60fps}"
+                        )
                         val q = state.quirks
                         Text("Quirks table ${q.source} v${q.version}, ${state.quirkDisables.size} feature(s) disabled")
                         if (state.forced.isNotEmpty()) Text("Forced failures (debug): ${state.forced.sorted().joinToString()}")

@@ -30,6 +30,8 @@ class FeaturePolicyTest {
         assertEquals(24, r.defaults.videoFps)
         assertTrue(r.defaults.previewStabilization)
         assertTrue(r.defaults.stabilized60fps)
+        assertFalse("preview stabilization is opt-in", r.defaults.previewStabilizationOnByDefault)
+        assertEquals(false, r.defaults.toMap()["preview_stabilization_on_by_default"])
         assertEquals("0", r.defaults.cameraId)
         assertTrue(r.demotions.toString(), r.demotions.isEmpty())
     }
