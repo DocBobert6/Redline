@@ -38,7 +38,6 @@ fun CapabilityScreen(
     onRunSelfTest: () -> Unit = {},
     onRepeatSelfTest: (() -> Unit)? = null,
     onToggleStabilization: (() -> Unit)? = null,
-    onToggleDngCrop: (() -> Unit)? = null,
     onRunStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
@@ -74,17 +73,6 @@ fun CapabilityScreen(
                     SectionCard("Capture") {
                         val c = state.capture
                         Text("Shots ${c.shots}, failures ${c.failures}, DNG ${c.dngSaved}/${c.dngWanted}")
-                        if (onToggleDngCrop != null) {
-                            OutlinedButton(onClick = onToggleDngCrop, modifier = Modifier.padding(top = 8.dp)) {
-                                val now = if (c.dngCropToFrame) "on" else "off"
-                                val next = if (c.dngCropToFrame) "off" else "on"
-                                Text("Crop DNG to zoom frame: $now (tap to turn $next)")
-                            }
-                            Text(
-                                "Tags the DNG with the 3:2 zoom framing. Every sensor pixel is kept; undo the crop in your editor.",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
                         c.avgSaveMs?.let { Text("Shutter to saved: avg $it ms, max ${c.maxSaveMs} ms") }
                         c.last?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         if (c.stressRequested > 0) {

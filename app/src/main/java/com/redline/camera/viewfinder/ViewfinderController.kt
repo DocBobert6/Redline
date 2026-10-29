@@ -144,8 +144,6 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val stopTargetMm: Int,
         val trueEquivalentMm: Float?,
         val stopLongPx: Int,
-        val lensCrop: Float = 1f,
-        val dngCropToFrame: Boolean = true,
         val deviceDegrees: Int,
         val keep: Boolean
     )
@@ -489,8 +487,6 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             stopTargetMm = r.stopTargetMm,
             trueEquivalentMm = r.trueEquivalentMm,
             stopLongPx = r.stopLongPx,
-            lensCrop = r.lensCrop,
-            dngCropToFrame = r.dngCropToFrame,
             shutterAtMs = p.shutterAtMs,
             keep = r.keep
         )

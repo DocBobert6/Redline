@@ -203,9 +203,6 @@ class MainActivity : ComponentActivity() {
             if (it.getBoolean(STATE_CAPABILITY, false)) screen.value = Screen.CAPABILITY
         }
 
-        val dngCrop = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_DNG_CROP, true)
-        state.value = state.value.copy(capture = state.value.capture.copy(dngCropToFrame = dngCrop))
-
         val quirksRepo = QuirksRepository(this)
         val quirks = quirksRepo.load()
         val forced = if (BuildConfig.DEBUG) DebugOverrides.parse(intent.getStringExtra(EXTRA_FORCE_FAIL)) else emptySet()
@@ -332,7 +329,6 @@ class MainActivity : ComponentActivity() {
                 } else {
                     null
                 },
-                onToggleDngCrop = ::toggleDngCrop,
                 onRunStress = {
                     stressPending = true
                     showViewfinder()
@@ -362,13 +358,6 @@ class MainActivity : ComponentActivity() {
         controller.setRaw(rawOn.value)
     }
 
-    /** Settings: DNG framing tag on/off, persisted (default on). */
-    private fun toggleDngCrop() {
-        val next = !state.value.capture.dngCropToFrame
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_DNG_CROP, next).apply()
-        state.value = state.value.copy(capture = state.value.capture.copy(dngCropToFrame = next))
-    }
-
     /** One still with the selected stop's framing. [done] runs on the main thread. */
     private fun shoot(keep: Boolean, done: (ShotResult) -> Unit) {
         val stop = setupState.value?.zoomPlan?.stop(selectedStop.intValue)
@@ -377,8 +366,6 @@ class MainActivity : ComponentActivity() {
             stopTargetMm = stop?.targetMm ?: selectedStop.intValue,
             trueEquivalentMm = stop?.trueEquivalentMm,
             stopLongPx = stop?.outputWidthPx ?: 0,
-            lensCrop = stop?.zoomRatio ?: 1f,
-            dngCropToFrame = state.value.capture.dngCropToFrame,
             deviceDegrees = deviceDegrees,
             keep = keep
         )
@@ -624,8 +611,6 @@ class MainActivity : ComponentActivity() {
         private const val STATE_STOP = "redline.zoom_stop"
         private const val STATE_CAPABILITY = "redline.capability_screen"
         private const val STATE_RAW = "redline.raw"
-        private const val PREFS = "redline_settings"
-        private const val PREF_DNG_CROP = "dng_crop_to_frame"
         private const val DEFAULT_SENSOR_ORIENTATION = 90
 
         /** Deferred checks start at the first preview frame, or after this long if no frame arrives. */
