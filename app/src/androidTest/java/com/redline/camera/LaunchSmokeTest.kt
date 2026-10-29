@@ -12,12 +12,14 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.capability.CapabilityProbe
 import com.redline.camera.capability.DeviceProfileProbe
+import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ShootMode
 import com.redline.camera.ui.BACK_TAG
 import com.redline.camera.ui.GRID_TOGGLE_TAG
 import com.redline.camera.ui.HISTOGRAM_TOGGLE_TAG
 import com.redline.camera.ui.LEVEL_TOGGLE_TAG
 import com.redline.camera.ui.LIST_TAG
+import com.redline.camera.ui.LOOK_SECTION_TITLE
 import com.redline.camera.ui.MODE_ROW_TAG
 import com.redline.camera.ui.OPEN_CAPABILITY_TAG
 import com.redline.camera.ui.VIEWFINDER_TAG
@@ -133,6 +135,22 @@ class LaunchSmokeTest {
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Viewfinder") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Feature combinations") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Demotions") }
+    }
+
+    /**
+     * B20: the Look preview section is always there. The emulator may lack OpenGL ES 3 or the native ABI; then the
+     * section says why and the app keeps running on the plain preview. Either way the start-up checks finish.
+     */
+    @Test
+    fun capabilityScreenShowsLookPreviewSection() {
+        launch()
+        openCapabilityScreen()
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo(LOOK_SECTION_TITLE) }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo(LookPreviewReport.LABEL) }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo("LUT pass", substring = true) }
+        compose.waitUntil(TIMEOUT_MS) { !scrolledTo("checking OpenGL ES", substring = true) }
+        compose.onNodeWithTag(BACK_TAG).performClick()
+        compose.waitUntil(TIMEOUT_MS) { exists(VIEWFINDER_TAG) }
     }
 
     @Test

@@ -39,3 +39,35 @@ def apply_lut(rgb: np.ndarray, lut: np.ndarray) -> np.ndarray:
                 )
                 out += w[..., None] * lut[i0[..., 0] + dr, i0[..., 1] + dg, i0[..., 2] + db]
     return out
+
+
+def read_cube(path: str) -> np.ndarray:
+    """Read a 3D .cube file (red fastest) into a [r][g][b] -> rgb array.
+
+    Handles TITLE, LUT_3D_SIZE, comments and blank lines. DOMAIN_MIN/MAX other than 0..1 and 1D LUTs are refused,
+    since every Redline LUT is written by write_cube on the unit cube.
+    """
+    size = None
+    rows: list[list[float]] = []
+    with open(path, encoding="ascii") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            key = line.split()[0]
+            if key == "LUT_3D_SIZE":
+                size = int(line.split()[1])
+            elif key == "LUT_1D_SIZE":
+                raise ValueError("1D LUTs are not supported")
+            elif key in ("DOMAIN_MIN", "DOMAIN_MAX"):
+                vals = [float(v) for v in line.split()[1:4]]
+                if vals != ([0.0] * 3 if key == "DOMAIN_MIN" else [1.0] * 3):
+                    raise ValueError(f"{key} other than the unit cube is not supported")
+            elif key[0].isdigit() or key[0] in "-+.":
+                rows.append([float(v) for v in line.split()[:3]])
+    if size is None:
+        raise ValueError("missing LUT_3D_SIZE")
+    if len(rows) != size**3:
+        raise ValueError(f"expected {size**3} entries, found {len(rows)}")
+    flat = np.asarray(rows, dtype=float).reshape(size, size, size, 3)  # [b][g][r]
+    return flat.transpose(2, 1, 0, 3).copy()
