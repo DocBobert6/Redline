@@ -1,12 +1,12 @@
 package com.redline.camera.capability
 
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
 
 class QuirksTest {
     private val device = DeviceKey("Acme", "Phone 9", "acme/phone9/phone9:15/AP1A/123:user/release-keys", 35)
