@@ -18,6 +18,7 @@ import android.provider.MediaStore
 import android.util.Log
 import com.redline.camera.capability.Dim
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
 
@@ -33,6 +34,10 @@ class StillShot(
     val stopTargetMm: Int,
     val trueEquivalentMm: Float?,
     val stopLongPx: Int,
+    /** Sensor crop of the selected stop on the RAW source (1.0 = full width). */
+    val lensCrop: Float = 1f,
+    /** Setting: tag the DNG with the stop's 3:2 framing (DefaultCrop); pixels stay full-sensor. */
+    val dngCropToFrame: Boolean = true,
     val shutterAtMs: Long,
     /** False for stress-test shots: the files are fully written through MediaStore, then deleted. */
     val keep: Boolean
@@ -42,7 +47,8 @@ class StillShot(
  * B13 still saving (PLAN 6 step 9, minus the look): the HAL JPEG is cropped to the viewfinder's 3:2,
  * scaled to the zoom stop's honest output size, re-encoded, given EXIF (camera tags copied, Make/Model
  * untouched, look tag added) and saved to DCIM/Redline through MediaStore. With RAW on, the RAW_SENSOR
- * frame is written as a DNG next to it with DngCreator (full sensor; the 3:2 crop is a JPEG-only step).
+ * frame is written as a DNG next to it with DngCreator. The DNG keeps every sensor pixel; with the crop setting on
+ * its DefaultCrop tags carry the stop's 3:2 framing, so editors open it framed like the JPEG (undoable).
  */
 class StillSaver(context: Context, private val version: String) {
     private val app = context.applicationContext
@@ -63,10 +69,11 @@ class StillSaver(context: Context, private val version: String) {
             false
         }
         var dngOk = false
+        var dngCropped = false
         val raw = shot.raw
         if (raw != null) {
             try {
-                saveDng(shot, raw, base, look)
+                dngCropped = saveDng(shot, raw, base, look)
                 dngOk = true
             } catch (e: Throwable) {
                 Log.w(TAG, "DNG save failed", e)
@@ -80,6 +87,7 @@ class StillSaver(context: Context, private val version: String) {
             jpegSize = jpegSize,
             dngSaved = dngOk,
             dngWanted = raw != null,
+            dngCropped = dngCropped,
             shutterToSavedMs = nowMs() - shot.shutterAtMs,
             error = error,
             kept = shot.keep
@@ -138,12 +146,30 @@ class StillSaver(context: Context, private val version: String) {
         exif.saveAttributes()
     }
 
-    private fun saveDng(shot: StillShot, raw: Image, base: String, look: String) {
+    /** Writes the DNG; returns true when the stop's framing was written into its DefaultCrop tags. */
+    private fun saveDng(shot: StillShot, raw: Image, base: String, look: String): Boolean {
+        val buf = ExposedBytes(DNG_BUFFER_HINT)
         DngCreator(shot.characteristics, shot.result).use { dng ->
             dng.setOrientation(CaptureMath.exifOrientation(shot.jpegOrientation))
             dng.setDescription(look)
-            insert("$base.dng", "image/x-adobe-dng", shot.keep) { os -> dng.writeImage(os, raw) }
+            dng.writeImage(buf, raw)
         }
+        var cropped = false
+        if (shot.dngCropToFrame) {
+            val bytes = buf.bytes()
+            val writerCrop = DngCrop.read(bytes, buf.size())
+            if (writerCrop != null) {
+                cropped = DngCrop.write(bytes, DngCrop.frame(writerCrop, shot.lensCrop), buf.size())
+            }
+            if (!cropped) Log.w(TAG, "DNG DefaultCrop tags not found; saved uncropped")
+        }
+        insert("$base.dng", "image/x-adobe-dng", shot.keep) { os -> buf.writeTo(os) }
+        return cropped
+    }
+
+    /** Lets the DNG bytes be patched in place without a second 24 MB copy. */
+    private class ExposedBytes(size: Int) : ByteArrayOutputStream(size) {
+        fun bytes(): ByteArray = buf
     }
 
     /** Pending insert, write, publish; a stress shot is deleted after the full write instead of published. */
@@ -180,6 +206,7 @@ class StillSaver(context: Context, private val version: String) {
     companion object {
         private const val TAG = "RedlineSaver"
         const val JPEG_QUALITY = 95
+        private const val DNG_BUFFER_HINT = 26 * 1024 * 1024
 
         /** No look is applied before B21 (RAW colour pipeline); the tag says so. */
         const val LOOK_NONE = "none (camera JPEG)"

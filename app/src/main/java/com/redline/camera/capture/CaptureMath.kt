@@ -93,6 +93,7 @@ data class ShotResult(
     val jpegSize: Dim? = null,
     val dngSaved: Boolean = false,
     val dngWanted: Boolean = false,
+    val dngCropped: Boolean = false,
     val shutterToSavedMs: Long? = null,
     val error: String? = null,
     val kept: Boolean = true
@@ -102,7 +103,7 @@ data class ShotResult(
         else -> buildString {
             append(if (kept) "Saved " else "Captured ")
             append("JPEG ${jpegSize ?: "?"}")
-            if (dngWanted) append(if (dngSaved) " + DNG" else " (DNG failed: ${error ?: "?"})")
+            if (dngWanted) append(if (dngSaved) (if (dngCropped) " + DNG (framed)" else " + DNG") else " (DNG failed: ${error ?: "?"})")
             shutterToSavedMs?.let { append(" in $it ms") }
         }
     }
@@ -114,6 +115,9 @@ data class CaptureStats(
     val failures: Int = 0,
     val dngWanted: Int = 0,
     val dngSaved: Int = 0,
+    val dngCropped: Int = 0,
+    /** Setting: DNGs carry the stop's 3:2 framing as DefaultCrop tags (default on, persisted). */
+    val dngCropToFrame: Boolean = true,
     val totalSaveMs: Long = 0,
     val maxSaveMs: Long = 0,
     val lastError: String? = null,
@@ -133,6 +137,7 @@ data class CaptureStats(
             failures = failures + if (failed) 1 else 0,
             dngWanted = dngWanted + if (r.dngWanted) 1 else 0,
             dngSaved = dngSaved + if (r.dngSaved) 1 else 0,
+            dngCropped = dngCropped + if (r.dngCropped) 1 else 0,
             totalSaveMs = totalSaveMs + ms,
             maxSaveMs = max(maxSaveMs, ms),
             lastError = if (failed) r.error ?: "unknown" else lastError,
@@ -158,6 +163,8 @@ data class CaptureStats(
         "failures" to failures,
         "dng_wanted" to dngWanted,
         "dng_saved" to dngSaved,
+        "dng_crop_to_frame" to dngCropToFrame,
+        "dng_cropped" to dngCropped,
         "avg_shutter_to_saved_ms" to avgSaveMs,
         "max_shutter_to_saved_ms" to if (shots == 0) null else maxSaveMs,
         "last" to last,
