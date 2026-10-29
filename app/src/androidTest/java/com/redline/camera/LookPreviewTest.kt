@@ -4,13 +4,13 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.look.LookPreviewRenderer
 import com.redline.camera.nativebridge.RedlineNative
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.TimeUnit
 
 /**
  * B20 on a real Android runtime: the native module loads for this ABI and parses the bundled LUT, and wherever the
