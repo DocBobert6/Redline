@@ -206,9 +206,7 @@ class StillSaver(context: Context, private val version: String) {
             ExifInterface.TAG_METERING_MODE,
             ExifInterface.TAG_WHITE_BALANCE,
             ExifInterface.TAG_FLASH,
-            ExifInterface.TAG_COLOR_SPACE,
-            ExifInterface.TAG_LENS_MAKE,
-            ExifInterface.TAG_LENS_MODEL
+            ExifInterface.TAG_COLOR_SPACE
         )
     }
 }
