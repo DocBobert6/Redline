@@ -1,6 +1,7 @@
 package com.redline.camera.capability
 
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.manual.ManualReport
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
 
@@ -26,7 +27,9 @@ data class CapabilityState(
     /** B12 zoom stops for the default camera. */
     val zoomPlan: ZoomPlan? = null,
     /** B13 still-capture counters and the 500-shot stress run. */
-    val capture: CaptureStats = CaptureStats()
+    val capture: CaptureStats = CaptureStats(),
+    /** B14 manual controls: ranges read, mode, current values, clamp events and the range gate. */
+    val manual: ManualReport = ManualReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -37,7 +40,7 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections (self_test, combinations, effective_defaults, demotions, quirks) and B12 viewfinder. */
+    /** The B10 profile plus the B11 sections, the B12 viewfinder, B13 capture and B14 manual controls. */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -54,6 +57,7 @@ object CapabilityReport {
         )
         out["viewfinder"] = (state.viewfinder ?: ViewfinderMetrics(status = "not opened")).toMap(state.zoomPlan)
         out["capture"] = state.capture.toMap()
+        out["manual"] = state.manual.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

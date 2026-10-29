@@ -26,6 +26,8 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.manual.ManualCaps
+import com.redline.camera.manual.ManualMath
 
 @Composable
 fun CapabilityScreen(
@@ -89,6 +91,32 @@ fun CapabilityScreen(
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
+                    }
+                }
+                item {
+                    SectionCard("Manual controls") {
+                        val m = state.manual
+                        val caps = m.caps
+                        if (caps == null) {
+                            Text("Ranges not read yet")
+                        } else {
+                            val mode = m.applied?.mode ?: m.settings.mode
+                            Text("Mode ${mode.label}; offered ${caps.modes().joinToString { it.label }}")
+                            Text("ISO ${caps.isoRange?.toList() ?: "not reported"}, shutter ${shutterRange(caps)}")
+                            Text("Focus ${focusRange(caps)}, aperture ${caps.apertureLabel}")
+                            Text("EV ${evRange(caps)}, AE lock ${caps.aeLockAvailable}, AWB lock ${caps.awbLockAvailable}")
+                            val presets = caps.awbPresets.joinToString { ManualCaps.awbLabel(it) }
+                            Text("WB presets ${presets.ifEmpty { "none" }}")
+                            val outOfRange = m.resultViolationCount + m.appliedOutOfRange
+                            Text("Clamps ${m.clampCount}, results checked ${m.resultsChecked}, out of range $outOfRange")
+                            Text("Gate (every control within reported ranges): ${gateWord(m.gatePassed)}")
+                            m.clampEvents.takeLast(3).forEach { Text("Clamped $it", style = MaterialTheme.typography.bodySmall) }
+                            caps.hidden().forEach { (k, why) -> Text("$k: $why", style = MaterialTheme.typography.bodySmall) }
+                        }
+                        Text(
+                            "Histogram: ${m.histogramSource ?: "-"}; level: ${m.levelSensor ?: "-"}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
                 }
                 item {
@@ -190,6 +218,24 @@ private fun gateWord(ok: Boolean?): String = when (ok) {
     null -> "not measured"
     true -> "pass"
     false -> "FAIL"
+}
+
+private fun shutterRange(c: ManualCaps): String {
+    val l = c.shutterLadder
+    if (l.isEmpty()) return "not reported"
+    return "${ManualMath.shutterLabel(l.first())} to ${ManualMath.shutterLabel(l.last())}"
+}
+
+private fun evRange(c: ManualCaps): String {
+    val l = c.evLadder
+    if (l.isEmpty()) return "not offered"
+    return "${ManualMath.evLabel(l.first().ev)} to ${ManualMath.evLabel(l.last().ev)}"
+}
+
+private fun focusRange(c: ManualCaps): String {
+    val m = c.minFocusDiopters ?: return "not reported"
+    if (!c.manualFocus) return "fixed or auto only ($m D)"
+    return "∞ to ${ManualMath.focusLabel(m, m, c.metricFocus)} ($m D, ${c.minFocusSource}, ${c.focusCalibration ?: "?"})"
 }
 
 private fun statusWord(s: CheckStatus): String = when (s) {

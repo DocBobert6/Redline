@@ -2,14 +2,21 @@ package com.redline.camera
 
 import android.Manifest
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -34,7 +41,15 @@ import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.capture.ShotResult
+import com.redline.camera.manual.ManualApplied
+import com.redline.camera.manual.ManualCaps
+import com.redline.camera.manual.ManualMath
+import com.redline.camera.manual.ManualModel
+import com.redline.camera.manual.ManualSettings
+import com.redline.camera.manual.ShootMode
 import com.redline.camera.ui.CapabilityScreen
+import com.redline.camera.ui.ManualActions
+import com.redline.camera.ui.ManualUi
 import com.redline.camera.ui.ViewfinderScreen
 import com.redline.camera.viewfinder.ViewfinderController
 import com.redline.camera.viewfinder.ViewfinderMetrics
@@ -44,6 +59,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /**
  * Opens on the 3:2 viewfinder (B12); the capability screen (B10/B11) is one tap away.
@@ -73,6 +89,26 @@ class MainActivity : ComponentActivity() {
     private var deviceDegrees = 0
     private var stressPending = false
     private var stressAbort = false
+
+    // B14 manual controls and pro tools (main thread).
+    private val manualSettings = mutableStateOf(ManualSettings())
+    private val manualApplied = mutableStateOf<ManualApplied?>(null)
+    private val gridOn = mutableStateOf(FeaturePolicy.GRID_ON_BY_DEFAULT)
+    private val levelOn = mutableStateOf(FeaturePolicy.LEVEL_ON_BY_DEFAULT)
+    private val histogramOn = mutableStateOf(FeaturePolicy.HISTOGRAM_ON_BY_DEFAULT)
+    private val histogram = mutableStateOf<IntArray?>(null)
+    private val tilt = mutableStateOf<Float?>(null)
+    private val liveText = mutableStateOf<String?>(null)
+    private var lastAuto: ViewfinderController.ResultValues? = null
+    private var previewView: TextureView? = null
+    private var histBitmap: Bitmap? = null
+    private val histPixels = IntArray(HIST_W * HIST_H)
+    private var sensorManager: SensorManager? = null
+    private var levelSensor: Sensor? = null
+    private var levelRegistered = false
+    private var lastTiltMs = 0L
+    private val gravity = FloatArray(3)
+    private val rotation = FloatArray(9)
 
     private val profile: DeviceProfile? get() = profileState.value
 
@@ -169,6 +205,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        override fun onPreviewValues(values: ViewfinderController.ResultValues) {
+            runOnUiThread {
+                if (values.manual?.aeOff != true) lastAuto = values
+                liveText.value = liveLine(values)
+                checkResult(values)
+            }
+        }
+
+        override fun onStillValues(values: ViewfinderController.ResultValues) {
+            runOnUiThread { checkResult(values) }
+        }
+
         override fun onRawUnavailable(reason: String) {
             runOnUiThread {
                 rawOn.value = false
@@ -200,6 +248,7 @@ class MainActivity : ComponentActivity() {
         savedInstanceState?.let {
             selectedStop.intValue = it.getInt(STATE_STOP, ZoomStops.DEFAULT_STOP)
             rawOn.value = it.getBoolean(STATE_RAW, false)
+            restoreManual(it)
             if (it.getBoolean(STATE_CAPABILITY, false)) screen.value = Screen.CAPABILITY
         }
 
@@ -232,6 +281,13 @@ class MainActivity : ComponentActivity() {
         }
 
         if (awaitingPermission) permissionRequest.launch(Manifest.permission.CAMERA)
+
+        sensorManager = getSystemService(SENSOR_SERVICE) as? SensorManager
+        levelSensor = sensorManager?.let { sm ->
+            sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+                ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+                ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        }
     }
 
     private fun onProfileReady(loaded: DeviceProfile?, cacheHit: Boolean, setup: ViewfinderSetup?) {
@@ -251,6 +307,19 @@ class MainActivity : ComponentActivity() {
         if (setup?.zoomPlan?.stop(selectedStop.intValue) == null) {
             selectedStop.intValue = setup?.zoomPlan?.stops?.firstOrNull()?.targetMm ?: ZoomStops.DEFAULT_STOP
         }
+        update {
+            it.copy(
+                manual = it.manual.copy(
+                    caps = setup?.manual,
+                    gridOn = gridOn.value,
+                    levelOn = levelOn.value,
+                    histogramOn = histogramOn.value,
+                    histogramSource = HISTOGRAM_SOURCE,
+                    levelSensor = levelSensorName()
+                )
+            )
+        }
+        applyManual()
         syncCamera()
         if (!awaitingPermission) scheduleChecks(immediate = !permissionGranted.value || setup == null)
     }
@@ -261,11 +330,16 @@ class MainActivity : ComponentActivity() {
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
         permissionGranted.value = SelfTest(this).hasPermission()
         syncCamera()
+        syncLevelSensor()
+        mainHandler.removeCallbacks(histogramTick)
+        mainHandler.postDelayed(histogramTick, HISTOGRAM_PERIOD_MS)
     }
 
     override fun onPause() {
         resumed = false
         orientationListener.disable()
+        mainHandler.removeCallbacks(histogramTick)
+        syncLevelSensor()
         syncCamera()
         super.onPause()
     }
@@ -281,6 +355,36 @@ class MainActivity : ComponentActivity() {
         outState.putInt(STATE_STOP, selectedStop.intValue)
         outState.putBoolean(STATE_CAPABILITY, screen.value == Screen.CAPABILITY)
         outState.putBoolean(STATE_RAW, rawOn.value)
+        val m = manualSettings.value
+        outState.putString(STATE_MODE, m.mode.name)
+        outState.putInt(STATE_ISO, m.iso)
+        outState.putLong(STATE_EXPOSURE, m.exposureNs)
+        outState.putFloat(STATE_FOCUS, m.focusDiopters ?: Float.NaN)
+        outState.putInt(STATE_EV, m.evIndex)
+        outState.putBoolean(STATE_AE_LOCK, m.aeLock)
+        outState.putBoolean(STATE_AWB_LOCK, m.awbLock)
+        outState.putString(STATE_AWB, m.awb)
+        outState.putBoolean(STATE_GRID, gridOn.value)
+        outState.putBoolean(STATE_LEVEL, levelOn.value)
+        outState.putBoolean(STATE_HISTOGRAM, histogramOn.value)
+    }
+
+    private fun restoreManual(b: Bundle) {
+        val d = ManualSettings()
+        val focus = b.getFloat(STATE_FOCUS, Float.NaN)
+        manualSettings.value = ManualSettings(
+            mode = runCatching { ShootMode.valueOf(b.getString(STATE_MODE) ?: "") }.getOrDefault(d.mode),
+            iso = b.getInt(STATE_ISO, d.iso),
+            exposureNs = b.getLong(STATE_EXPOSURE, d.exposureNs),
+            focusDiopters = if (focus.isNaN()) null else focus,
+            evIndex = b.getInt(STATE_EV, d.evIndex),
+            aeLock = b.getBoolean(STATE_AE_LOCK, d.aeLock),
+            awbLock = b.getBoolean(STATE_AWB_LOCK, d.awbLock),
+            awb = b.getString(STATE_AWB) ?: d.awb
+        )
+        gridOn.value = b.getBoolean(STATE_GRID, gridOn.value)
+        levelOn.value = b.getBoolean(STATE_LEVEL, levelOn.value)
+        histogramOn.value = b.getBoolean(STATE_HISTOGRAM, histogramOn.value)
     }
 
     @Composable
@@ -305,7 +409,20 @@ class MainActivity : ComponentActivity() {
                 rawAvailable = rawAvailable(),
                 rawOn = rawOn.value,
                 onToggleRaw = ::toggleRaw,
-                captureText = state.value.capture.overlayText()
+                captureText = state.value.capture.overlayText(),
+                manualUi = ManualUi(
+                    caps = setup?.manual,
+                    settings = manualSettings.value,
+                    applied = manualApplied.value,
+                    live = liveText.value,
+                    histogram = histogram.value,
+                    tiltDeg = tilt.value,
+                    gridOn = gridOn.value,
+                    levelOn = levelOn.value,
+                    histogramOn = histogramOn.value
+                ),
+                manualActions = manualActions,
+                onPreviewView = { previewView = it }
             )
         } else {
             CapabilityScreen(
@@ -335,6 +452,186 @@ class MainActivity : ComponentActivity() {
                 },
                 onBack = ::showViewfinder
             )
+        }
+    }
+
+    private val manualActions = ManualActions(
+        onMode = ::selectMode,
+        onIso = { dir -> stepManual { caps, s -> s.copy(iso = ManualMath.stepIso(caps.isoLadder, s.iso, dir)) } },
+        onShutter = { dir -> stepManual { caps, s -> s.copy(exposureNs = ManualMath.stepShutter(caps.shutterLadder, s.exposureNs, dir)) } },
+        onFocus = { dir -> stepManual { caps, s -> s.copy(focusDiopters = ManualMath.stepFocus(caps.focusLadder, s.focusDiopters, dir)) } },
+        onEv = { dir -> stepManual { caps, s -> s.copy(evIndex = ManualMath.stepEv(caps.evLadder, s.evIndex, dir)) } },
+        onToggleAeLock = { stepManual { _, s -> s.copy(aeLock = !s.aeLock) } },
+        onToggleAwbLock = { stepManual { _, s -> s.copy(awbLock = !s.awbLock) } },
+        onCycleAwb = {
+            stepManual { caps, s ->
+                val presets = caps.awbPresets
+                val i = presets.indexOf(s.awb)
+                s.copy(awb = if (presets.isEmpty()) "AUTO" else presets[(i + 1).mod(presets.size)])
+            }
+        },
+        onToggleGrid = {
+            gridOn.value = !gridOn.value
+            update { it.copy(manual = it.manual.copy(gridOn = gridOn.value)) }
+        },
+        onToggleLevel = {
+            levelOn.value = !levelOn.value
+            syncLevelSensor()
+            update { it.copy(manual = it.manual.copy(levelOn = levelOn.value)) }
+        },
+        onToggleHistogram = {
+            histogramOn.value = !histogramOn.value
+            if (!histogramOn.value) histogram.value = null
+            update { it.copy(manual = it.manual.copy(histogramOn = histogramOn.value)) }
+        }
+    )
+
+    private fun stepManual(change: (ManualCaps, ManualSettings) -> ManualSettings) {
+        val caps = setupState.value?.manual ?: return
+        applyManual(change(caps, manualSettings.value))
+    }
+
+    /** Entering M starts from what auto exposure was doing, snapped to the ladders. */
+    private fun selectMode(mode: ShootMode) {
+        val caps = setupState.value?.manual ?: return
+        val s = manualSettings.value
+        if (mode == ShootMode.M && s.mode != ShootMode.M) {
+            val auto = lastAuto
+            applyManual(
+                s.copy(
+                    mode = mode,
+                    iso = ManualMath.snapIso(caps.isoLadder, auto?.iso ?: s.iso),
+                    exposureNs = ManualMath.snapShutter(caps.shutterLadder, auto?.exposureNs ?: s.exposureNs),
+                    focusDiopters = null
+                )
+            )
+        } else {
+            applyManual(s.copy(mode = mode))
+        }
+    }
+
+    /**
+     * Resolves [next] against the reported ranges (ManualModel clamps and records any clamp), keeps the stored
+     * settings on the clamped values, and hands the result to the camera for both the preview and the stills.
+     */
+    private fun applyManual(next: ManualSettings = manualSettings.value) {
+        val caps = setupState.value?.manual
+        if (caps == null) {
+            manualSettings.value = next
+            manualApplied.value = null
+            controller.setManual(null)
+            return
+        }
+        val a = ManualModel.resolve(caps, next)
+        val normalized = next.copy(
+            mode = a.mode,
+            iso = a.stillIso ?: next.iso,
+            exposureNs = a.stillExposureNs ?: next.exposureNs,
+            focusDiopters = if (a.mode == ShootMode.M) a.focusDiopters else next.focusDiopters,
+            evIndex = if (a.mode == ShootMode.AV) a.evIndex else next.evIndex,
+            awb = if (a.mode != ShootMode.AUTO) a.awbMode else next.awb
+        )
+        manualSettings.value = normalized
+        manualApplied.value = a
+        controller.setManual(a)
+        update { it.copy(manual = it.manual.copy(caps = caps).record(a, normalized)) }
+    }
+
+    /** B14 gate evidence: values Redline set manually must come back inside the reported ranges. */
+    private fun checkResult(v: ViewfinderController.ResultValues) {
+        val m = v.manual ?: return
+        val caps = setupState.value?.manual ?: return
+        if (!m.aeOff && m.focusDiopters == null) return
+        val violations = ManualModel.violations(
+            caps,
+            if (m.aeOff) v.iso else null,
+            if (m.aeOff) v.exposureNs else null,
+            if (m.focusDiopters != null) v.focusDiopters else null
+        )
+        update { it.copy(manual = it.manual.recordResult(violations)) }
+    }
+
+    private fun liveLine(v: ViewfinderController.ResultValues): String {
+        val caps = setupState.value?.manual
+        val parts = mutableListOf<String>()
+        v.iso?.let { parts += "ISO $it" }
+        v.exposureNs?.let { parts += ManualMath.shutterLabel(it) }
+        val f = v.focusDiopters
+        if (f != null && caps?.manualFocus == true) parts += ManualMath.focusLabel(f, caps.minFocusDiopters, caps.metricFocus)
+        val mf = if (v.manual?.focusDiopters != null) "MF" else "AF"
+        return "Live: ${parts.joinToString(" · ")} · $mf"
+    }
+
+    /** Histogram from a downscaled TextureView sample, about 4 times a second, only while it is visible. */
+    private val histogramTick = object : Runnable {
+        override fun run() {
+            sampleHistogram()
+            if (resumed) mainHandler.postDelayed(this, HISTOGRAM_PERIOD_MS)
+        }
+    }
+
+    private fun sampleHistogram() {
+        if (!histogramOn.value || !streaming.value || screen.value != Screen.VIEWFINDER) return
+        val v = previewView ?: return
+        if (!v.isAttachedToWindow || !v.isAvailable) return
+        val bmp = histBitmap ?: Bitmap.createBitmap(HIST_W, HIST_H, Bitmap.Config.ARGB_8888).also { histBitmap = it }
+        runCatching { v.getBitmap(bmp) }.getOrNull() ?: return
+        bmp.getPixels(histPixels, 0, HIST_W, 0, 0, HIST_W, HIST_H)
+        histogram.value = ManualMath.histogramFromArgb(histPixels, ManualMath.DEFAULT_BINS)
+    }
+
+    private val levelListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val up = if (e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                for (i in 0..2) gravity[i] += LEVEL_SMOOTHING * (e.values[i] - gravity[i])
+                gravity
+            } else {
+                if (runCatching { SensorManager.getRotationMatrixFromVector(rotation, e.values) }.isFailure) return
+                floatArrayOf(rotation[6], rotation[7], rotation[8])
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastTiltMs < LEVEL_PERIOD_MS) return
+            lastTiltMs = now
+            val t = ManualMath.horizonTiltDegrees(up[0], up[1], up[2], displayRotationDegrees())
+            val old = tilt.value
+            if (t == null || old == null || abs(t - old) >= LEVEL_MIN_CHANGE_DEG) tilt.value = t
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    private fun syncLevelSensor() {
+        val sm = sensorManager ?: return
+        val sensor = levelSensor ?: return
+        val want = resumed && levelOn.value
+        if (want && !levelRegistered) {
+            levelRegistered = sm.registerListener(levelListener, sensor, SensorManager.SENSOR_DELAY_UI)
+        } else if (!want && levelRegistered) {
+            sm.unregisterListener(levelListener)
+            levelRegistered = false
+            tilt.value = null
+        }
+    }
+
+    private fun levelSensorName(): String = when (levelSensor?.type) {
+        Sensor.TYPE_GAME_ROTATION_VECTOR -> "game_rotation_vector"
+        Sensor.TYPE_ROTATION_VECTOR -> "rotation_vector"
+        Sensor.TYPE_ACCELEROMETER -> "accelerometer"
+        else -> "none"
+    }
+
+    private fun displayRotationDegrees(): Int {
+        val r = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+        return when (r) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
         }
     }
 
@@ -611,6 +908,27 @@ class MainActivity : ComponentActivity() {
         private const val STATE_STOP = "redline.zoom_stop"
         private const val STATE_CAPABILITY = "redline.capability_screen"
         private const val STATE_RAW = "redline.raw"
+        private const val STATE_MODE = "redline.mode"
+        private const val STATE_ISO = "redline.iso"
+        private const val STATE_EXPOSURE = "redline.exposure_ns"
+        private const val STATE_FOCUS = "redline.focus_diopters"
+        private const val STATE_EV = "redline.ev_index"
+        private const val STATE_AE_LOCK = "redline.ae_lock"
+        private const val STATE_AWB_LOCK = "redline.awb_lock"
+        private const val STATE_AWB = "redline.awb"
+        private const val STATE_GRID = "redline.grid"
+        private const val STATE_LEVEL = "redline.level"
+        private const val STATE_HISTOGRAM = "redline.histogram"
+
+        /** Histogram sample: 4 Hz from a 128x96 TextureView copy; the camera session and its 30 fps are untouched. */
+        private const val HISTOGRAM_PERIOD_MS = 250L
+        private const val HIST_W = 128
+        private const val HIST_H = 96
+        private const val HISTOGRAM_SOURCE =
+            "TextureView sample, 4 Hz, 128x96 (no YUV stream: preview + YUV + JPEG (+RAW) is not a verified combination)"
+        private const val LEVEL_PERIOD_MS = 66L
+        private const val LEVEL_SMOOTHING = 0.2f
+        private const val LEVEL_MIN_CHANGE_DEG = 0.2f
         private const val DEFAULT_SENSOR_ORIENTATION = 90
 
         /** Deferred checks start at the first preview frame, or after this long if no frame arrives. */
