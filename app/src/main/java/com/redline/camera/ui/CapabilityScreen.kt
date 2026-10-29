@@ -36,6 +36,7 @@ fun CapabilityScreen(
     state: CapabilityState = CapabilityState(),
     onRunSelfTest: () -> Unit = {},
     onRepeatSelfTest: (() -> Unit)? = null,
+    onToggleStabilization: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
@@ -107,7 +108,16 @@ fun CapabilityScreen(
                             Text(
                                 "Stabilization ${v.previewStabilization}, zoom via ${v.zoomApi ?: "-"}, profile cache ${v.profileCache ?: "-"}"
                             )
+                            v.droppedFrames?.let {
+                                Text("Dropped frames $it of ${v.framesCounted ?: 0}, worst interval ${v.worstFrameIntervalMs ?: "-"} ms")
+                            }
                             v.status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        }
+                        if (onToggleStabilization != null) {
+                            val next = v?.stabilizationOverride?.let { !it } ?: !policy.defaults.previewStabilization
+                            OutlinedButton(onClick = onToggleStabilization, modifier = Modifier.padding(top = 8.dp)) {
+                                Text("Test: turn preview stabilization ${if (next) "on" else "off"}")
+                            }
                         }
                         state.zoomPlan?.stops?.forEach { s ->
                             Text("${s.focalNote}: ${s.resolutionNote}", style = MaterialTheme.typography.bodySmall)

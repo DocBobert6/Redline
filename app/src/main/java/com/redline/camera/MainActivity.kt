@@ -71,6 +71,11 @@ class MainActivity : ComponentActivity() {
     private var cameraOpen = false
     private var lastClose: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
     private var appliedStabilization = false
+
+    /** Test-only override of preview stabilization from the Info screen (null = follow the policy). Not persisted. */
+    private var stabilizationOverride: Boolean? = null
+
+    private fun wantedStabilization(): Boolean = stabilizationOverride ?: state.value.policy(profile).defaults.previewStabilization
     private var selfTestOwnsCamera = false
     private var awaitingPermission = false
     private var checksPending = false
@@ -269,6 +274,10 @@ class MainActivity : ComponentActivity() {
                 state = state.value,
                 onRunSelfTest = { runChecks(force = true) },
                 onRepeatSelfTest = { repeatSelfTest(REPEAT_RUNS) },
+                onToggleStabilization = {
+                    stabilizationOverride = !wantedStabilization()
+                    updateViewfinder { it.copy(stabilizationOverride = stabilizationOverride) }
+                },
                 onBack = ::showViewfinder
             )
         }
@@ -308,7 +317,17 @@ class MainActivity : ComponentActivity() {
             !selfTestOwnsCamera
         if (want && !cameraOpen && surface != null && setup != null) {
             cameraOpen = true
-            appliedStabilization = state.value.policy(profile).defaults.previewStabilization
+            appliedStabilization = wantedStabilization()
+            // Each viewfinder session measures fresh, so the report reflects the current settings only.
+            updateViewfinder {
+                it.copy(
+                    previewFpsMin = null,
+                    framesCounted = null,
+                    droppedFrames = null,
+                    worstFrameIntervalMs = null,
+                    stabilizationOverride = stabilizationOverride
+                )
+            }
             val stop = setup.zoomPlan.stop(selectedStop.intValue)
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
@@ -444,7 +463,7 @@ class MainActivity : ComponentActivity() {
     /** Combination results can demote preview stabilization after the preview opened; follow the policy. */
     private fun applyPolicyToCamera() {
         if (!cameraOpen) return
-        val stab = state.value.policy(profile).defaults.previewStabilization
+        val stab = wantedStabilization()
         if (stab != appliedStabilization) {
             appliedStabilization = stab
             controller.setStabilization(stab)
