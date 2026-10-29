@@ -37,7 +37,8 @@ vec3 srgbDecode(vec3 c) {
 
 vec3 srgbEncode(vec3 l) {
     l = max(l, vec3(0.0));
-    return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l));
+    // pow's argument is kept off zero so the unused branch can never be NaN (mix would carry it through).
+    return mix(l * 12.92, 1.055 * pow(max(l, vec3(0.0031308)), vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l));
 }
 
 void main() {

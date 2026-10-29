@@ -1,5 +1,6 @@
 package com.redline.camera.look
 
+import android.annotation.SuppressLint
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -301,6 +302,7 @@ class LookPreviewRenderer(private val listener: Listener) {
      * Uploads the LUT as a 3D texture in the first format that both uploads cleanly and passes the GPU self-check:
      * RGBA16F (half floats; linear-filterable in core ES 3.0), RGB16F (from floats), then RGBA8.
      */
+    @SuppressLint("HalfFloat") // the ShortBuffer carries raw half-float bits for GL_HALF_FLOAT, by design
     private fun uploadAndCheckLut(l: CubeLut): LutChoice {
         drainGlErrors()
         lutTex = newTexture(GLES30.GL_TEXTURE_3D, GLES30.GL_LINEAR)
