@@ -13,6 +13,7 @@ import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Half
 import android.util.Log
 import com.redline.camera.capability.Dim
 import com.redline.camera.viewfinder.FrameStats
@@ -211,12 +212,10 @@ class LookPreviewRenderer(private val listener: Listener) {
         lut = loaded
         programOes = buildProgram(LookShaders.FRAGMENT_OES) ?: return base.copy(reason = "look shader (OES) did not compile/link")
         program2d = buildProgram(LookShaders.FRAGMENT_2D) ?: return base.copy(reason = "look shader (2D) did not compile/link")
-        val format = uploadLut(loaded) ?: return base.copy(reason = "3D LUT texture upload failed (RGB16F and RGBA8)")
-        val err = selfCheck(loaded)
-        val withLut = base.copy(lutSize = loaded.size, lutFormat = format, selfCheckMaxErrorSteps = err)
-        if (err == null) return withLut.copy(reason = "GPU self-check could not render")
-        if (err > LutMath.SELF_CHECK_TOLERANCE) {
-            return withLut.copy(reason = "GPU self-check off by $err/255 (limit ${LutMath.SELF_CHECK_TOLERANCE}); LUT not applied")
+        val (format, check, tried) = uploadAndCheckLut(loaded)
+        val withLut = base.copy(lutSize = loaded.size, lutFormat = format, selfCheckMaxErrorSteps = check?.maxErr)
+        if (format == null || check == null) {
+            return withLut.copy(reason = "GPU self-check failed for every 3D LUT format, LUT not applied: $tried")
         }
         gpuTimer = "GL_EXT_disjoint_timer_query" in ext
         if (gpuTimer) GLES30.glGenQueries(QUERY_RING, queries, 0)
@@ -294,28 +293,69 @@ class LookPreviewRenderer(private val listener: Listener) {
         return id
     }
 
-    /** Uploads the LUT as a 3D texture: RGB16F (linear-filterable in core ES 3.0), else RGBA8. Returns the format used. */
-    private fun uploadLut(l: CubeLut): String? {
+    private data class CheckResult(val maxErr: Int, val detail: String)
+
+    private data class LutChoice(val format: String?, val check: CheckResult?, val tried: String)
+
+    /**
+     * Uploads the LUT as a 3D texture in the first format that both uploads cleanly and passes the GPU self-check:
+     * RGBA16F (half floats; linear-filterable in core ES 3.0), RGB16F (from floats), then RGBA8.
+     */
+    private fun uploadAndCheckLut(l: CubeLut): LutChoice {
         drainGlErrors()
         lutTex = newTexture(GLES30.GL_TEXTURE_3D, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
         val n = l.size
-        val data = ByteBuffer.allocateDirect(l.data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(l.data)
-        data.position(0)
-        GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGB16F, n, n, n, 0, GLES30.GL_RGB, GLES30.GL_FLOAT, data)
-        if (GLES30.glGetError() == GLES30.GL_NO_ERROR) return "RGB16F"
-        val bytes = ByteBuffer.allocateDirect(n * n * n * 4).put(LutMath.toRgba8(l))
-        bytes.position(0)
-        GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGBA8, n, n, n, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, bytes)
-        return if (GLES30.glGetError() == GLES30.GL_NO_ERROR) "RGBA8 (half-float upload refused)" else null
+        val count = n * n * n
+        val tried = mutableListOf<String>()
+        for (format in LUT_FORMATS) {
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTex)
+            when (format) {
+                "RGBA16F" -> {
+                    val half = ByteBuffer.allocateDirect(count * 8).order(ByteOrder.nativeOrder()).asShortBuffer()
+                    for (i in 0 until count) {
+                        for (c in 0..2) half.put(Half.toHalf(l.data[i * 3 + c]))
+                        half.put(HALF_ONE)
+                    }
+                    half.position(0)
+                    GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGBA16F, n, n, n, 0, GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, half)
+                }
+                "RGB16F" -> {
+                    val data = ByteBuffer.allocateDirect(l.data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(l.data)
+                    data.position(0)
+                    GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGB16F, n, n, n, 0, GLES30.GL_RGB, GLES30.GL_FLOAT, data)
+                }
+                else -> {
+                    val bytes = ByteBuffer.allocateDirect(count * 4).put(LutMath.toRgba8(l))
+                    bytes.position(0)
+                    val t = GLES30.GL_TEXTURE_3D
+                    GLES30.glTexImage3D(t, 0, GLES30.GL_RGBA8, n, n, n, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, bytes)
+                }
+            }
+            val err = GLES30.glGetError()
+            if (err != GLES30.GL_NO_ERROR) {
+                tried += "$format upload error 0x${Integer.toHexString(err)}"
+                continue
+            }
+            val check = selfCheck(l)
+            if (check == null) {
+                tried += "$format: self-check could not render"
+                continue
+            }
+            tried += "$format: ${check.detail}"
+            if (check.maxErr <= LutMath.SELF_CHECK_TOLERANCE) return LutChoice(format, check, tried.joinToString("; "))
+        }
+        Log.w(TAG, "LUT self-check failed: $tried")
+        return LutChoice(null, null, tried.joinToString("; "))
     }
 
     /**
-     * Renders [LutMath.SELF_CHECK_COLOURS] through the real program (2D input, strength 1 and 0.5) into an RGBA8
-     * framebuffer and compares with the CPU reference. Returns the worst error in 8-bit steps, or null on failure.
+     * Renders [LutMath.SELF_CHECK_COLOURS] through the real program (2D input; strength 0, 1 and 0.5) into an RGBA8
+     * framebuffer and compares with the CPU reference [LutMath.applyLook]. Strength 0 checks the pipeline without the
+     * LUT. Returns the worst error in 8-bit steps with a short description, or null when it could not render.
      */
-    private fun selfCheck(l: CubeLut): Int? {
+    private fun selfCheck(l: CubeLut): CheckResult? {
         val p = program2d ?: return null
         val colours = LutMath.SELF_CHECK_COLOURS
         val w = colours.size / 3
@@ -325,20 +365,25 @@ class LookPreviewRenderer(private val listener: Listener) {
             input.put(0xFF.toByte())
         }
         input.position(0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         val inTex = newTexture(GLES30.GL_TEXTURE_2D, GLES30.GL_NEAREST)
         GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, 1, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, input)
         val outTex = newTexture(GLES30.GL_TEXTURE_2D, GLES30.GL_NEAREST)
         GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, 1, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
         val fbo = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo[0])
         GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, outTex, 0)
-        var worst: Int? = null
         try {
             if (GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) != GLES30.GL_FRAMEBUFFER_COMPLETE) return null
             GLES30.glViewport(0, 0, w, 1)
             Matrix.setIdentityM(texMatrix, 0)
             var max = 0
-            for (s in floatArrayOf(1f, 0.5f)) {
+            val parts = mutableListOf<String>()
+            var worstNote = ""
+            for (s in floatArrayOf(0f, 1f, 0.5f)) {
+                GLES30.glClearColor(0f, 0f, 0f, 0f)
+                GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
                 draw(p, GLES30.GL_TEXTURE_2D, inTex, l, s)
                 val pixels = ByteBuffer.allocateDirect(w * 4).order(ByteOrder.nativeOrder())
                 GLES30.glReadPixels(0, 0, w, 1, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
@@ -346,15 +391,35 @@ class LookPreviewRenderer(private val listener: Listener) {
                 val bytes = ByteArray(w * 4)
                 pixels.position(0)
                 pixels.get(bytes)
-                max = maxOf(max, LutMath.maxErrorSteps(l, colours, bytes, s))
+                val err = LutMath.maxErrorSteps(l, colours, bytes, s)
+                parts += "s$s=$err"
+                if (err > max) {
+                    max = err
+                    worstNote = worstColour(l, colours, bytes, s)
+                }
             }
-            worst = max
+            return CheckResult(max, "max $max/255 (${parts.joinToString(" ")})$worstNote")
         } finally {
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
             GLES30.glDeleteFramebuffers(1, fbo, 0)
             GLES30.glDeleteTextures(2, intArrayOf(inTex, outTex), 0)
         }
-        return worst
+    }
+
+    private fun worstColour(l: CubeLut, colours: IntArray, bytes: ByteArray, s: Float): String {
+        var worst = -1
+        var at = 0
+        for (i in 0 until colours.size / 3) {
+            val one = LutMath.maxErrorSteps(l, colours.copyOfRange(i * 3, i * 3 + 3), bytes.copyOfRange(i * 4, i * 4 + 4), s)
+            if (one > worst) {
+                worst = one
+                at = i
+            }
+        }
+        val want = LutMath.applyLook(l, colours[at * 3] / 255f, colours[at * 3 + 1] / 255f, colours[at * 3 + 2] / 255f, s)
+            .map { (it * 255f).toInt() }
+        val gpu = (0..2).map { bytes[at * 4 + it].toInt() and 0xFF }
+        return ", worst in ${colours.copyOfRange(at * 3, at * 3 + 3).toList()} at s$s: gpu $gpu want $want"
     }
 
     private fun draw(p: Program, inputTarget: Int, inputTex: Int, l: CubeLut, s: Float) {
@@ -525,6 +590,8 @@ class LookPreviewRenderer(private val listener: Listener) {
         const val TIMER_CPU = "cpu_glfinish_estimate (every 15th frame)"
         private const val CPU_SAMPLE_EVERY = 15L
         private const val QUERY_RING = 4
+        private val LUT_FORMATS = listOf("RGBA16F", "RGB16F", "RGBA8")
+        private const val HALF_ONE: Short = 0x3C00
         private const val DEFAULT_FPS = 30
         private const val WARMUP_MS = 2_000L
         private const val STATS_PERIOD_MS = 1_000L
