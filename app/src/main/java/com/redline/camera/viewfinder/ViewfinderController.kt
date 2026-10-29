@@ -153,6 +153,8 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         handler.post {
             if (stabilization != on) {
                 stabilization = on
+                frameStats = FrameStats(setup?.aeFpsRange?.second ?: PreviewFps.TARGET)
+                streamStartMs = SystemClock.elapsedRealtime()
                 repeat()
             }
         }
@@ -178,6 +180,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         stabilization = stab
         firstCaptureSeen = false
         fps.reset()
+        frameStats = FrameStats(setup.aeFpsRange?.second ?: PreviewFps.TARGET)
         texture.setDefaultBufferSize(setup.previewSize.width, setup.previewSize.height)
         surface?.release()
         val target = Surface(texture)

@@ -160,7 +160,9 @@ data class ViewfinderMetrics(
     val status: String? = null,
     val framesCounted: Int? = null,
     val droppedFrames: Int? = null,
-    val worstFrameIntervalMs: Double? = null
+    val worstFrameIntervalMs: Double? = null,
+    /** Set when the Info-screen test toggle overrides the policy's preview stabilization. */
+    val stabilizationOverride: Boolean? = null
 ) {
     val fpsGatePassed: Boolean? get() = previewFpsMin?.let { it >= FPS_GATE - FPS_SLACK }
     val startGatePassed: Boolean? get() = firstFrameMs?.let { it < START_GATE_MS }
@@ -192,6 +194,7 @@ data class ViewfinderMetrics(
         "frames_counted" to framesCounted,
         "dropped_frames" to droppedFrames,
         "worst_frame_interval_ms" to worstFrameIntervalMs?.let { round2(it) },
+        "stabilization_override" to stabilizationOverride,
         "gate" to linkedMapOf(
             "preview_fps_min_ge_30" to fpsGatePassed,
             "first_frame_lt_1000_ms" to startGatePassed
