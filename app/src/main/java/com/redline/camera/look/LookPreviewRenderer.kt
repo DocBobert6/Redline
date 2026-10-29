@@ -104,6 +104,10 @@ class LookPreviewRenderer(private val listener: Listener) {
     private val queries = IntArray(QUERY_RING)
     private val queryPending = BooleanArray(QUERY_RING)
     private var timerChecked = false
+    private var gpuResults = 0
+    private var gpuDisjoint = 0
+    private var gpuSamples = 0
+    private var sessionStartFrame = 0L
     private var frameIndex = 0L
     private val timing = LutTimingStats()
     private var displayStats = FrameStats(DEFAULT_FPS)
@@ -150,6 +154,10 @@ class LookPreviewRenderer(private val listener: Listener) {
                 cameraTexture = cam
                 bufferSize = size
                 timing.reset()
+                sessionStartFrame = frameIndex
+                gpuResults = 0
+                gpuDisjoint = 0
+                gpuSamples = 0
                 displayStats = FrameStats(expectedFps)
                 attachedAtMs = SystemClock.elapsedRealtime()
                 lastStatsMs = attachedAtMs
@@ -521,7 +529,23 @@ class LookPreviewRenderer(private val listener: Listener) {
             if (v[0] == 0) continue
             GLES30.glGetQueryObjectuiv(queries[i], GLES30.GL_QUERY_RESULT, v, 0)
             queryPending[i] = false
-            if (!disjoint) timing.add((v[0].toLong() and 0xFFFFFFFFL) / 1e6)
+            gpuResults++
+            if (disjoint) {
+                gpuDisjoint++
+            } else {
+                timing.add((v[0].toLong() and 0xFFFFFFFFL) / 1e6)
+                gpuSamples++
+            }
+        }
+        // B20a: on the baseline device the extension is listed, but no usable sample arrived in a whole session
+        // (results never available, or every one flagged disjoint). After a grace period with no sample, fall back to
+        // the sparse glFinish estimate so the gate is always measured.
+        if (gpuSamples == 0 && frameIndex - sessionStartFrame >= GPU_GRACE_FRAMES) {
+            gpuTimer = false
+            timerMethod = "$TIMER_CPU (GPU timer gave no usable sample in $GPU_GRACE_FRAMES frames: " +
+                "$gpuResults results, $gpuDisjoint disjoint)"
+            queryPending.fill(false)
+            timing.reset()
         }
     }
 
@@ -592,6 +616,7 @@ class LookPreviewRenderer(private val listener: Listener) {
         const val TIMER_CPU = "cpu_glfinish_estimate (every 15th frame)"
         private const val CPU_SAMPLE_EVERY = 15L
         private const val QUERY_RING = 4
+        private const val GPU_GRACE_FRAMES = 90L
         private val LUT_FORMATS = listOf("RGBA16F", "RGB16F", "RGBA8")
         private const val HALF_ONE: Short = 0x3C00
         private const val DEFAULT_FPS = 30
