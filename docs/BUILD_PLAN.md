@@ -42,7 +42,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | [ ] B22 | `v0.2.2-alpha.1` | RAW burst capture (8-12 frames, under-exposed), tile align + merge, background processing queue | 24/35mm save < 3 s; no shutter blocking |
 | [ ] B23 | `v0.2.3-alpha.1` | Handheld multi-frame super-resolution at 50/70mm; per-stop output sizes | 50/70mm save < 5 s; resolution chart gain measured |
 | [ ] B24 | `v0.2.4-alpha.1` | Vignetting (in-camera residual), distortion (off by default, RAW-feel toggle), sharpening, grain; full Picture Style set | Visual sign-off on shoot list |
-| [ ] B25 | `v0.2.5-alpha.1` | Ultra HDR JPEG (libultrahdr gainmap), HEIF, optional DNG of merge; Save-formats setting: JPEG only, DNG only, or both (the DNG framing crop tag shipped in B13 as its own toggle) | Ultra HDR files validate and render on HDR displays |
+| [ ] B25 | `v0.2.5-alpha.1` | Ultra HDR JPEG (libultrahdr gainmap), HEIF, optional DNG of merge; Save-formats setting: JPEG only, DNG only, or both (DNG always full-sensor, uncropped; the B13 DefaultCrop tag was removed in B14 because Google Photos showed a blank thumbnail and had no way to uncrop) | Ultra HDR files validate and render on HDR displays |
 
 ## Phase 3: Simulated depth of field (`v0.3.x`)
 
