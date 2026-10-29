@@ -135,8 +135,8 @@ object ManualMath {
 
     /** Frame duration for a manual still: long enough for the exposure, never past the max frame duration. */
     fun stillFrameDurationNs(exposureNs: Long, maxFrameDurationNs: Long?): Long {
-        val hasMax = maxFrameDurationNs != null && maxFrameDurationNs > 0
-        val base = if (hasMax) min(PREVIEW_FRAME_DURATION_NS, maxFrameDurationNs!!) else PREVIEW_FRAME_DURATION_NS
+        val cap = maxFrameDurationNs?.takeIf { it > 0 } ?: PREVIEW_FRAME_DURATION_NS
+        val base = min(PREVIEW_FRAME_DURATION_NS, cap)
         return max(exposureNs, base)
     }
 
