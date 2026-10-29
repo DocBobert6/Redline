@@ -22,9 +22,8 @@ data class CapabilityState(
 
     fun effectiveSelfTest(): SelfTestReport? = DebugOverrides.applySelfTest(selfTest, forced)
 
-    fun policy(profile: DeviceProfile?): PolicyResult {
-        return FeaturePolicy.evaluate(profile, effectiveCombos(), effectiveSelfTest(), quirkDisables)
-    }
+    fun policy(profile: DeviceProfile?): PolicyResult =
+        FeaturePolicy.evaluate(profile, effectiveCombos(), effectiveSelfTest(), quirkDisables)
 }
 
 object CapabilityReport {
