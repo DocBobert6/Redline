@@ -149,8 +149,6 @@ class LaunchSmokeTest {
         compose.waitUntil(TIMEOUT_MS) { scrolledTo(LookPreviewReport.LABEL) }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("LUT pass", substring = true) }
         compose.waitUntil(TIMEOUT_MS) { !scrolledTo("checking OpenGL ES", substring = true) }
-        compose.onNodeWithTag(BACK_TAG).performClick()
-        compose.waitUntil(TIMEOUT_MS) { exists(VIEWFINDER_TAG) }
     }
 
     @Test

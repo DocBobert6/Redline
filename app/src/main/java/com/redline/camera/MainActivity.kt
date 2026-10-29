@@ -866,7 +866,7 @@ class MainActivity : ComponentActivity() {
             else -> null
         }
         val lookPending = lookSetting && !lookPrepareDone
-        if (base && !lookPending && !cameraOpen && target != null && setup != null) {
+        if (base && !lookPending && !cameraOpen && target != null) {
             cameraOpen = true
             openedWithLook = look
             appliedStabilization = wantedStabilization()

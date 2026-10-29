@@ -137,7 +137,7 @@ class LookPreviewRenderer(private val listener: Listener) {
             try {
                 detachOnThread()
                 displayTexture.setDefaultBufferSize(size.width, size.height)
-                val surface = EGL14.eglCreateWindowSurface(display, config, displayTexture, intArrayOf(EGL14.EGL_NONE), 0)
+                val surface: EGLSurface? = EGL14.eglCreateWindowSurface(display, config, displayTexture, intArrayOf(EGL14.EGL_NONE), 0)
                 check(surface != null && surface != EGL14.EGL_NO_SURFACE) { "eglCreateWindowSurface failed: ${eglError()}" }
                 window = surface
                 makeCurrent(window)
@@ -244,17 +244,19 @@ class LookPreviewRenderer(private val listener: Listener) {
             return "no EGL config for OpenGL ES 3 (window + pbuffer, RGBA8888)"
         }
         config = configs[0]
-        context =
-            EGL14.eglCreateContext(
-                display,
-                config,
-                EGL14.EGL_NO_CONTEXT,
-                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE),
-                0
-            )
-        if (context == null || context == EGL14.EGL_NO_CONTEXT) return "OpenGL ES 3 context not created: ${eglError()}"
-        pbuffer = EGL14.eglCreatePbufferSurface(display, config, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-        if (pbuffer == null || pbuffer == EGL14.EGL_NO_SURFACE) return "pbuffer not created: ${eglError()}"
+        val ctx: EGLContext? = EGL14.eglCreateContext(
+            display,
+            config,
+            EGL14.EGL_NO_CONTEXT,
+            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE),
+            0
+        )
+        if (ctx == null || ctx == EGL14.EGL_NO_CONTEXT) return "OpenGL ES 3 context not created: ${eglError()}"
+        context = ctx
+        val pb: EGLSurface? =
+            EGL14.eglCreatePbufferSurface(display, config, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+        if (pb == null || pb == EGL14.EGL_NO_SURFACE) return "pbuffer not created: ${eglError()}"
+        pbuffer = pb
         if (!EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)) return "eglMakeCurrent failed: ${eglError()}"
         return null
     }
@@ -512,7 +514,7 @@ class LookPreviewRenderer(private val listener: Listener) {
 
     private fun drainGlErrors() {
         var guard = 0
-        while (GLES30.glGetError() != GLES30.GL_NO_ERROR && guard++ < 16) Unit
+        while (GLES30.glGetError() != GLES30.GL_NO_ERROR && guard < 16) guard++
     }
 
     private fun eglError(): String = "0x" + Integer.toHexString(EGL14.eglGetError())
