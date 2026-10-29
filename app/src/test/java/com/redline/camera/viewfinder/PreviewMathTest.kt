@@ -128,4 +128,33 @@ class PreviewMathTest {
         assertEquals(listOf(30, 30), map["ae_fps_range"])
         assertTrue(m.overlayText().contains("640 ms"))
     }
+
+    @Test
+    fun frameStatsSeparatesJitterFromDrops() {
+        val stats = FrameStats(30)
+        var t = 0L
+        stats.add(t)
+        repeat(29) {
+            t += if (it % 2 == 0) 34_000_000L else 32_700_000L
+            stats.add(t)
+        }
+        assertEquals(29, stats.intervals)
+        assertEquals(0, stats.dropped)
+        t += 66_700_000L
+        stats.add(t)
+        assertEquals(1, stats.dropped)
+        assertEquals(66_700_000L, stats.worstNs)
+    }
+
+    @Test
+    fun frameStatsBreakRunSkipsTheGap() {
+        val stats = FrameStats(30)
+        stats.add(0L)
+        stats.add(33_333_333L)
+        stats.breakRun()
+        stats.add(5_000_000_000L)
+        stats.add(5_033_333_333L)
+        assertEquals(2, stats.intervals)
+        assertEquals(0, stats.dropped)
+    }
 }

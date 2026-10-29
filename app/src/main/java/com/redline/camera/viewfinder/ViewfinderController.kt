@@ -107,6 +107,9 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         /** Rolling sensor fps, about twice a second. [warm] is false during the first seconds while AE settles. */
         fun onPreviewFps(fps: Double, warm: Boolean)
 
+        /** Warm-up-excluded frame-interval statistics, reported alongside [onPreviewFps]. */
+        fun onFrameStats(intervals: Int, dropped: Int, worstIntervalMs: Double)
+
         /** The repeating request is running with these settings. */
         fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean)
 
@@ -130,6 +133,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
     private var stabilization = false
     private val closeWaiters = mutableListOf<CompletableFuture<Unit>>()
     private val fps = RollingFps()
+    private var frameStats = FrameStats(PreviewFps.TARGET)
     private var firstCaptureSeen = false
     private var streamStartMs = 0L
     private var lastFpsReportMs = 0L
@@ -234,6 +238,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
                 }
                 session = s
                 streamStartMs = SystemClock.elapsedRealtime()
+                frameStats.breakRun()
                 repeat()
             }
 
@@ -258,10 +263,13 @@ class ViewfinderController(context: Context, private val listener: Listener) {
                 listener.onFirstCapture(now)
             }
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            val warm = now - streamStartMs >= WARMUP_MS
+            if (warm) frameStats.add(ts) else frameStats.breakRun()
             val rate = fps.add(ts) ?: return
             if (now - lastFpsReportMs >= FPS_REPORT_MS) {
                 lastFpsReportMs = now
-                listener.onPreviewFps(rate, now - streamStartMs >= WARMUP_MS)
+                listener.onPreviewFps(rate, warm)
+                listener.onFrameStats(frameStats.intervals, frameStats.dropped, frameStats.worstNs / 1e6)
             }
         }
     }
@@ -287,6 +295,9 @@ class ViewfinderController(context: Context, private val listener: Listener) {
                 set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabMode)
                 applyZoom(this, su)
             }
+            val targetFps = su.aeFpsRange?.second ?: PreviewFps.TARGET
+            if (frameStats.intervals == 0) frameStats = FrameStats(targetFps)
+            frameStats.breakRun()
             s.setRepeatingRequest(req.build(), captureCallback, handler)
             listener.onStreaming(su, stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
         } catch (e: Exception) {
