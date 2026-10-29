@@ -22,6 +22,7 @@ import android.os.HandlerThread
 import android.util.Log
 import android.util.Range
 import android.view.Surface
+import com.redline.camera.viewfinder.PreviewFps
 import java.io.File
 import java.util.Collections
 import java.util.concurrent.CompletableFuture
@@ -151,7 +152,11 @@ class SelfTest(context: Context) {
             val counter = FrameCounter()
             withReaders(listOf(reader(previewSize, ImageFormat.YUV_420_888, counter))) { readers ->
                 withSession(readers.map { it.surface }) { session ->
-                    val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(readers[0].surface) }
+                    val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        addTarget(readers[0].surface)
+                        // Same AE range the viewfinder uses, so the check measures the preview the user actually gets.
+                        PreviewFps.choose(camera.fpsRanges)?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
+                    }
                     session.setRepeatingRequest(req.build(), counter, handler)
                     Thread.sleep(PREVIEW_MS)
                     session.stopRepeating()

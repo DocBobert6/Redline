@@ -124,6 +124,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        override fun onFrameStats(intervals: Int, dropped: Int, worstIntervalMs: Double) {
+            updateViewfinder { m -> m.copy(framesCounted = intervals, droppedFrames = dropped, worstFrameIntervalMs = worstIntervalMs) }
+        }
+
         override fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean) {
             updateViewfinder { m ->
                 m.copy(

@@ -110,6 +110,37 @@ class RollingFps(private val windowNs: Long = 1_000_000_000L) {
     fun reset() = stamps.clear()
 }
 
+/**
+ * Frame-interval statistics from sensor timestamps (ns). A frame counts as dropped when its interval is more than
+ * 1.5x the expected interval (1 / target fps), which separates a real stutter from ordinary timestamp jitter.
+ */
+class FrameStats(targetFps: Int) {
+    private val expectedNs = 1_000_000_000L / targetFps.coerceAtLeast(1)
+    private var last: Long? = null
+
+    var intervals = 0
+        private set
+    var dropped = 0
+        private set
+    var worstNs = 0L
+        private set
+
+    fun add(timestampNs: Long) {
+        val prev = last
+        last = timestampNs
+        if (prev == null || timestampNs <= prev) return
+        val dt = timestampNs - prev
+        intervals++
+        if (dt * 2 > expectedNs * 3) dropped++
+        if (dt > worstNs) worstNs = dt
+    }
+
+    /** Starts a new run of intervals (new session or repeating request) without clearing the counts. */
+    fun breakRun() {
+        last = null
+    }
+}
+
 /** What the viewfinder measured, for the overlay and the shared capability report ("viewfinder" section). */
 data class ViewfinderMetrics(
     val firstFrameMs: Long? = null,
@@ -126,7 +157,10 @@ data class ViewfinderMetrics(
     val profileCache: String? = null,
     val launch: String? = null,
     val permissionPrompted: Boolean = false,
-    val status: String? = null
+    val status: String? = null,
+    val framesCounted: Int? = null,
+    val droppedFrames: Int? = null,
+    val worstFrameIntervalMs: Double? = null
 ) {
     val fpsGatePassed: Boolean? get() = previewFpsMin?.let { it >= FPS_GATE - FPS_SLACK }
     val startGatePassed: Boolean? get() = firstFrameMs?.let { it < START_GATE_MS }
@@ -155,6 +189,9 @@ data class ViewfinderMetrics(
         "launch" to launch,
         "permission_prompted" to permissionPrompted,
         "status" to status,
+        "frames_counted" to framesCounted,
+        "dropped_frames" to droppedFrames,
+        "worst_frame_interval_ms" to worstFrameIntervalMs?.let { round2(it) },
         "gate" to linkedMapOf(
             "preview_fps_min_ge_30" to fpsGatePassed,
             "first_frame_lt_1000_ms" to startGatePassed
