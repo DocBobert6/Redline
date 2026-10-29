@@ -1,5 +1,6 @@
 package com.redline.camera.capability
 
+import com.redline.camera.capture.CaptureStats
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
 
@@ -23,7 +24,9 @@ data class CapabilityState(
     /** B12 viewfinder measurements (first frame, preview fps, stream size, AE range); null before it opens. */
     val viewfinder: ViewfinderMetrics? = null,
     /** B12 zoom stops for the default camera. */
-    val zoomPlan: ZoomPlan? = null
+    val zoomPlan: ZoomPlan? = null,
+    /** B13 still-capture counters and the 500-shot stress run. */
+    val capture: CaptureStats = CaptureStats()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -50,6 +53,7 @@ object CapabilityReport {
             "disabled" to state.quirkDisables
         )
         out["viewfinder"] = (state.viewfinder ?: ViewfinderMetrics(status = "not opened")).toMap(state.zoomPlan)
+        out["capture"] = state.capture.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }
