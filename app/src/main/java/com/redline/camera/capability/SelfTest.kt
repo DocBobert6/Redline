@@ -155,7 +155,8 @@ class SelfTest(context: Context) {
                     val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(readers[0].surface)
                         // Same AE range the viewfinder uses, so the check measures the preview the user actually gets.
-                        PreviewFps.choose(camera.fpsRanges)?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
+                        val range = PreviewFps.choose(camera.fpsRanges)
+                        if (range != null) set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(range.first, range.second))
                     }
                     session.setRepeatingRequest(req.build(), counter, handler)
                     Thread.sleep(PREVIEW_MS)
