@@ -27,6 +27,15 @@ data class EffectiveDefaults(
     val previewStabilization: Boolean,
     val stabilized60fps: Boolean
 ) {
+    /**
+     * Whether the viewfinder starts with preview stabilization on. [previewStabilization] says it is
+     * available (detected, verified, not demoted); it is still off by default, because on the baseline
+     * device profile it stretched single preview frames to ~50 ms and failed the B12 30 fps gate,
+     * while the plain preview held 30 fps with no drops. It is offered as an opt-in setting instead.
+     */
+    val previewStabilizationOnByDefault: Boolean
+        get() = previewStabilization && FeaturePolicy.PREVIEW_STABILIZATION_ON_BY_DEFAULT
+
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "camera_id" to cameraId,
         "detected_tier" to detectedTier.name,
@@ -34,6 +43,7 @@ data class EffectiveDefaults(
         "still_path" to stillPath.name,
         "video_fps" to videoFps,
         "preview_stabilization" to previewStabilization,
+        "preview_stabilization_on_by_default" to previewStabilizationOnByDefault,
         "stabilized_60fps" to stabilized60fps
     )
 }
@@ -56,6 +66,9 @@ data class PolicyResult(val defaults: EffectiveDefaults, val demotions: List<Dem
 object FeaturePolicy {
     const val VIDEO_FPS_DEFAULT = 24
     const val VIDEO_FPS_FALLBACK = 30
+
+    /** Preview stabilization is opt-in: available features are offered, but only gate-passing ones default on. */
+    const val PREVIEW_STABILIZATION_ON_BY_DEFAULT = false
 
     /** The camera Redline defaults to: the first back-facing camera, else the first camera. */
     fun defaultCamera(profile: DeviceProfile?): CameraProfile? =

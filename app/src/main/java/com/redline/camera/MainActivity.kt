@@ -75,7 +75,11 @@ class MainActivity : ComponentActivity() {
     /** Test-only override of preview stabilization from the Info screen (null = follow the policy). Not persisted. */
     private var stabilizationOverride: Boolean? = null
 
-    private fun wantedStabilization(): Boolean = stabilizationOverride ?: state.value.policy(profile).defaults.previewStabilization
+    private fun wantedStabilization(): Boolean {
+        val d = state.value.policy(profile).defaults
+        if (!d.previewStabilization) return false
+        return stabilizationOverride ?: d.previewStabilizationOnByDefault
+    }
     private var selfTestOwnsCamera = false
     private var awaitingPermission = false
     private var checksPending = false
@@ -274,9 +278,13 @@ class MainActivity : ComponentActivity() {
                 state = state.value,
                 onRunSelfTest = { runChecks(force = true) },
                 onRepeatSelfTest = { repeatSelfTest(REPEAT_RUNS) },
-                onToggleStabilization = {
-                    stabilizationOverride = !wantedStabilization()
-                    updateViewfinder { it.copy(stabilizationOverride = stabilizationOverride) }
+                onToggleStabilization = if (state.value.policy(profile).defaults.previewStabilization) {
+                    {
+                        stabilizationOverride = !wantedStabilization()
+                        updateViewfinder { it.copy(stabilizationOverride = stabilizationOverride) }
+                    }
+                } else {
+                    null
                 },
                 onBack = ::showViewfinder
             )
