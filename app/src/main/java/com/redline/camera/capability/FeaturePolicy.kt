@@ -25,7 +25,13 @@ data class EffectiveDefaults(
     val stillPath: StillPath,
     val videoFps: Int,
     val previewStabilization: Boolean,
-    val stabilized60fps: Boolean
+    val stabilized60fps: Boolean,
+    /** B14 pro tools (PLAN 11 defaults table: grid, level and histogram ON). UI only, so every tier gets them. */
+    val gridOn: Boolean = FeaturePolicy.GRID_ON_BY_DEFAULT,
+    val levelOn: Boolean = FeaturePolicy.LEVEL_ON_BY_DEFAULT,
+    val histogramOn: Boolean = FeaturePolicy.HISTOGRAM_ON_BY_DEFAULT,
+    /** The viewfinder starts in Auto; Av and M are offered only where the camera reports what they need. */
+    val startMode: String = FeaturePolicy.START_MODE
 ) {
     /**
      * Whether the viewfinder starts with preview stabilization on. [previewStabilization] says it is
@@ -44,7 +50,11 @@ data class EffectiveDefaults(
         "video_fps" to videoFps,
         "preview_stabilization" to previewStabilization,
         "preview_stabilization_on_by_default" to previewStabilizationOnByDefault,
-        "stabilized_60fps" to stabilized60fps
+        "stabilized_60fps" to stabilized60fps,
+        "grid_on" to gridOn,
+        "level_on" to levelOn,
+        "histogram_on" to histogramOn,
+        "start_mode" to startMode
     )
 }
 
@@ -69,6 +79,12 @@ object FeaturePolicy {
 
     /** Preview stabilization is opt-in: available features are offered, but only gate-passing ones default on. */
     const val PREVIEW_STABILIZATION_ON_BY_DEFAULT = false
+
+    /** B14: grid, level and histogram are on by default (PLAN 11); they draw over the preview and touch no request. */
+    const val GRID_ON_BY_DEFAULT = true
+    const val LEVEL_ON_BY_DEFAULT = true
+    const val HISTOGRAM_ON_BY_DEFAULT = true
+    const val START_MODE = "AUTO"
 
     /** The camera Redline defaults to: the first back-facing camera, else the first camera. */
     fun defaultCamera(profile: DeviceProfile?): CameraProfile? =

@@ -24,12 +24,15 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.view.Surface
+import com.redline.camera.capability.CameraNames
 import com.redline.camera.capability.CameraProfile
 import com.redline.camera.capability.Dim
 import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.StillSaver
 import com.redline.camera.capture.StillShot
+import com.redline.camera.manual.ManualApplied
+import com.redline.camera.manual.ManualCaps
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -53,7 +56,9 @@ data class ViewfinderSetup(
     val jpegSize: Dim? = null,
     /** Largest RAW_SENSOR size when the camera has the RAW capability, else null. */
     val rawSize: Dim? = null,
-    val frontFacing: Boolean = false
+    val frontFacing: Boolean = false,
+    /** B14 manual-control ranges; null when the characteristics could not be read. */
+    val manual: ManualCaps? = null
 ) {
     val zoomApi: String get() = if (zoomRatioRange != null) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"
 
@@ -94,7 +99,27 @@ data class ViewfinderSetup(
                 zoomPlan = plan,
                 jpegSize = largest(camera.outputSizes["JPEG"]),
                 rawSize = if (camera.has("RAW")) largest(camera.outputSizes["RAW_SENSOR"]) else null,
-                frontFacing = camera.facing == "FRONT"
+                frontFacing = camera.facing == "FRONT",
+                manual = runCatching { manualCaps(ch, camera) }.getOrNull()
+            )
+        }
+
+        private fun manualCaps(ch: CameraCharacteristics, camera: CameraProfile): ManualCaps {
+            fun <T> get(key: CameraCharacteristics.Key<T>): T? = runCatching { ch.get(key) }.getOrNull()
+            val calibration = get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)
+            return ManualCaps.from(
+                camera = camera,
+                aeLockAvailable = get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true,
+                awbLockAvailable = get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true,
+                logicalMinFocus = get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE),
+                logicalFocals = get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty(),
+                logicalApertures = get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.toList().orEmpty(),
+                focusCalibration = when (calibration) {
+                    CameraMetadata.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED -> "UNCALIBRATED"
+                    CameraMetadata.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_APPROXIMATE -> "APPROXIMATE"
+                    CameraMetadata.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_CALIBRATED -> "CALIBRATED"
+                    else -> null
+                }
             )
         }
 
@@ -136,6 +161,28 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
 
         /** The session could not be configured with the RAW stream; RAW was turned off and the session rebuilt. */
         fun onRawUnavailable(reason: String) {}
+
+        /** What the preview frames report (about twice a second): ISO, exposure and focus distance. */
+        fun onPreviewValues(values: ResultValues) {}
+
+        /** What a still's capture result reported, for the B14 range check. */
+        fun onStillValues(values: ResultValues) {}
+    }
+
+    /**
+     * Sensor values echoed by a capture result; null when the result does not carry the key. [manual] is the
+     * B14 setting the request was built with (carried as the request tag), not whatever is current when the
+     * result arrives, so results already in flight during a change are judged by their own request.
+     */
+    data class ResultValues(val iso: Int?, val exposureNs: Long?, val focusDiopters: Float?, val manual: ManualApplied?) {
+        companion object {
+            fun of(r: CaptureResult) = ResultValues(
+                iso = r.get(CaptureResult.SENSOR_SENSITIVITY),
+                exposureNs = r.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                focusDiopters = r.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                manual = r.request.tag as? ManualApplied
+            )
+        }
     }
 
     /** What the shutter needs to know about the selected zoom stop (B13). */
@@ -144,8 +191,6 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val stopTargetMm: Int,
         val trueEquivalentMm: Float?,
         val stopLongPx: Int,
-        val lensCrop: Float = 1f,
-        val dngCropToFrame: Boolean = true,
         val deviceDegrees: Int,
         val keep: Boolean
     )
@@ -166,6 +211,9 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     private var setup: ViewfinderSetup? = null
     private var zoomRatio = 1f
     private var stabilization = false
+
+    /** B14 manual settings, already clamped to the reported ranges; null = the B12/B13 auto behaviour. */
+    private var manual: ManualApplied? = null
     private val closeWaiters = mutableListOf<CompletableFuture<Unit>>()
     private val fps = RollingFps()
     private var frameStats = FrameStats(PreviewFps.TARGET)
@@ -229,6 +277,16 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         handler.post {
             zoomRatio = ratio
             repeat()
+        }
+    }
+
+    /** Applies [applied] (already clamped by ManualModel) to the repeating request and to every later still. */
+    fun setManual(applied: ManualApplied?) {
+        handler.post {
+            if (manual != applied) {
+                manual = applied
+                repeat()
+            }
         }
     }
 
@@ -410,10 +468,13 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                 set(CaptureRequest.JPEG_ORIENTATION, orientation)
                 set(CaptureRequest.JPEG_QUALITY, StillSaver.JPEG_QUALITY.toByte())
                 applyZoom(this, su)
+                applyManual(this, preview = false)
             }
             pending = shot
             s!!.capture(req.build(), stillCallback, handler)
-            handler.postDelayed({ if (pending === shot) failShot(shot, "timed out after $SHOT_TIMEOUT_MS ms") }, SHOT_TIMEOUT_MS)
+            // A long manual exposure gets its own time on top of the usual budget.
+            val timeout = SHOT_TIMEOUT_MS + (manual?.stillFrameDurationNs ?: 0L) / 1_000_000L
+            handler.postDelayed({ if (pending === shot) failShot(shot, "timed out after $timeout ms") }, timeout)
         } catch (e: Exception) {
             Log.w(TAG, "still capture failed", e)
             pending = null
@@ -428,6 +489,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
 
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             val p = pending ?: return
+            listener.onStillValues(ResultValues.of(result))
             p.result = result
             if (p.timestamp == null) p.timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
             maybeFinish(p)
@@ -489,8 +551,6 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             stopTargetMm = r.stopTargetMm,
             trueEquivalentMm = r.trueEquivalentMm,
             stopLongPx = r.stopLongPx,
-            lensCrop = r.lensCrop,
-            dngCropToFrame = r.dngCropToFrame,
             shutterAtMs = p.shutterAtMs,
             keep = r.keep
         )
@@ -564,6 +624,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                 lastFpsReportMs = now
                 listener.onPreviewFps(rate, warm)
                 listener.onFrameStats(frameStats.intervals, frameStats.dropped, frameStats.worstNs / 1e6)
+                listener.onPreviewValues(ResultValues.of(result))
             }
         }
     }
@@ -583,6 +644,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                 if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
                 applyZoom(this, su)
+                applyManual(this, preview = true)
             }
             val targetFps = su.aeFpsRange?.second ?: PreviewFps.TARGET
             if (frameStats.intervals == 0) frameStats = FrameStats(targetFps)
@@ -607,6 +669,39 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             )
         }
     }
+
+    /**
+     * Writes the B14 settings. M: AE OFF with ISO, exposure and frame duration (the preview keeps its shutter at
+     * 1/30 s or shorter, with ISO raised to match, so it stays at 30 fps; the still gets the full exposure). Av:
+     * EV and AE lock on top of auto exposure. Manual focus, AWB preset and AWB lock in both. Nothing is written
+     * that ManualModel did not clamp to a reported range.
+     */
+    private fun applyManual(b: CaptureRequest.Builder, preview: Boolean) {
+        b.setTag(manual)
+        val m = manual ?: return
+        if (m.aeOff) {
+            val iso = if (preview) m.previewIso else m.stillIso
+            val exposure = if (preview) m.previewExposureNs else m.stillExposureNs
+            val frame = if (preview) m.previewFrameDurationNs else m.stillFrameDurationNs
+            if (iso != null && exposure != null && frame != null) {
+                b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
+                b.set(CaptureRequest.SENSOR_FRAME_DURATION, frame)
+            }
+        } else {
+            if (m.evIndex != 0) b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, m.evIndex)
+            if (m.aeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+        }
+        m.focusDiopters?.let {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+        }
+        awbModeInt(m.awbMode)?.let { if (it != CameraMetadata.CONTROL_AWB_MODE_AUTO) b.set(CaptureRequest.CONTROL_AWB_MODE, it) }
+        if (m.awbLock) b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+    }
+
+    private fun awbModeInt(name: String): Int? = CameraNames.AWB_MODES.entries.firstOrNull { it.value == name }?.key
 
     private fun closeOnThread(f: CompletableFuture<Unit>) {
         generation++

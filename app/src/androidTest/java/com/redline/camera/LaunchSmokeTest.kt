@@ -12,11 +12,17 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.capability.CapabilityProbe
 import com.redline.camera.capability.DeviceProfileProbe
+import com.redline.camera.manual.ShootMode
 import com.redline.camera.ui.BACK_TAG
+import com.redline.camera.ui.GRID_TOGGLE_TAG
+import com.redline.camera.ui.HISTOGRAM_TOGGLE_TAG
+import com.redline.camera.ui.LEVEL_TOGGLE_TAG
 import com.redline.camera.ui.LIST_TAG
+import com.redline.camera.ui.MODE_ROW_TAG
 import com.redline.camera.ui.OPEN_CAPABILITY_TAG
 import com.redline.camera.ui.VIEWFINDER_TAG
 import com.redline.camera.ui.ZOOM_RING_TAG
+import com.redline.camera.ui.modeTag
 import com.redline.camera.ui.zoomStopTag
 import com.redline.camera.viewfinder.ZoomStops
 import org.junit.After
@@ -92,6 +98,22 @@ class LaunchSmokeTest {
     }
 
     @Test
+    fun modeRowAndProToolTogglesDoNotCrash() {
+        launch()
+        compose.waitUntil(TIMEOUT_MS) { exists(MODE_ROW_TAG) }
+        compose.onNodeWithTag(modeTag(ShootMode.AUTO)).assertExists()
+        listOf(GRID_TOGGLE_TAG, LEVEL_TOGGLE_TAG, HISTOGRAM_TOGGLE_TAG).forEach { tag ->
+            compose.onNodeWithTag(tag).performClick()
+            compose.onNodeWithTag(tag).performClick()
+        }
+        // Av / M appear only when the emulated camera reports what they need; tapping them must not crash.
+        listOf(ShootMode.AV, ShootMode.M, ShootMode.AUTO).forEach { m ->
+            if (exists(modeTag(m))) compose.onNodeWithTag(modeTag(m)).performClick()
+        }
+        compose.onNodeWithTag(VIEWFINDER_TAG).assertExists()
+    }
+
+    @Test
     fun navigatesToCapabilityScreenAndBack() {
         launch()
         openCapabilityScreen()
@@ -107,6 +129,7 @@ class LaunchSmokeTest {
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Self-test") }
         compose.onNodeWithText("Self-test").assertExists()
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Run self-test again") }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo("Manual controls") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Viewfinder") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Feature combinations") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Demotions") }

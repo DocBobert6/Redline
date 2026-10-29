@@ -68,7 +68,8 @@ private val Scrim = Color(0x99000000)
 /**
  * The main screen (B12): a letterboxed 3:2 Camera2 preview (2:3 when held upright), a zoom ring with
  * click stops and honest labels, a small debug overlay with first-frame time and preview fps, and a
- * button to the capability screen.
+ * button to the capability screen. B14 adds the grid, level and histogram overlays and the Auto / Av / M
+ * controls.
  */
 @Composable
 fun ViewfinderScreen(
@@ -88,7 +89,10 @@ fun ViewfinderScreen(
     rawAvailable: Boolean = false,
     rawOn: Boolean = false,
     onToggleRaw: () -> Unit = {},
-    captureText: String? = null
+    captureText: String? = null,
+    manualUi: ManualUi = ManualUi(),
+    manualActions: ManualActions = ManualActions(),
+    onPreviewView: (TextureView) -> Unit = {}
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent)) {
@@ -102,10 +106,16 @@ fun ViewfinderScreen(
                         .testTag(FRAME_TAG)
                 ) {
                     AndroidView(
-                        factory = { ctx -> PreviewTextureView(ctx).also { it.surfaceTextureListener = textureListener } },
+                        factory = { ctx ->
+                            PreviewTextureView(ctx).also {
+                                it.surfaceTextureListener = textureListener
+                                onPreviewView(it)
+                            }
+                        },
                         update = { it.configure(previewSize, sensorOrientation) },
                         modifier = Modifier.fillMaxSize()
                     )
+                    FrameOverlays(manualUi)
                     if (status != null || needsPermission) {
                         Column(
                             modifier = Modifier.align(Alignment.Center).padding(16.dp),
@@ -135,6 +145,7 @@ fun ViewfinderScreen(
                     captureText?.let {
                         Text(it, fontSize = 11.sp, modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp))
                     }
+                    ManualBar(manualUi, manualActions, modifier = Modifier.fillMaxWidth())
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
