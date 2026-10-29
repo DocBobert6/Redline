@@ -81,7 +81,7 @@ fun CapabilityScreen(
                         }
                         if (onRepeatSelfTest != null) {
                             OutlinedButton(onClick = onRepeatSelfTest, enabled = !state.selfTestRunning) {
-                                Text("Run self-test 100x (debug)")
+                                Text("Run self-test 100x")
                             }
                         }
                     }

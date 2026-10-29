@@ -15,7 +15,7 @@ data class CapabilityState(
     val quirkDisables: Map<String, String> = emptyMap(),
     /** Debug-only forced failures ([DebugOverrides]). Always empty in release builds. */
     val forced: Set<String> = emptySet(),
-    /** Debug repeat-run progress, e.g. "37/40 runs passed". */
+    /** Repeat-run progress, e.g. "37/40 runs passed". */
     val repeatStatus: String? = null
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
@@ -36,6 +36,7 @@ object CapabilityReport {
         out["effective_defaults"] = policy.defaults.toMap()
         out["demotions"] = policy.demotions.map { it.toMap() }
         out["policy_notes"] = policy.notes
+        out["self_test_repeat"] = state.repeatStatus
         out["quirks"] = linkedMapOf(
             "source" to state.quirks.source,
             "version" to state.quirks.version,
