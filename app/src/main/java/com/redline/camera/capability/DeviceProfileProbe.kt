@@ -39,6 +39,19 @@ class DeviceProfileProbe(private val context: Context) {
         return json
     }
 
+    /**
+     * The profile for the viewfinder's cold start: the cached copy when it is for this OS build and schema
+     * (no camera is probed), else a fresh [build] that is written to the cache. Second value: true on a cache hit.
+     */
+    fun cachedOrBuild(): Pair<DeviceProfile, Boolean> {
+        val file = File(context.filesDir, CACHE_FILE)
+        val cached = DeviceProfileParser.fromJson(safe { file.readText() })
+        if (cached != null && cached.buildFingerprint == Build.FINGERPRINT) return cached to true
+        val fresh = build()
+        safe { file.writeText(fresh.toJson()) }
+        return fresh to false
+    }
+
     private fun camera(id: String): CameraProfile {
         val ch = manager.getCameraCharacteristics(id)
         val capInts = safe { ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() }.orEmpty()

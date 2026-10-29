@@ -1,5 +1,8 @@
 package com.redline.camera.capability
 
+import com.redline.camera.viewfinder.ViewfinderMetrics
+import com.redline.camera.viewfinder.ZoomPlan
+
 /**
  * Everything B11 adds on top of the static [DeviceProfile]: combination results, the self-test,
  * the matched quirks, and debug-forced failures. Pure, so the screen and the shared report derive
@@ -16,7 +19,11 @@ data class CapabilityState(
     /** Debug-only forced failures ([DebugOverrides]). Always empty in release builds. */
     val forced: Set<String> = emptySet(),
     /** Repeat-run progress, e.g. "37/40 runs passed". */
-    val repeatStatus: String? = null
+    val repeatStatus: String? = null,
+    /** B12 viewfinder measurements (first frame, preview fps, stream size, AE range); null before it opens. */
+    val viewfinder: ViewfinderMetrics? = null,
+    /** B12 zoom stops for the default camera. */
+    val zoomPlan: ZoomPlan? = null
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -27,7 +34,7 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections: self_test, combinations, effective_defaults, demotions, quirks. */
+    /** The B10 profile plus the B11 sections (self_test, combinations, effective_defaults, demotions, quirks) and B12 viewfinder. */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -42,6 +49,7 @@ object CapabilityReport {
             "version" to state.quirks.version,
             "disabled" to state.quirkDisables
         )
+        out["viewfinder"] = (state.viewfinder ?: ViewfinderMetrics(status = "not opened")).toMap(state.zoomPlan)
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

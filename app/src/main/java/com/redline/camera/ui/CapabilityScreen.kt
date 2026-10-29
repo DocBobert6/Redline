@@ -35,7 +35,8 @@ fun CapabilityScreen(
     onShareReport: () -> Unit = {},
     state: CapabilityState = CapabilityState(),
     onRunSelfTest: () -> Unit = {},
-    onRepeatSelfTest: (() -> Unit)? = null
+    onRepeatSelfTest: (() -> Unit)? = null,
+    onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
     MaterialTheme {
@@ -44,6 +45,11 @@ fun CapabilityScreen(
                 item {
                     Text("Redline ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.headlineSmall)
                     Text("Capability probe", style = MaterialTheme.typography.bodyMedium)
+                    if (onBack != null) {
+                        OutlinedButton(onClick = onBack, modifier = Modifier.padding(top = 8.dp).testTag(BACK_TAG)) {
+                            Text("Back to viewfinder")
+                        }
+                    }
                     if (profile != null) {
                         val e = profile.encoders
                         Text("${profile.manufacturer} ${profile.model}, Android API ${profile.sdkInt}")
@@ -87,6 +93,28 @@ fun CapabilityScreen(
                     }
                 }
                 item {
+                    SectionCard("Viewfinder") {
+                        val v = state.viewfinder
+                        if (v == null) {
+                            Text("Not opened yet")
+                        } else {
+                            Text("First frame ${v.firstFrameMs?.let { "$it ms" } ?: "-"} (gate < 1000 ms: ${gateWord(v.startGatePassed)})")
+                            Text(
+                                "Preview ${v.previewFps?.let { "%.1f".format(it) } ?: "-"} fps, " +
+                                    "min ${v.previewFpsMin?.let { "%.1f".format(it) } ?: "-"} (gate >= 30: ${gateWord(v.fpsGatePassed)})"
+                            )
+                            Text("Stream ${v.previewSize ?: "-"} cropped to 3:2, AE ${v.aeFpsRange?.toList() ?: "auto"}")
+                            Text(
+                                "Stabilization ${v.previewStabilization}, zoom via ${v.zoomApi ?: "-"}, profile cache ${v.profileCache ?: "-"}"
+                            )
+                            v.status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        }
+                        state.zoomPlan?.stops?.forEach { s ->
+                            Text("${s.focalNote}: ${s.resolutionNote}", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                item {
                     SectionCard("Feature combinations") {
                         val combos = state.effectiveCombos()
                         if (state.combos == null) Text("Checking...")
@@ -119,6 +147,13 @@ fun CapabilityScreen(
 }
 
 const val LIST_TAG = "capability_list"
+const val BACK_TAG = "back_to_viewfinder"
+
+private fun gateWord(ok: Boolean?): String = when (ok) {
+    null -> "not measured"
+    true -> "pass"
+    false -> "FAIL"
+}
 
 private fun statusWord(s: CheckStatus): String = when (s) {
     CheckStatus.PASS -> "PASS"
