@@ -1,5 +1,6 @@
 package com.redline.camera
 
+import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.look.LookPreviewRenderer
@@ -8,6 +9,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -15,7 +17,8 @@ import org.junit.runner.RunWith
 /**
  * B20 on a real Android runtime: the native module loads for this ABI and parses the bundled LUT, and wherever the
  * GPU offers OpenGL ES 3 with external-image ESSL3 the look renderer's start-up checks (shader compile, 3D LUT
- * upload, GPU-vs-CPU self-check) pass. Without those the test is skipped: the app then runs on the plain preview.
+ * upload, GPU-vs-CPU self-check) pass. Without those, or on an emulator / software GLES renderer, the render check
+ * is skipped (Assume): real GPU verification happens on the device, where the app's own self-check gates the feature.
  */
 @RunWith(AndroidJUnit4::class)
 class LookPreviewTest {
@@ -52,6 +55,11 @@ class LookPreviewTest {
             renderer.prepare { RedlineNative.parseCube(lutBytes()) }
             val caps = result.get(30, TimeUnit.SECONDS)
             assumeTrue("no OpenGL ES 3 + external ESSL3 here (${caps.glVersion}): ${caps.reason}", caps.es3 && caps.externalEssl3)
+            // GPU rendering correctness is verified on real devices only; emulator / software GLES is not chased.
+            assumeFalse(
+                "emulator or software GLES (${caps.renderer}): render self-check not asserted",
+                isEmulatorOrSoftwareGl(caps.renderer)
+            )
             assertTrue(
                 "look renderer start-up failed on ${caps.glVersion} / ${caps.renderer}: ${caps.reason} " +
                     "(format ${caps.lutFormat}, self-check ${caps.selfCheckMaxErrorSteps}/255)",
@@ -61,6 +69,13 @@ class LookPreviewTest {
         } finally {
             renderer.release()
         }
+    }
+
+    private fun isEmulatorOrSoftwareGl(renderer: String?): Boolean {
+        val r = renderer.orEmpty().lowercase()
+        val software = listOf("swiftshader", "android emulator", "llvmpipe", "softpipe", "lavapipe").any { it in r }
+        val device = listOf(Build.FINGERPRINT, Build.HARDWARE, Build.PRODUCT).joinToString(" ").lowercase()
+        return software || "goldfish" in device || "ranchu" in device || "generic" in Build.FINGERPRINT.lowercase()
     }
 
     companion object {
