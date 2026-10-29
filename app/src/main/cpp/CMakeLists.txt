@@ -1,0 +1,16 @@
+# Redline native module (B20): libredline_native.so. Built by AGP's externalNativeBuild with the NDK pinned in
+# app/build.gradle.kts (ndkVersion) and the CI workflows. Halide is deliberately not added yet.
+cmake_minimum_required(VERSION 3.22.1)
+project(redline_native LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(redline_native SHARED
+    cube_parser.cpp
+    redline_jni.cpp)
+
+target_compile_options(redline_native PRIVATE -Wall -Wextra -Werror -fvisibility=hidden -O2)
+# 16 KB page alignment (Android 15+ devices with 16 KB pages).
+target_link_options(redline_native PRIVATE "-Wl,-z,max-page-size=16384")

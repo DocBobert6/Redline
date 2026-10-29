@@ -14,6 +14,11 @@ on:
 permissions:
   contents: write
 
+# B20 native module: pinned NDK and CMake (keep in sync with app/build.gradle.kts and ci.yml).
+env:
+  NDK_VERSION: "28.2.13676358"
+  CMAKE_VERSION: "3.22.1"
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -37,6 +42,9 @@ jobs:
           java-version: "21"
 
       # ubuntu-latest ships the Android SDK (ANDROID_HOME); AGP downloads missing platforms.
+
+      - name: Install pinned NDK + CMake
+        run: (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" > /dev/null
 
       - uses: gradle/actions/setup-gradle@v4
 

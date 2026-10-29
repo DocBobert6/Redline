@@ -26,6 +26,7 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
 
@@ -41,6 +42,8 @@ fun CapabilityScreen(
     onRepeatSelfTest: (() -> Unit)? = null,
     onToggleStabilization: (() -> Unit)? = null,
     onRunStress: (() -> Unit)? = null,
+    onToggleLook: (() -> Unit)? = null,
+    onCycleLookStrength: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
@@ -177,6 +180,9 @@ fun CapabilityScreen(
                     }
                 }
                 item {
+                    LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
+                }
+                item {
                     SectionCard("Feature combinations") {
                         val combos = state.effectiveCombos()
                         if (state.combos == null) Text("Checking...")
@@ -213,6 +219,49 @@ fun CapabilityScreen(
 
 const val LIST_TAG = "capability_list"
 const val BACK_TAG = "back_to_viewfinder"
+const val LOOK_SECTION_TITLE = "Look preview"
+const val LOOK_TOGGLE_TAG = "look_preview_toggle"
+const val LOOK_STRENGTH_TAG = "look_preview_strength"
+
+/** B20: GPU look preview state, capabilities, LUT-pass timing and the <= 8 ms gate. */
+@Composable
+private fun LookPreviewCard(r: LookPreviewReport, onToggle: (() -> Unit)?, onCycleStrength: (() -> Unit)?) {
+    SectionCard(LOOK_SECTION_TITLE) {
+        Text(LookPreviewReport.LABEL, style = MaterialTheme.typography.bodySmall)
+        val state = when {
+            r.active -> "On: viewfinder renders through the GPU LUT"
+            r.enabled -> "On (applies when the viewfinder is open)"
+            else -> "Off: ${r.whyOff()}"
+        }
+        Text(state)
+        r.glVersion?.let { Text("$it; ${r.glRenderer ?: "-"}") }
+        if (r.available != null) {
+            Text("Float linear ${r.floatLinear}, half-float colour buffer ${r.halfFloatColorBuffer}, OES ESSL3 ${r.externalEssl3}")
+        }
+        Text("LUT ${r.lutName ?: "-"} ${r.lutSize?.let { "$it^3" } ?: ""} ${r.lutFormat ?: ""}".trim())
+        Text("Native ${r.nativeVersion ?: r.nativeError ?: "not loaded yet"}")
+        r.selfCheckMaxErrorSteps?.let { Text("GPU self-check: max error $it/255") }
+        val t = r.timing
+        val ms = { v: Double? -> v?.let { "%.2f".format(it) } ?: "-" }
+        Text(
+            "LUT pass ${t.framesMeasured} frames, p50 ${ms(t.p50Ms)} ms, p95 ${ms(t.p95Ms)} ms, max ${ms(t.maxMs)} ms " +
+                "(gate <= 8 ms: ${gateWord(r.gateLutLe8Ms)})"
+        )
+        Text("Timer ${r.timerMethod ?: "-"}", style = MaterialTheme.typography.bodySmall)
+        r.displayDropped?.let { Text("Displayed frames ${r.displayFrames ?: 0}, dropped $it", style = MaterialTheme.typography.bodySmall) }
+        r.runtimeError?.let { Text("Runtime error: $it", style = MaterialTheme.typography.bodySmall) }
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(LOOK_TOGGLE_TAG)) {
+                Text("Turn look preview ${if (r.userSetting) "off" else "on"} (default on)")
+            }
+        }
+        if (onCycleStrength != null && r.enabled) {
+            OutlinedButton(onClick = onCycleStrength, modifier = Modifier.testTag(LOOK_STRENGTH_TAG)) {
+                Text("Look strength ${(r.strength * 100).toInt()}% (tap to change)")
+            }
+        }
+    }
+}
 
 private fun gateWord(ok: Boolean?): String = when (ok) {
     null -> "not measured"

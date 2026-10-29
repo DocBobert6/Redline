@@ -2,6 +2,7 @@ package com.redline.camera
 
 import android.Manifest
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.Sensor
@@ -26,6 +27,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.edit
 import com.redline.camera.capability.CameraFacts
 import com.redline.camera.capability.CapabilityProbe
 import com.redline.camera.capability.CapabilityReport
@@ -41,12 +43,16 @@ import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.capture.ShotResult
+import com.redline.camera.look.CubeLut
+import com.redline.camera.look.LookPreviewRenderer
+import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
 import com.redline.camera.manual.ManualModel
 import com.redline.camera.manual.ManualSettings
 import com.redline.camera.manual.ShootMode
+import com.redline.camera.nativebridge.RedlineNative
 import com.redline.camera.ui.CapabilityScreen
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
@@ -138,6 +144,87 @@ class MainActivity : ComponentActivity() {
     private lateinit var controller: ViewfinderController
     private lateinit var orientationListener: OrientationEventListener
 
+    // B20 GPU look preview (main thread). The camera writes either straight into the TextureView (plain path) or
+    // into the renderer's SurfaceTexture, which draws through the LUT into the TextureView (look path).
+    private enum class Attach { NONE, ATTACHING, ATTACHED }
+
+    private lateinit var lookRenderer: LookPreviewRenderer
+    private lateinit var prefs: SharedPreferences
+    private var lookSetting = true
+    private var lookStrength = 1f
+    private var lookPrepareDone = false
+    private var lookReady = false
+    private var lookRuntimeError: String? = null
+    private var lookAttach = Attach.NONE
+    private var attachToken = 0
+    private var attachedTo: SurfaceTexture? = null
+    private var cameraTexture: SurfaceTexture? = null
+    private var openedWithLook = false
+    private var lastDetach: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+
+    /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
+    private fun useLook(): Boolean = lookSetting && lookReady && lookRuntimeError == null
+
+    private val lookPrepareTimeout = Runnable {
+        if (!lookPrepareDone) {
+            lookPrepareDone = true
+            lookReady = false
+            updateLook {
+                it.copy(
+                    available = false,
+                    reason = "OpenGL ES preparation took over $LOOK_PREPARE_TIMEOUT_MS ms; plain preview this session"
+                )
+            }
+            syncCamera()
+        }
+    }
+
+    private val lookListener = object : LookPreviewRenderer.Listener {
+        override fun onPrepared(caps: LookPreviewRenderer.Caps) {
+            runOnUiThread {
+                if (lookPrepareDone) return@runOnUiThread // timed out earlier: stays off for this session
+                lookPrepareDone = true
+                mainHandler.removeCallbacks(lookPrepareTimeout)
+                lookReady = caps.ok
+                updateLook {
+                    it.copy(
+                        available = caps.ok,
+                        reason = caps.reason,
+                        glVersion = caps.glVersion,
+                        glRenderer = caps.renderer,
+                        es3 = caps.es3,
+                        externalEssl3 = caps.externalEssl3,
+                        floatLinear = caps.floatLinear,
+                        halfFloatColorBuffer = caps.halfFloatColorBuffer,
+                        lutSize = caps.lutSize,
+                        lutFormat = caps.lutFormat,
+                        timerMethod = caps.timerMethod,
+                        selfCheckMaxErrorSteps = caps.selfCheckMaxErrorSteps
+                    )
+                }
+                syncCamera()
+            }
+        }
+
+        override fun onStats(stats: LookPreviewRenderer.Stats) {
+            updateLook {
+                it.copy(
+                    timing = stats.timing,
+                    timerMethod = stats.timerMethod,
+                    displayFrames = stats.displayFrames,
+                    displayDropped = stats.displayDropped
+                )
+            }
+        }
+
+        override fun onRuntimeError(message: String) {
+            runOnUiThread {
+                lookFailed(message)
+                syncCamera()
+            }
+        }
+    }
+
     private val permissionRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         awaitingPermission = false
         permissionGranted.value = granted
@@ -160,8 +247,21 @@ class MainActivity : ComponentActivity() {
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
             texture = null
             syncCamera()
-            // Release the texture only once the camera has stopped writing to it.
-            lastClose.whenComplete { _, _ -> surface.release() }
+            // Release the texture only once the camera has stopped writing to it and the look renderer has let go.
+            val wasAttached = attachedTo === surface
+            val detached = CompletableFuture<Unit>()
+            if (wasAttached) {
+                forgetAttachment()
+                lastDetach = detached
+            }
+            lastClose.whenComplete { _, _ ->
+                val gl = if (wasAttached) lookRenderer.detach() else CompletableFuture.completedFuture(Unit)
+                gl.whenComplete { _, _ ->
+                    surface.release()
+                    detached.complete(Unit)
+                    if (wasAttached) runOnUiThread { syncCamera() }
+                }
+            }
             return false
         }
 
@@ -240,6 +340,14 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         controller = ViewfinderController(this, cameraListener, BuildConfig.VERSION_NAME)
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
+        lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
+        lookRenderer = LookPreviewRenderer(lookListener)
+        lookRenderer.setStrength(lookStrength)
+        // Start-up checks run in parallel with the profile load, so the camera can open on the right path at once.
+        lookRenderer.prepare { loadLookLut() }
+        mainHandler.postDelayed(lookPrepareTimeout, LOOK_PREPARE_TIMEOUT_MS)
         orientationListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation != ORIENTATION_UNKNOWN) deviceDegrees = orientation
@@ -266,7 +374,8 @@ class MainActivity : ComponentActivity() {
                 launch = if (savedInstanceState == null) "cold" else "recreated",
                 permissionPrompted = awaitingPermission,
                 status = "starting"
-            )
+            ),
+            lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET)
         )
 
         setContent { Content() }
@@ -346,6 +455,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(checksFallback)
+        mainHandler.removeCallbacks(lookPrepareTimeout)
+        // The renderer owns the camera's SurfaceTexture on the look path: release it once the camera has closed.
+        controller.close().whenComplete { _, _ -> lookRenderer.release() }
         controller.release()
         super.onDestroy()
     }
@@ -422,7 +534,8 @@ class MainActivity : ComponentActivity() {
                     histogramOn = histogramOn.value
                 ),
                 manualActions = manualActions,
-                onPreviewView = { previewView = it }
+                onPreviewView = { previewView = it },
+                lookBadge = if (state.value.lookPreview.active) LOOK_BADGE else null
             )
         } else {
             CapabilityScreen(
@@ -450,6 +563,8 @@ class MainActivity : ComponentActivity() {
                     stressPending = true
                     showViewfinder()
                 },
+                onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
+                onCycleLookStrength = ::cycleLookStrength,
                 onBack = ::showViewfinder
             )
         }
@@ -719,20 +834,41 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Opens or closes the preview so it matches what should be happening: resumed, on the viewfinder screen,
-     * permission granted, a surface and a setup, and no self-test holding the camera. The returned future
-     * completes when any close it started has finished.
+     * permission granted, a surface and a setup, and no self-test holding the camera. B20: the camera writes into
+     * the look renderer's SurfaceTexture when the look preview is in use, else straight into the TextureView; a
+     * change of path closes the camera first, then (re)attaches or detaches the renderer, then reopens. The
+     * returned future completes when any close it started has finished.
      */
     private fun syncCamera(): CompletableFuture<Unit> {
         val setup = setupState.value
-        val surface = texture
-        val want = resumed &&
+        val display = texture
+        val look = useLook()
+        val base = resumed &&
             screen.value == Screen.VIEWFINDER &&
             permissionGranted.value &&
-            surface != null &&
+            display != null &&
             setup != null &&
             !selfTestOwnsCamera
-        if (want && !cameraOpen && surface != null && setup != null) {
+        if (cameraOpen && (!base || openedWithLook != look)) {
+            cameraOpen = false
+            streaming.value = false
+            stressAbort = true
+            updateLook { it.copy(active = false) }
+            lastClose = controller.close()
+            // Once closed, settle the renderer and reopen on the right path if the camera is still wanted.
+            lastClose.whenComplete { _, _ -> runOnUiThread { syncCamera() } }
+            return lastClose
+        }
+        if (!cameraOpen) syncRenderer(display, setup, look)
+        val target = when {
+            look -> if (lookAttach == Attach.ATTACHED && attachedTo === display) cameraTexture else null
+            lookAttach == Attach.NONE && lastDetach.isDone -> display
+            else -> null
+        }
+        val lookPending = lookSetting && !lookPrepareDone
+        if (base && !lookPending && !cameraOpen && target != null) {
             cameraOpen = true
+            openedWithLook = look
             appliedStabilization = wantedStabilization()
             // Each viewfinder session measures fresh, so the report reflects the current settings only.
             updateViewfinder {
@@ -744,19 +880,83 @@ class MainActivity : ComponentActivity() {
                     stabilizationOverride = stabilizationOverride
                 )
             }
+            updateLook { it.copy(active = look) }
             val stop = setup.zoomPlan.stop(selectedStop.intValue)
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
-            controller.open(setup, surface, ratio, appliedStabilization, rawOn.value && rawAvailable())
+            controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
-        } else if (!want && cameraOpen) {
-            cameraOpen = false
-            streaming.value = false
-            stressAbort = true
-            lastClose = controller.close()
-            return lastClose
         }
         return CompletableFuture.completedFuture(Unit)
+    }
+
+    /** Camera closed: attach the renderer to the TextureView for the look path, or detach it for the plain path. */
+    private fun syncRenderer(display: SurfaceTexture?, setup: ViewfinderSetup?, look: Boolean) {
+        if (!look) {
+            if (lookAttach != Attach.NONE) {
+                forgetAttachment()
+                val f = lookRenderer.detach()
+                lastDetach = f
+                f.whenComplete { _, _ -> runOnUiThread { syncCamera() } }
+            }
+            return
+        }
+        if (lookAttach != Attach.NONE || display == null || setup == null || !permissionGranted.value || !lastDetach.isDone) return
+        lookAttach = Attach.ATTACHING
+        attachedTo = display
+        val token = ++attachToken
+        lookRenderer.attach(display, setup.previewSize, setup.aeFpsRange?.second ?: LOOK_DEFAULT_FPS) { cam, error ->
+            runOnUiThread {
+                // Superseded (surface destroyed or look turned off meanwhile): its detach is already queued behind it.
+                if (token != attachToken) return@runOnUiThread
+                if (cam == null) {
+                    forgetAttachment()
+                    lookFailed("attach: $error")
+                } else {
+                    lookAttach = Attach.ATTACHED
+                    cameraTexture = cam
+                }
+                syncCamera()
+            }
+        }
+    }
+
+    private fun forgetAttachment() {
+        lookAttach = Attach.NONE
+        attachedTo = null
+        cameraTexture = null
+        attachToken++
+    }
+
+    /** The GL path failed after start-up: the plain TextureView preview takes over for the rest of the session. */
+    private fun lookFailed(message: String) {
+        if (lookRuntimeError != null) return
+        lookRuntimeError = message
+        updateLook { it.copy(runtimeError = message, active = false) }
+    }
+
+    /** GL thread: loads the native module and parses the bundled LUT with it. */
+    private fun loadLookLut(): CubeLut {
+        val native = RedlineNative.load()
+        updateLook { it.copy(nativeVersion = native.version, nativeError = native.error) }
+        check(native.loaded) { "native module not loaded (${native.error})" }
+        val bytes = applicationContext.assets.open(LOOK_LUT_ASSET).use { it.readBytes() }
+        return RedlineNative.parseCube(bytes)
+    }
+
+    private fun toggleLook() {
+        lookSetting = !lookSetting
+        prefs.edit { putBoolean(PREF_LOOK_PREVIEW, lookSetting) }
+        updateLook { it.copy(userSetting = lookSetting) }
+        syncCamera()
+    }
+
+    private fun cycleLookStrength() {
+        val i = LOOK_STRENGTHS.indexOfFirst { abs(it - lookStrength) < 0.01f }
+        lookStrength = LOOK_STRENGTHS[(i + 1).mod(LOOK_STRENGTHS.size)]
+        prefs.edit { putFloat(PREF_LOOK_STRENGTH, lookStrength) }
+        lookRenderer.setStrength(lookStrength)
+        updateLook { it.copy(strength = lookStrength) }
     }
 
     private fun onFirstFrameDisplayed() {
@@ -878,6 +1078,10 @@ class MainActivity : ComponentActivity() {
         update { s -> s.copy(viewfinder = change(s.viewfinder ?: ViewfinderMetrics())) }
     }
 
+    private fun updateLook(change: (LookPreviewReport) -> LookPreviewReport) {
+        update { s -> s.copy(lookPreview = change(s.lookPreview)) }
+    }
+
     /** Combination results can demote preview stabilization after the preview opened; follow the policy. */
     private fun applyPolicyToCamera() {
         if (!cameraOpen) return
@@ -934,6 +1138,16 @@ class MainActivity : ComponentActivity() {
         /** Deferred checks start at the first preview frame, or after this long if no frame arrives. */
         private const val CHECKS_FALLBACK_MS = 3_000L
         private const val RELEASE_TIMEOUT_MS = 4_000L
+
+        // B20 look preview.
+        private const val PREFS_NAME = "redline_settings"
+        private const val PREF_LOOK_PREVIEW = "look_preview"
+        private const val PREF_LOOK_STRENGTH = "look_strength"
+        private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
+        private const val LOOK_BADGE = "Look preview (approx.)"
+        private const val LOOK_PREPARE_TIMEOUT_MS = 1_500L
+        private const val LOOK_DEFAULT_FPS = 30
+        private val LOOK_STRENGTHS = floatArrayOf(1f, 0.75f, 0.5f, 0.25f)
 
         /** One worker for every check so two runs never hold the camera at once. */
         private val worker: ExecutorService = Executors.newSingleThreadExecutor()

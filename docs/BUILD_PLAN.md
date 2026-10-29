@@ -31,7 +31,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | [x] B11 | `v0.1.1-alpha.1` | Feature-combination checks (session-config query + CameraX feature groups), first-launch self-test, demotion rules, remote quirks table | Self-test passes 100/100 on baseline; forced failures demote cleanly |
 | [x] B12 | `v0.1.2-alpha.4` | Camera2 preview in 3:2, permissions, zoom ring 24*/28/35/50/70 with crop and honest labels | 30 fps preview, cold start < 1 s to first frame (passed on the baseline device profile with preview stabilization off: 0 dropped frames, 465 ms; stabilization stays opt-in) |
 | [x] B13 | `v0.1.3-alpha.1` | Single-shot JPEG + RAW/DNG capture, MediaStore save, EXIF incl. look tag (no make/model spoof) | 500 consecutive captures, zero failures |
-| [ ] B14 | `v0.1.4-alpha.1` | Manual ISO/shutter/focus, EV, AE/AWB lock, histogram, level; Av/M modes | Every control limited to reported ranges (implemented in PR #28; gate awaits the on-device check on the baseline device profile) |
+| [x] B14 | `v0.1.4-alpha.1` | Manual ISO/shutter/focus, EV, AE/AWB lock, histogram, level; Av/M modes | Every control limited to reported ranges (passed: on-device check on the baseline device profile, 2026-10-29) |
 
 ## Phase 2: Stills look pipeline (`v0.2.x`)
 

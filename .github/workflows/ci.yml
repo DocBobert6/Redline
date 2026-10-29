@@ -10,6 +10,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# B20 native module: pinned NDK and CMake (keep in sync with ndkVersion / cmake version in app/build.gradle.kts).
+env:
+  NDK_VERSION: "28.2.13676358"
+  CMAKE_VERSION: "3.22.1"
+
 jobs:
   android:
     name: Build, lint, unit tests
@@ -27,7 +32,16 @@ jobs:
 
       # ubuntu-latest ships the Android SDK (ANDROID_HOME); AGP downloads missing platforms.
 
+      - name: Install pinned NDK + CMake
+        run: (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" > /dev/null
+
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Native parser host tests (CTest)
+        run: |
+          cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-host
+          ctest --test-dir build/native-host --output-on-failure
 
       - name: Build version info
         id: ver
@@ -40,7 +54,7 @@ jobs:
           ./gradlew --stacktrace
           -Predline.versionName=${{ steps.ver.outputs.name }}
           -Predline.versionCode=${{ steps.ver.outputs.code }}
-          :app:ktlintCheck :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+          :app:ktlintCheck :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleRelease
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -101,6 +115,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      - name: Install pinned NDK + CMake
+        run: (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" > /dev/null
 
       - uses: gradle/actions/setup-gradle@v4
 

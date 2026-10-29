@@ -59,6 +59,7 @@ const val ZOOM_NOTE_TAG = "zoom_note"
 const val OPEN_CAPABILITY_TAG = "open_capability"
 const val SHUTTER_TAG = "shutter"
 const val RAW_TOGGLE_TAG = "raw_toggle"
+const val LOOK_BADGE_TAG = "look_badge"
 
 fun zoomStopTag(mm: Int): String = "zoom_stop_$mm"
 
@@ -92,7 +93,9 @@ fun ViewfinderScreen(
     captureText: String? = null,
     manualUi: ManualUi = ManualUi(),
     manualActions: ManualActions = ManualActions(),
-    onPreviewView: (TextureView) -> Unit = {}
+    onPreviewView: (TextureView) -> Unit = {},
+    /** B20: shown while the camera renders through the GPU look-preview LUT. */
+    lookBadge: String? = null
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent)) {
@@ -116,6 +119,15 @@ fun ViewfinderScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                     FrameOverlays(manualUi)
+                    if (lookBadge != null) {
+                        Text(
+                            lookBadge,
+                            fontSize = 10.sp,
+                            modifier = Modifier.align(
+                                Alignment.TopStart
+                            ).padding(6.dp).background(Scrim).padding(2.dp).testTag(LOOK_BADGE_TAG)
+                        )
+                    }
                     if (status != null || needsPermission) {
                         Column(
                             modifier = Modifier.align(Alignment.Center).padding(16.dp),

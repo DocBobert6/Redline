@@ -1,6 +1,7 @@
 package com.redline.camera.capability
 
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
@@ -29,7 +30,9 @@ data class CapabilityState(
     /** B13 still-capture counters and the 500-shot stress run. */
     val capture: CaptureStats = CaptureStats(),
     /** B14 manual controls: ranges read, mode, current values, clamp events and the range gate. */
-    val manual: ManualReport = ManualReport()
+    val manual: ManualReport = ManualReport(),
+    /** B20 GPU look preview: availability (GLES 3, native module, LUT), self-check, LUT-pass timing and its gate. */
+    val lookPreview: LookPreviewReport = LookPreviewReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -40,7 +43,7 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections, the B12 viewfinder, B13 capture and B14 manual controls. */
+    /** The B10 profile plus the B11 sections, the B12 viewfinder, B13 capture, B14 manual controls and the B20 look preview. */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -58,6 +61,7 @@ object CapabilityReport {
         out["viewfinder"] = (state.viewfinder ?: ViewfinderMetrics(status = "not opened")).toMap(state.zoomPlan)
         out["capture"] = state.capture.toMap()
         out["manual"] = state.manual.toMap()
+        out["look_preview"] = state.lookPreview.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

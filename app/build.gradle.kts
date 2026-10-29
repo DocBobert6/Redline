@@ -12,6 +12,9 @@ android {
     namespace = "com.redline.camera"
     compileSdk = 37
 
+    // B20 native module. Keep in sync with NDK_VERSION / CMAKE_VERSION in .github/workflows/ci.yml and release.yml.
+    ndkVersion = "28.2.13676358"
+
     defaultConfig {
         applicationId = "com.redline.camera"
         minSdk = 29
@@ -19,6 +22,18 @@ android {
         versionCode = redlineVersionCode
         versionName = redlineVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // Phones (arm64) and the x86_64 emulator. Elsewhere the native load fails and the look preview reports why.
+            abiFilters += setOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     signingConfigs {
