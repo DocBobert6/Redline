@@ -5,13 +5,20 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.capability.CapabilityProbe
 import com.redline.camera.capability.DeviceProfileProbe
+import com.redline.camera.ui.BACK_TAG
 import com.redline.camera.ui.LIST_TAG
+import com.redline.camera.ui.OPEN_CAPABILITY_TAG
+import com.redline.camera.ui.VIEWFINDER_TAG
+import com.redline.camera.ui.ZOOM_RING_TAG
+import com.redline.camera.ui.zoomStopTag
+import com.redline.camera.viewfinder.ZoomStops
 import org.junit.After
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -19,8 +26,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Launches without the CAMERA permission prompt (debug extra), so the self-test reports skipped
- * checks on the emulator. A second launch forces failures to exercise the demotion rules.
+ * Launches without the CAMERA permission prompt (debug extra), so the viewfinder shows its permission
+ * message and the self-test reports skipped checks on the emulator. The app opens on the viewfinder (B12);
+ * the capability screen is reached through its Info button. A launch with forced failures exercises the
+ * demotion rules (B11).
  */
 @RunWith(AndroidJUnit4::class)
 class LaunchSmokeTest {
@@ -43,6 +52,13 @@ class LaunchSmokeTest {
         scenario?.close()
     }
 
+    private fun exists(tag: String): Boolean = try {
+        compose.onNodeWithTag(tag).assertExists()
+        true
+    } catch (e: Throwable) {
+        false
+    }
+
     private fun scrolledTo(text: String, substring: Boolean = false): Boolean = try {
         compose.onNodeWithTag(LIST_TAG).performScrollToNode(hasText(text, substring = substring))
         true
@@ -50,18 +66,48 @@ class LaunchSmokeTest {
         false
     }
 
-    @Test
-    fun appLaunchesAndShowsProbe() {
-        launch()
-        compose.onNodeWithText("Capability probe").assertExists()
+    private fun openCapabilityScreen() {
+        compose.waitUntil(TIMEOUT_MS) { exists(OPEN_CAPABILITY_TAG) }
+        compose.onNodeWithTag(OPEN_CAPABILITY_TAG).performClick()
+        compose.waitUntil(TIMEOUT_MS) { exists(LIST_TAG) }
     }
 
     @Test
-    fun screenShowsSelfTestSection() {
+    fun appLaunchesIntoViewfinderWithZoomStops() {
         launch()
+        compose.waitUntil(TIMEOUT_MS) { exists(VIEWFINDER_TAG) }
+        // The emulator camera may be slow or absent; the ring only needs the cached profile.
+        compose.waitUntil(TIMEOUT_MS) { exists(ZOOM_RING_TAG) }
+        ZoomStops.STOPS.forEach { mm -> compose.onNodeWithTag(zoomStopTag(mm)).assertExists() }
+        compose.onNodeWithTag(OPEN_CAPABILITY_TAG).assertExists()
+    }
+
+    @Test
+    fun zoomStopTapDoesNotCrash() {
+        launch()
+        compose.waitUntil(TIMEOUT_MS) { exists(zoomStopTag(70)) }
+        compose.onNodeWithTag(zoomStopTag(70)).performClick()
+        compose.onNodeWithTag(zoomStopTag(24)).performClick()
+        compose.onNodeWithTag(VIEWFINDER_TAG).assertExists()
+    }
+
+    @Test
+    fun navigatesToCapabilityScreenAndBack() {
+        launch()
+        openCapabilityScreen()
+        compose.onNodeWithText("Capability probe").assertExists()
+        compose.onNodeWithTag(BACK_TAG).performClick()
+        compose.waitUntil(TIMEOUT_MS) { exists(VIEWFINDER_TAG) }
+    }
+
+    @Test
+    fun capabilityScreenShowsSections() {
+        launch()
+        openCapabilityScreen()
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Self-test") }
         compose.onNodeWithText("Self-test").assertExists()
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Run self-test again") }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo("Viewfinder") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Feature combinations") }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Demotions") }
     }
@@ -69,6 +115,7 @@ class LaunchSmokeTest {
     @Test
     fun forcedFailuresDemoteCleanly() {
         launch(forceFail = "raw_capture,fps_24")
+        openCapabilityScreen()
         // The emulator may have no RAW or no fixed 24 fps range; either way the 24p default must step down.
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("video_24p: 24p -> 30p", substring = true) }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("Forced failures (debug)", substring = true) }
@@ -87,6 +134,15 @@ class LaunchSmokeTest {
         val json = profile.toJson()
         assertTrue(json.startsWith("{") && json.contains("\"cameras\""))
         assertTrue(profile.cameras.all { it.id.isNotEmpty() })
+    }
+
+    @Test
+    fun cachedProfileIsReusedOnTheSecondRead() {
+        val probe = DeviceProfileProbe(InstrumentationRegistry.getInstrumentation().targetContext)
+        val (first, _) = probe.cachedOrBuild()
+        val (second, hit) = probe.cachedOrBuild()
+        assertTrue(hit)
+        assertTrue(first == second)
     }
 
     companion object {

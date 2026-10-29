@@ -47,6 +47,12 @@ class SelfTest(context: Context) {
 
     fun cached(): SelfTestReport? = SelfTestReport.fromJson(runCatching { File(appContext.filesDir, CACHE_FILE).readText() }.getOrNull())
 
+    /** True when [cachedOrRun] would open the camera: forced, never run, incomplete, or run on another OS build. */
+    fun isDue(force: Boolean = false): Boolean {
+        val cached = cached()
+        return force || cached == null || !cached.complete || cached.buildFingerprint != Build.FINGERPRINT
+    }
+
     /** The cached report when it is for this OS build and complete; otherwise a fresh run (cached if complete). */
     fun cachedOrRun(camera: CameraProfile?, force: Boolean = false): SelfTestReport {
         val cached = cached()
