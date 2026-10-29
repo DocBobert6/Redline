@@ -2,6 +2,7 @@ package com.redline.camera.viewfinder
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -14,6 +15,8 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.Image
+import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -23,8 +26,13 @@ import android.util.Range
 import android.view.Surface
 import com.redline.camera.capability.CameraProfile
 import com.redline.camera.capability.Dim
+import com.redline.camera.capture.CaptureMath
+import com.redline.camera.capture.ShotResult
+import com.redline.camera.capture.StillSaver
+import com.redline.camera.capture.StillShot
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 /**
  * Everything the viewfinder needs to open the default camera, read once from the cached profile plus a
@@ -40,7 +48,12 @@ data class ViewfinderSetup(
     val maxDigitalZoom: Float,
     val activeArray: Rect?,
     val continuousAf: Boolean,
-    val zoomPlan: ZoomPlan
+    val zoomPlan: ZoomPlan,
+    /** Largest JPEG size (B13 stills); null when the profile lists none. */
+    val jpegSize: Dim? = null,
+    /** Largest RAW_SENSOR size when the camera has the RAW capability, else null. */
+    val rawSize: Dim? = null,
+    val frontFacing: Boolean = false
 ) {
     val zoomApi: String get() = if (zoomRatioRange != null) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"
 
@@ -78,9 +91,14 @@ data class ViewfinderSetup(
                 maxDigitalZoom = maxDigital,
                 activeArray = runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) }.getOrNull(),
                 continuousAf = "CONTINUOUS_PICTURE" in camera.afModes,
-                zoomPlan = plan
+                zoomPlan = plan,
+                jpegSize = largest(camera.outputSizes["JPEG"]),
+                rawSize = if (camera.has("RAW")) largest(camera.outputSizes["RAW_SENSOR"]) else null,
+                frontFacing = camera.facing == "FRONT"
             )
         }
+
+        private fun largest(sizes: List<String>?): Dim? = sizes.orEmpty().mapNotNull { Dim.parse(it) }.maxByOrNull { it.area }
 
         /** Centred crop of the active array for [ratio] (API 29 path). */
         fun cropRegion(active: Rect, ratio: Float): Rect {
@@ -99,7 +117,7 @@ data class ViewfinderSetup(
  * public call just posts there. Open on resume, close on pause; [close] completes once the device is
  * really closed, so the self-test can take the camera without fighting the viewfinder for it.
  */
-class ViewfinderController(context: Context, private val listener: Listener) {
+class ViewfinderController(context: Context, private val listener: Listener, version: String = "") {
     interface Listener {
         /** First onCaptureCompleted of a session, as SystemClock.elapsedRealtime(). */
         fun onFirstCapture(elapsedRealtimeMs: Long)
@@ -115,12 +133,27 @@ class ViewfinderController(context: Context, private val listener: Listener) {
 
         /** The camera could not be opened or was lost; the controller has already cleaned up. */
         fun onError(message: String)
+
+        /** The session could not be configured with the RAW stream; RAW was turned off and the session rebuilt. */
+        fun onRawUnavailable(reason: String) {}
     }
+
+    /** What the shutter needs to know about the selected zoom stop (B13). */
+    data class StillRequest(
+        val stopLabel: String,
+        val stopTargetMm: Int,
+        val trueEquivalentMm: Float?,
+        val stopLongPx: Int,
+        val deviceDegrees: Int,
+        val keep: Boolean
+    )
 
     private val manager = context.applicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val thread = HandlerThread("redline-viewfinder").apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
+    private val saver = StillSaver(context, version)
+    private val saveExecutor = Executors.newSingleThreadExecutor()
 
     // Camera-thread state.
     private var generation = 0
@@ -138,8 +171,56 @@ class ViewfinderController(context: Context, private val listener: Listener) {
     private var streamStartMs = 0L
     private var lastFpsReportMs = 0L
 
-    fun open(setup: ViewfinderSetup, texture: SurfaceTexture, zoomRatio: Float, stabilization: Boolean) {
-        handler.post { openOnThread(setup, texture, zoomRatio, stabilization) }
+    // B13 still capture (camera thread).
+    private var rawWanted = false
+    private var jpegReader: ImageReader? = null
+    private var rawReader: ImageReader? = null
+    private var sessionHasRaw = false
+    private var characteristics: CameraCharacteristics? = null
+    private var pending: PendingShot? = null
+    private var savesQueued = 0
+    private val retired = mutableListOf<ImageReader>()
+
+    private class PendingShot(
+        val request: StillRequest,
+        val jpegOrientation: Int,
+        val wantRaw: Boolean,
+        val shutterAtMs: Long,
+        val done: (ShotResult) -> Unit
+    ) {
+        var timestamp: Long? = null
+        var result: TotalCaptureResult? = null
+        var jpeg: ByteArray? = null
+        var raw: Image? = null
+        var finished = false
+    }
+
+    fun open(setup: ViewfinderSetup, texture: SurfaceTexture, zoomRatio: Float, stabilization: Boolean, raw: Boolean = false) {
+        handler.post {
+            rawWanted = raw
+            openOnThread(setup, texture, zoomRatio, stabilization)
+        }
+    }
+
+    /** RAW (DNG) on/off. The RAW stream is only in the session while RAW is on, so the default session stays preview + JPEG. */
+    fun setRaw(on: Boolean) {
+        handler.post {
+            if (rawWanted == on) return@post
+            rawWanted = on
+            val cam = device ?: return@post
+            val target = surface ?: return@post
+            if (pending != null) return@post // rebuilt after the shot in flight
+            rebuildSession(cam, target)
+        }
+    }
+
+    /**
+     * Takes one still (JPEG, plus DNG while RAW is on). [done] runs on the saver thread once the files are
+     * written, or with a failure. Refused (failure, nothing captured) while a shot is in flight or two saves
+     * are queued.
+     */
+    fun capture(request: StillRequest, done: (ShotResult) -> Unit) {
+        handler.post { captureOnThread(request, done) }
     }
 
     fun setZoom(ratio: Float) {
@@ -170,6 +251,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
     fun release() {
         close()
         thread.quitSafely()
+        saveExecutor.shutdown()
     }
 
     @SuppressLint("MissingPermission")
@@ -181,6 +263,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         firstCaptureSeen = false
         fps.reset()
         frameStats = FrameStats(setup.aeFpsRange?.second ?: PreviewFps.TARGET)
+        characteristics = runCatching { manager.getCameraCharacteristics(setup.cameraId) }.getOrNull()
         texture.setDefaultBufferSize(setup.previewSize.width, setup.previewSize.height)
         surface?.release()
         val target = Surface(texture)
@@ -233,6 +316,23 @@ class ViewfinderController(context: Context, private val listener: Listener) {
     }
 
     private fun createSession(camera: CameraDevice, target: Surface, gen: Int) {
+        val su = setup
+        closeReaders()
+        val outputs = mutableListOf(OutputConfiguration(target))
+        su?.jpegSize?.let { size ->
+            val r = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2)
+            r.setOnImageAvailableListener({ onJpeg(it) }, handler)
+            jpegReader = r
+            outputs += OutputConfiguration(r.surface)
+        }
+        val withRaw = rawWanted && su?.rawSize != null
+        if (withRaw) {
+            val size = su!!.rawSize!!
+            val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 2)
+            r.setOnImageAvailableListener({ onRaw(it) }, handler)
+            rawReader = r
+            outputs += OutputConfiguration(r.surface)
+        }
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 if (gen != generation) {
@@ -240,22 +340,209 @@ class ViewfinderController(context: Context, private val listener: Listener) {
                     return
                 }
                 session = s
+                sessionHasRaw = withRaw
                 streamStartMs = SystemClock.elapsedRealtime()
                 frameStats.breakRun()
                 repeat()
             }
 
             override fun onConfigureFailed(s: CameraCaptureSession) {
-                if (gen == generation) listener.onError("preview session configuration failed")
+                if (gen != generation) return
+                if (withRaw) {
+                    rawWanted = false
+                    listener.onRawUnavailable("session with RAW_SENSOR ${su?.rawSize} could not be configured")
+                    createSession(camera, target, gen)
+                } else {
+                    listener.onError("preview session configuration failed")
+                }
             }
         }
         try {
-            val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, listOf(OutputConfiguration(target)), executor, callback)
+            val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor, callback)
             camera.createCaptureSession(config)
         } catch (e: Exception) {
             Log.w(TAG, "createCaptureSession failed", e)
             listener.onError("preview session failed: ${e.javaClass.simpleName}")
         }
+    }
+
+    private fun rebuildSession(camera: CameraDevice, target: Surface) {
+        runCatching { session?.close() }
+        session = null
+        createSession(camera, target, generation)
+    }
+
+    private fun captureOnThread(request: StillRequest, done: (ShotResult) -> Unit) {
+        val s = session
+        val cam = device
+        val su = setup
+        val target = surface
+        val jpeg = jpegReader
+        val refuse = when {
+            s == null || cam == null || su == null || target == null -> "camera not ready"
+            jpeg == null -> "no JPEG stream"
+            pending != null -> "busy: previous shot in flight"
+            savesQueued >= MAX_SAVES_QUEUED -> "busy: saving"
+            else -> null
+        }
+        if (refuse != null) {
+            saveExecutor.execute { done(ShotResult(ok = false, error = refuse, kept = request.keep)) }
+            return
+        }
+        val wantRaw = sessionHasRaw && rawReader != null
+        val orientation = CaptureMath.jpegOrientation(su!!.sensorOrientation, request.deviceDegrees, su.frontFacing)
+        val shot = PendingShot(request, orientation, wantRaw, SystemClock.elapsedRealtime(), done)
+        try {
+            val req = cam!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(target!!)
+                addTarget(jpeg!!.surface)
+                if (wantRaw) {
+                    addTarget(rawReader!!.surface)
+                    set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                }
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                su.aeFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
+                if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
+                set(CaptureRequest.JPEG_ORIENTATION, orientation)
+                set(CaptureRequest.JPEG_QUALITY, StillSaver.JPEG_QUALITY.toByte())
+                applyZoom(this, su)
+            }
+            pending = shot
+            s!!.capture(req.build(), stillCallback, handler)
+            handler.postDelayed({ if (pending === shot) failShot(shot, "timed out after $SHOT_TIMEOUT_MS ms") }, SHOT_TIMEOUT_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "still capture failed", e)
+            pending = null
+            saveExecutor.execute { done(ShotResult(ok = false, error = "capture: ${e.javaClass.simpleName}", kept = request.keep)) }
+        }
+    }
+
+    private val stillCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureStarted(s: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+            pending?.let { if (it.timestamp == null) it.timestamp = timestamp }
+        }
+
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            val p = pending ?: return
+            p.result = result
+            if (p.timestamp == null) p.timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+            maybeFinish(p)
+        }
+
+        override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+            pending?.let { failShot(it, "capture failed (reason ${failure.reason})") }
+        }
+    }
+
+    private fun onJpeg(reader: ImageReader) {
+        val img = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
+        val p = pending
+        if (p == null || p.jpeg != null) {
+            img.close()
+            return
+        }
+        try {
+            val buf = img.planes[0].buffer
+            p.jpeg = ByteArray(buf.remaining()).also { buf.get(it) }
+        } finally {
+            img.close()
+        }
+        maybeFinish(p)
+    }
+
+    private fun onRaw(reader: ImageReader) {
+        val img = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
+        val p = pending
+        if (p == null || !p.wantRaw || p.raw != null) {
+            img.close()
+            return
+        }
+        p.raw = img
+        maybeFinish(p)
+    }
+
+    private fun maybeFinish(p: PendingShot) {
+        if (p.finished || p !== pending) return
+        val result = p.result ?: return
+        val jpeg = p.jpeg ?: return
+        if (p.wantRaw && p.raw == null) return
+        val ch = characteristics
+        if (ch == null) {
+            failShot(p, "no camera characteristics")
+            return
+        }
+        p.finished = true
+        pending = null
+        savesQueued++
+        val r = p.request
+        val shot = StillShot(
+            jpeg = jpeg,
+            raw = p.raw,
+            result = result,
+            characteristics = ch,
+            jpegOrientation = p.jpegOrientation,
+            stopLabel = r.stopLabel,
+            stopTargetMm = r.stopTargetMm,
+            trueEquivalentMm = r.trueEquivalentMm,
+            stopLongPx = r.stopLongPx,
+            shutterAtMs = p.shutterAtMs,
+            keep = r.keep
+        )
+        saveExecutor.execute {
+            val out = saver.save(shot) { SystemClock.elapsedRealtime() }
+            handler.post {
+                savesQueued--
+                closeRetiredIfIdle()
+            }
+            p.done(out)
+        }
+        afterShot()
+    }
+
+    private fun failShot(p: PendingShot, message: String) {
+        if (p.finished) return
+        p.finished = true
+        if (pending === p) pending = null
+        runCatching { p.raw?.close() }
+        saveExecutor.execute { p.done(ShotResult(ok = false, error = message, dngWanted = p.wantRaw, kept = p.request.keep)) }
+        afterShot()
+    }
+
+    /** A RAW toggle that arrived during a shot is applied once the shot is out of the camera. */
+    private fun afterShot() {
+        if (rawWanted != sessionHasRaw) {
+            val cam = device ?: return
+            val target = surface ?: return
+            rebuildSession(cam, target)
+        }
+    }
+
+    private fun stabilizationMode(): Int = if (stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+    } else {
+        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+    }
+
+    /**
+     * Detaches the readers from the next session. A RAW Image the saver is still writing belongs to its
+     * reader, so readers are only closed once no save is queued.
+     */
+    private fun closeReaders() {
+        pending?.let { failShot(it, "session closed") }
+        jpegReader?.let { retired += it }
+        rawReader?.let { retired += it }
+        jpegReader = null
+        rawReader = null
+        sessionHasRaw = false
+        closeRetiredIfIdle()
+    }
+
+    private fun closeRetiredIfIdle() {
+        if (savesQueued > 0) return
+        retired.forEach { runCatching { it.close() } }
+        retired.clear()
     }
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
@@ -290,12 +577,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 su.aeFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
                 if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                val stabMode = if (stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
-                } else {
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                }
-                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabMode)
+                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
                 applyZoom(this, su)
             }
             val targetFps = su.aeFpsRange?.second ?: PreviewFps.TARGET
@@ -327,6 +609,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         val cam = device
         runCatching { session?.close() }
         session = null
+        closeReaders()
         device = null
         if (cam == null && !opening) {
             surface?.release()
@@ -351,5 +634,7 @@ class ViewfinderController(context: Context, private val listener: Listener) {
         private const val TAG = "RedlineViewfinder"
         private const val FPS_REPORT_MS = 500L
         private const val WARMUP_MS = 2_000L
+        private const val MAX_SAVES_QUEUED = 2
+        private const val SHOT_TIMEOUT_MS = 5_000L
     }
 }

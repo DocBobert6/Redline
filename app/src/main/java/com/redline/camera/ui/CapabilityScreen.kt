@@ -25,6 +25,7 @@ import com.redline.camera.capability.DeviceProfile
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
+import com.redline.camera.capture.CaptureStats
 
 @Composable
 fun CapabilityScreen(
@@ -37,6 +38,7 @@ fun CapabilityScreen(
     onRunSelfTest: () -> Unit = {},
     onRepeatSelfTest: (() -> Unit)? = null,
     onToggleStabilization: (() -> Unit)? = null,
+    onRunStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
@@ -66,6 +68,28 @@ fun CapabilityScreen(
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.padding(top = 8.dp)
                     )
+                }
+                item {
+                    SectionCard("Capture") {
+                        val c = state.capture
+                        Text("Shots ${c.shots}, failures ${c.failures}, DNG ${c.dngSaved}/${c.dngWanted}")
+                        c.avgSaveMs?.let { Text("Shutter to saved: avg $it ms, max ${c.maxSaveMs} ms") }
+                        c.last?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        if (c.stressRequested > 0) {
+                            val raw = if (c.stressRaw) ", RAW on" else ""
+                            val gate = gateWord(c.stressGatePassed)
+                            Text("Stress ${c.stressDone}/${c.stressRequested}, ${c.stressFailures} failed$raw (gate: $gate)")
+                        }
+                        if (onRunStress != null) {
+                            OutlinedButton(onClick = onRunStress, enabled = !c.stressRunning, modifier = Modifier.padding(top = 8.dp)) {
+                                Text("Run ${CaptureStats.STRESS_RUNS}-capture stress test")
+                            }
+                            Text(
+                                "Runs on the viewfinder; files are fully written, then deleted. Uses the current RAW setting.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
                 }
                 item {
                     SectionCard("Self-test") {

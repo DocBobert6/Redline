@@ -3,6 +3,7 @@ package com.redline.camera.ui
 import android.content.res.Configuration
 import android.view.TextureView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -15,6 +16,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
@@ -29,6 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -53,6 +57,8 @@ const val FRAME_TAG = "viewfinder_frame"
 const val ZOOM_RING_TAG = "zoom_ring"
 const val ZOOM_NOTE_TAG = "zoom_note"
 const val OPEN_CAPABILITY_TAG = "open_capability"
+const val SHUTTER_TAG = "shutter"
+const val RAW_TOGGLE_TAG = "raw_toggle"
 
 fun zoomStopTag(mm: Int): String = "zoom_stop_$mm"
 
@@ -76,7 +82,13 @@ fun ViewfinderScreen(
     status: String?,
     needsPermission: Boolean,
     onRequestPermission: () -> Unit,
-    onOpenCapability: () -> Unit
+    onOpenCapability: () -> Unit,
+    onShutter: () -> Unit = {},
+    shutterEnabled: Boolean = false,
+    rawAvailable: Boolean = false,
+    rawOn: Boolean = false,
+    onToggleRaw: () -> Unit = {},
+    captureText: String? = null
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent)) {
@@ -119,13 +131,36 @@ fun ViewfinderScreen(
                         Text("Info")
                     }
                 }
-                if (plan != null) {
-                    ZoomRing(
-                        plan = plan,
-                        selected = selectedStop,
-                        onSelect = onSelectStop,
-                        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding()
-                    )
+                Column(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding()) {
+                    captureText?.let {
+                        Text(it, fontSize = 11.sp, modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (rawAvailable) {
+                            OutlinedButton(onClick = onToggleRaw, modifier = Modifier.testTag(RAW_TOGGLE_TAG)) {
+                                Text(if (rawOn) "RAW on" else "RAW off", color = if (rawOn) Accent else Color.White)
+                            }
+                        } else {
+                            Spacer(modifier = Modifier.size(1.dp))
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(72.dp)
+                                .clip(CircleShape)
+                                .background(if (shutterEnabled) Color.White else Color.Gray)
+                                .border(4.dp, Accent, CircleShape)
+                                .clickable(enabled = shutterEnabled, onClick = onShutter)
+                                .testTag(SHUTTER_TAG)
+                        )
+                        Spacer(modifier = Modifier.size(width = 88.dp, height = 1.dp))
+                    }
+                    if (plan != null) {
+                        ZoomRing(plan = plan, selected = selectedStop, onSelect = onSelectStop, modifier = Modifier.fillMaxWidth())
+                    }
                 }
             }
         }

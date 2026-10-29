@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
+import android.view.OrientationEventListener
 import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -30,6 +31,9 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.QuirksRepository
 import com.redline.camera.capability.SelfTest
+import com.redline.camera.capability.StillPath
+import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.ShotResult
 import com.redline.camera.ui.CapabilityScreen
 import com.redline.camera.ui.ViewfinderScreen
 import com.redline.camera.viewfinder.ViewfinderController
@@ -62,6 +66,14 @@ class MainActivity : ComponentActivity() {
     private val status = mutableStateOf<String?>(null)
     private val permissionGranted = mutableStateOf(false)
 
+    /** B13: save a DNG next to the JPEG. Off by default (PLAN 5: RAW file is a toggle). */
+    private val rawOn = mutableStateOf(false)
+    private val shotInFlight = mutableStateOf(false)
+    private val streaming = mutableStateOf(false)
+    private var deviceDegrees = 0
+    private var stressPending = false
+    private var stressAbort = false
+
     private val profile: DeviceProfile? get() = profileState.value
 
     // Main-thread state.
@@ -88,6 +100,7 @@ class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val checksFallback = Runnable { flushChecks() }
     private lateinit var controller: ViewfinderController
+    private lateinit var orientationListener: OrientationEventListener
 
     private val permissionRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         awaitingPermission = false
@@ -138,6 +151,13 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean) {
+            runOnUiThread {
+                streaming.value = true
+                if (stressPending) {
+                    stressPending = false
+                    startStress()
+                }
+            }
             updateViewfinder { m ->
                 m.copy(
                     previewSize = setup.previewSize,
@@ -149,9 +169,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        override fun onRawUnavailable(reason: String) {
+            runOnUiThread {
+                rawOn.value = false
+                status.value = "RAW unavailable: $reason"
+            }
+        }
+
         override fun onError(message: String) {
             runOnUiThread {
                 cameraOpen = false
+                streaming.value = false
                 status.value = message
                 updateViewfinder { it.copy(status = message) }
                 flushChecks()
@@ -163,9 +191,15 @@ class MainActivity : ComponentActivity() {
         createdAtMs = SystemClock.elapsedRealtime()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        controller = ViewfinderController(this, cameraListener)
+        controller = ViewfinderController(this, cameraListener, BuildConfig.VERSION_NAME)
+        orientationListener = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation != ORIENTATION_UNKNOWN) deviceDegrees = orientation
+            }
+        }
         savedInstanceState?.let {
             selectedStop.intValue = it.getInt(STATE_STOP, ZoomStops.DEFAULT_STOP)
+            rawOn.value = it.getBoolean(STATE_RAW, false)
             if (it.getBoolean(STATE_CAPABILITY, false)) screen.value = Screen.CAPABILITY
         }
 
@@ -224,12 +258,14 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        if (orientationListener.canDetectOrientation()) orientationListener.enable()
         permissionGranted.value = SelfTest(this).hasPermission()
         syncCamera()
     }
 
     override fun onPause() {
         resumed = false
+        orientationListener.disable()
         syncCamera()
         super.onPause()
     }
@@ -244,6 +280,7 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
         outState.putInt(STATE_STOP, selectedStop.intValue)
         outState.putBoolean(STATE_CAPABILITY, screen.value == Screen.CAPABILITY)
+        outState.putBoolean(STATE_RAW, rawOn.value)
     }
 
     @Composable
@@ -262,7 +299,13 @@ class MainActivity : ComponentActivity() {
                 status = if (!permissionGranted.value) "Camera permission needed" else status.value,
                 needsPermission = !permissionGranted.value,
                 onRequestPermission = { permissionRequest.launch(Manifest.permission.CAMERA) },
-                onOpenCapability = ::showCapability
+                onOpenCapability = ::showCapability,
+                onShutter = { shoot(keep = true) {} },
+                shutterEnabled = streaming.value && !shotInFlight.value && !state.value.capture.stressRunning,
+                rawAvailable = rawAvailable(),
+                rawOn = rawOn.value,
+                onToggleRaw = ::toggleRaw,
+                captureText = state.value.capture.overlayText()
             )
         } else {
             CapabilityScreen(
@@ -286,6 +329,10 @@ class MainActivity : ComponentActivity() {
                 } else {
                     null
                 },
+                onRunStress = {
+                    stressPending = true
+                    showViewfinder()
+                },
                 onBack = ::showViewfinder
             )
         }
@@ -300,6 +347,70 @@ class MainActivity : ComponentActivity() {
     private fun showViewfinder() {
         screen.value = Screen.VIEWFINDER
         syncCamera()
+    }
+
+    /** RAW is offered when the camera has a RAW_SENSOR stream and the policy kept the RAW path. */
+    private fun rawAvailable(): Boolean =
+        setupState.value?.rawSize != null && state.value.policy(profile).defaults.stillPath == StillPath.RAW_PLUS_JPEG
+
+    private fun toggleRaw() {
+        rawOn.value = !rawOn.value && rawAvailable()
+        controller.setRaw(rawOn.value)
+    }
+
+    /** One still with the selected stop's framing. [done] runs on the main thread. */
+    private fun shoot(keep: Boolean, done: (ShotResult) -> Unit) {
+        val stop = setupState.value?.zoomPlan?.stop(selectedStop.intValue)
+        val request = ViewfinderController.StillRequest(
+            stopLabel = stop?.label ?: "${selectedStop.intValue}",
+            stopTargetMm = stop?.targetMm ?: selectedStop.intValue,
+            trueEquivalentMm = stop?.trueEquivalentMm,
+            stopLongPx = stop?.outputWidthPx ?: 0,
+            deviceDegrees = deviceDegrees,
+            keep = keep
+        )
+        shotInFlight.value = true
+        controller.capture(request) { result ->
+            runOnUiThread {
+                shotInFlight.value = false
+                val stress = !keep
+                state.value = state.value.copy(capture = state.value.capture.add(result, stress))
+                done(result)
+            }
+        }
+    }
+
+    /**
+     * B13 gate: 500 consecutive captures through the full save path (files written via MediaStore, then
+     * deleted), one at a time. Leaving the viewfinder aborts the run, which then does not count.
+     */
+    private fun startStress() {
+        if (state.value.capture.stressRunning) return
+        stressAbort = false
+        val runs = CaptureStats.STRESS_RUNS
+        state.value = state.value.copy(
+            capture = state.value.capture.copy(
+                stressRequested = runs,
+                stressDone = 0,
+                stressFailures = 0,
+                stressRaw = rawOn.value,
+                stressRunning = true
+            )
+        )
+        fun next() {
+            val c = state.value.capture
+            if (stressAbort || !cameraOpen) {
+                val aborted = c.copy(stressRunning = false, lastError = "stress run aborted at ${c.stressDone}/$runs")
+                state.value = state.value.copy(capture = aborted)
+                return
+            }
+            if (c.stressDone >= runs) {
+                state.value = state.value.copy(capture = c.copy(stressRunning = false))
+                return
+            }
+            shoot(keep = false) { next() }
+        }
+        next()
     }
 
     private fun selectStop(mm: Int) {
@@ -339,10 +450,12 @@ class MainActivity : ComponentActivity() {
             val stop = setup.zoomPlan.stop(selectedStop.intValue)
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
-            controller.open(setup, surface, ratio, appliedStabilization)
+            controller.open(setup, surface, ratio, appliedStabilization, rawOn.value && rawAvailable())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
         } else if (!want && cameraOpen) {
             cameraOpen = false
+            streaming.value = false
+            stressAbort = true
             lastClose = controller.close()
             return lastClose
         }
@@ -497,6 +610,7 @@ class MainActivity : ComponentActivity() {
         private const val REPEAT_RUNS = 100
         private const val STATE_STOP = "redline.zoom_stop"
         private const val STATE_CAPABILITY = "redline.capability_screen"
+        private const val STATE_RAW = "redline.raw"
         private const val DEFAULT_SENSOR_ORIENTATION = 90
 
         /** Deferred checks start at the first preview frame, or after this long if no frame arrives. */
