@@ -43,8 +43,10 @@ class LutTimingStats(private val window: Int = 1000) {
 
 data class TimingSnapshot(val framesMeasured: Int, val p50Ms: Double?, val p95Ms: Double?, val maxMs: Double?) {
     /** B20 gate: p95 of the LUT pass <= 8 ms, judged once at least 100 frames were measured; null before. */
-    val gatePassed: Boolean?
-        get() = if (framesMeasured >= LookPreviewReport.GATE_MIN_FRAMES && p95Ms != null) p95Ms <= LookPreviewReport.GATE_MS else null
+    val gatePassed: Boolean? get() = gateWith(LookPreviewReport.GATE_MIN_FRAMES)
+
+    /** The gate judged once at least [minFrames] samples exist; null before. */
+    fun gateWith(minFrames: Int): Boolean? = if (framesMeasured >= minFrames && p95Ms != null) p95Ms <= LookPreviewReport.GATE_MS else null
 }
 
 /**
@@ -78,7 +80,15 @@ data class LookPreviewReport(
     /** On, available and not failed at runtime: what the viewfinder renders through when the camera is open. */
     val enabled: Boolean get() = userSetting && available == true && runtimeError == null
 
-    val gateLutLe8Ms: Boolean? get() = timing.gatePassed
+    /**
+     * B20b: the CPU glFinish estimate samples every 15th frame, so a 10-15 s session yields ~20 samples, not 100.
+     * GPU timer queries keep the 100-frame minimum.
+     */
+    val gateLutLe8Ms: Boolean?
+        get() {
+            val cpu = timerMethod?.startsWith(CPU_METHOD_PREFIX) == true
+            return timing.gateWith(if (cpu) GATE_MIN_FRAMES_CPU else GATE_MIN_FRAMES)
+        }
 
     /** Why the look preview is not on, or null when it is. */
     fun whyOff(): String? = when {
@@ -124,6 +134,8 @@ data class LookPreviewReport(
         const val LABEL = "Look preview (approximate until B21)"
         const val GATE_MS = 8.0
         const val GATE_MIN_FRAMES = 100
+        const val GATE_MIN_FRAMES_CPU = 20
+        const val CPU_METHOD_PREFIX = "cpu_"
 
         private fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
 
