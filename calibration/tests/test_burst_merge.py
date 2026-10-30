@@ -140,7 +140,7 @@ def tool():
     return path
 
 
-def run_native(tool, tmp_path, frames, reference=-1, threads=3):
+def run_native(tool, tmp_path, frames, reference=-1, threads=3, white=WHITE):
     h, w = frames[0].shape
     paths = []
     for i, f in enumerate(frames):
@@ -149,7 +149,7 @@ def run_native(tool, tmp_path, frames, reference=-1, threads=3):
         paths.append(str(p))
     params = tmp_path / "params.txt"
     params.write_text(
-        f"width {w} height {h} black {' '.join(str(b) for b in BLACK)} white {WHITE} noise {NOISE_S} {NOISE_O} "
+        f"width {w} height {h} black {' '.join(str(b) for b in BLACK)} white {white} noise {NOISE_S} {NOISE_O} "
         f"threads {threads} reference {reference} frames {len(paths)} " + " ".join(paths)
     )
     out, disp = tmp_path / "out.f32", tmp_path / "disp.i32"
@@ -191,3 +191,28 @@ def test_native_is_deterministic_across_thread_counts(tool, tmp_path):
     b, db, _ = run_native(tool, tmp_path, frames, threads=4)
     np.testing.assert_array_equal(da, db)
     assert np.abs(a - b).max() <= 1e-3
+
+
+def test_native_matches_reference_14bit(tool, tmp_path):
+    """B22a: a 14-bit white level puts the grey above the narrow-accumulator kernels' range, so the native code takes
+    its general distance path; the alignment must still match the reference exactly."""
+    white = 16383.0
+    frames, _ = bm.synthetic_burst(192, 256, SHIFTS8[:4], white=white)
+    ref = bm.merge(frames, BLACK, white, NOISE_S, NOISE_O)
+    merged, disp, stats = run_native(tool, tmp_path, frames, white=white)
+    assert stats["reference"] == ref.reference
+    for k, d in ref.displacements.items():
+        np.testing.assert_array_equal(disp[k], d, err_msg=f"frame {k} displacements")
+    assert np.abs(merged.astype(np.float64) - ref.merged).max() <= MERGE_TOL * 16
+
+
+def test_grey_saturates_at_16_bits():
+    raw = np.full((4, 4), 20000, dtype=np.uint16)
+    assert bm.grey(raw).max() == 65535
+
+
+def test_native_streaming_holds_at_most_three_frames(tool, tmp_path):
+    frames, _ = bm.synthetic_burst(128, 192, SHIFTS8)
+    _, _, stats = run_native(tool, tmp_path, frames)
+    assert stats["max_held_frames"] == 3
+    assert stats["threads"] == 3

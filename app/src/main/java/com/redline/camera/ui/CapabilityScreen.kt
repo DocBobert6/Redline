@@ -283,7 +283,7 @@ const val BURST_STRESS_TAG = "burst_merge_stress"
 private fun BurstCard(r: BurstReport, onToggle: (() -> Unit)?, onRunStress: (() -> Unit)?) {
     SectionCard(BURST_SECTION_TITLE) {
         Text(BurstReport.LABEL, style = MaterialTheme.typography.bodySmall)
-        Text(if (r.enabled) "On: stills merge a RAW burst on the processing queue" else "Off: ${r.whyOff()}")
+        Text(if (r.enabled) "On: stills merge a RAW burst while it is captured" else "Off: ${r.whyOff()}")
         val f = { v: Double? -> v?.let { "%.3f".format(it) } ?: "-" }
         Text(
             "Self-check: aligned ${f(r.selfCheckAligned)}, noise reduction ${f(r.selfCheckNoiseRatio)}x, " +
@@ -293,22 +293,37 @@ private fun BurstCard(r: BurstReport, onToggle: (() -> Unit)?, onRunStress: (() 
         Text(
             "Memory pool ${r.poolFrames ?: "-"} frames x ${r.frameMb?.let {
                 "%.0f".format(it)
-            } ?: "-"} MB",
+            } ?: "-"} MB; peak per burst ${"%.0f".format(r.peakResidentMb)} MB (${r.streamMaxResidentFrames} frames + " +
+                "${"%.0f".format(r.peakNativeMb)} MB merge); workers ${r.workerThreads ?: "-"} threads, nice ${r.workerNice ?: "-"}",
             style = MaterialTheme.typography.bodySmall
         )
+        if (r.framesByLight.isNotEmpty()) {
+            Text(
+                "Frames by light: " + r.framesByLight.entries.joinToString { (k, v) -> "$k ${v[2]}-${v[3]} (${v[0]} shots)" },
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
         val avg = if (r.mergedShots == 0) "-" else "${r.totalSaveMs / r.mergedShots}"
         Text(
             "Merged ${r.mergedShots}, single-frame ${r.singleShots}, fallbacks ${r.fallbacks}; frames requested ${r.framesRequested}, " +
                 "captured ${r.framesCaptured}, merged ${r.framesMerged}; shutter-to-saved avg $avg ms (max ${r.maxSaveMs})"
         )
         if (r.singleReasons.isNotEmpty()) Text("Single-frame because: ${r.singleReasons}", style = MaterialTheme.typography.bodySmall)
+        if (r.queuedShots > 0) {
+            Text(
+                "Queued shots (not in the gate) ${r.queuedShots}: avg ${r.queuedTotalMs / r.queuedShots} ms, max ${r.queuedMaxMs} ms; " +
+                    "camera JPEG ${r.cameraJpegShots}",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
         Text(
             "Queue ${r.queueDepth} (max ${r.maxQueueDepth}); presses ${r.presses}, blocked ${r.shutterBlocked}, " +
                 "waited ${r.shutterWaits} (max ${r.maxShutterWaitMs} ms)"
         )
         r.last?.let { l ->
             Text(
-                "Last: ${l.plan.frames} planned / ${l.framesCaptured} captured / ${l.framesMerged} merged at ${l.stopMm} mm, " +
+                "Last: ${l.plan.frames} planned (${l.plan.light ?: "-"}) / ${l.framesCaptured} captured / ${l.framesMerged} merged " +
+                    "at ${l.stopMm} mm, " +
                     "ISO ${l.plan.iso}, ${l.plan.exposureNs / 1000} us, ${"%.2f".format(
                         l.plan.underEv
                     )} EV under, ref ${l.reference ?: "-"}, " +
@@ -317,6 +332,13 @@ private fun BurstCard(r: BurstReport, onToggle: (() -> Unit)?, onRunStress: (() 
                 style = MaterialTheme.typography.bodySmall
             )
             if (l.timingsMs.isNotEmpty()) Text("Stages ${l.timingsMs}", style = MaterialTheme.typography.bodySmall)
+            l.streaming?.let { st ->
+                Text(
+                    "Streaming: ${st.framesMergedDuringCapture} merged during capture, tail ${st.mergeTailMs} ms, " +
+                        "backlog max ${st.maxBacklog}, resident max ${st.maxResidentFrames} frames, ${st.threads} threads",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         }
         Text(
             "Gates: 24/35 mm save < 3 s ${gateWord(r.saveGate)} ${r.gateStops}, no shutter blocking ${gateWord(r.shutterGate)}"

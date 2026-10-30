@@ -204,49 +204,16 @@ extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNa
     std::free(env->GetDirectBufferAddress(buffer));
 }
 
-// Result layout (floats): [reference, frames, tilesX, tilesY, pyramidMs, referenceMs, alignMs, mergeMs, finishMs,
-// then per alternate frame: index, meanDispPx, maxDispPx, meanWeight, rejectedFraction, alignMs, mergeMs].
-extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergeBurst(
-    JNIEnv* env, jclass, jobjectArray buffers, jint width, jint height, jint rowStrideBytes, jfloatArray black, jfloat white,
-    jdouble noiseS, jdouble noiseO, jint reference, jint threads, jobject out, jfloat outScale) {
-    const Floats b(env, black);
-    std::string err;
-    std::vector<redline::BurstFrame> frames;
-    const jsize n = buffers == nullptr ? 0 : env->GetArrayLength(buffers);
-    const jlong need = static_cast<jlong>(rowStrideBytes) * (height - 1) + static_cast<jlong>(width) * 2;
-    if (n == 0) err = "no frames";
-    if (err.empty() && (rowStrideBytes <= 0 || (rowStrideBytes & 1) != 0 || width <= 0 || height <= 0)) err = "bad frame geometry";
-    for (jsize i = 0; err.empty() && i < n; ++i) {
-        jobject buf = env->GetObjectArrayElement(buffers, i);
-        void* data = buf == nullptr ? nullptr : env->GetDirectBufferAddress(buf);
-        if (data == nullptr || env->GetDirectBufferCapacity(buf) < need) err = "frame buffer missing, not direct or too small";
-        else frames.push_back({static_cast<const std::uint16_t*>(data), rowStrideBytes / 2});
-        if (buf != nullptr) env->DeleteLocalRef(buf);
-    }
-    void* outData = out == nullptr ? nullptr : env->GetDirectBufferAddress(out);
-    const jlong outNeed = static_cast<jlong>(width) * height * 2;
-    if (err.empty() && (outData == nullptr || env->GetDirectBufferCapacity(out) < outNeed)) err = "output buffer missing or too small";
-    if (err.empty() && b.size() != 4) err = "black level needs 4 values";
-    redline::BurstResult r;
-    if (err.empty()) {
-        redline::BurstParams p;
-        p.width = width;
-        p.height = height;
-        for (int i = 0; i < 4; ++i) p.black[i] = b.get()[i];
-        p.white = white;
-        p.noiseS = noiseS;
-        p.noiseO = noiseO;
-        p.threads = threads;
-        p.reference = reference;
-        err = redline::mergeBurstU16(frames, p, static_cast<std::uint16_t*>(outData), static_cast<std::size_t>(width), outScale, r);
-    }
-    if (!err.empty()) {
-        throwIllegalArgument(env, err);
-        return nullptr;
-    }
-    std::vector<jfloat> v = {static_cast<jfloat>(r.reference), static_cast<jfloat>(frames.size()), static_cast<jfloat>(r.tilesX),
+namespace {
+
+// Merge stats as floats: [reference, frames, tilesX, tilesY, pyramidMs, referenceMs, alignMs, mergeMs, finishMs, threads,
+// maxHeldFrames, peakNativeMb, then per alternate frame: index, meanDispPx, maxDispPx, meanWeight, rejectedFraction,
+// alignMs, mergeMs]. Keep in step with RedlineNative.MERGE_HEADER / MERGE_PER_FRAME.
+jfloatArray mergeStats(JNIEnv* env, const redline::BurstResult& r) {
+    std::vector<jfloat> v = {static_cast<jfloat>(r.reference), static_cast<jfloat>(r.framesAdded), static_cast<jfloat>(r.tilesX),
                              static_cast<jfloat>(r.tilesY), static_cast<jfloat>(r.pyramidMs), static_cast<jfloat>(r.referenceMs),
-                             static_cast<jfloat>(r.alignMs), static_cast<jfloat>(r.mergeMs), static_cast<jfloat>(r.finishMs)};
+                             static_cast<jfloat>(r.alignMs), static_cast<jfloat>(r.mergeMs), static_cast<jfloat>(r.finishMs),
+                             static_cast<jfloat>(r.threads), static_cast<jfloat>(r.maxHeldFrames), static_cast<jfloat>(r.peakNativeMb)};
     for (const auto& f : r.frames) {
         v.insert(v.end(), {static_cast<jfloat>(f.index), static_cast<jfloat>(f.meanDispPx), static_cast<jfloat>(f.maxDispPx),
                            static_cast<jfloat>(f.meanWeight), static_cast<jfloat>(f.rejectedFraction), static_cast<jfloat>(f.alignMs),
@@ -256,6 +223,152 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
     if (res == nullptr) return nullptr;
     env->SetFloatArrayRegion(res, 0, static_cast<jsize>(v.size()), v.data());
     return res;
+}
+
+std::string burstParams(JNIEnv* env, jint width, jint height, jfloatArray black, jfloat white, jdouble noiseS, jdouble noiseO,
+                        jint reference, jint threads, redline::BurstParams& p) {
+    const Floats b(env, black);
+    if (width <= 0 || height <= 0) return "bad frame geometry";
+    if (b.size() != 4) return "black level needs 4 values";
+    p.width = width;
+    p.height = height;
+    for (int i = 0; i < 4; ++i) p.black[i] = b.get()[i];
+    p.white = white;
+    p.noiseS = noiseS;
+    p.noiseO = noiseO;
+    p.threads = threads;
+    p.reference = reference;
+    return "";
+}
+
+// A direct buffer holding a RAW frame of the merger's geometry, or null with `err` set.
+const std::uint16_t* frameData(JNIEnv* env, jobject buf, jint width, jint height, jint rowStrideBytes, std::string& err) {
+    if (rowStrideBytes < width * 2 || (rowStrideBytes & 1) != 0) {
+        err = "bad row stride";
+        return nullptr;
+    }
+    const jlong need = static_cast<jlong>(rowStrideBytes) * (height - 1) + static_cast<jlong>(width) * 2;
+    void* data = buf == nullptr ? nullptr : env->GetDirectBufferAddress(buf);
+    if (data == nullptr || env->GetDirectBufferCapacity(buf) < need) {
+        err = "frame buffer missing, not direct or too small";
+        return nullptr;
+    }
+    return static_cast<const std::uint16_t*>(data);
+}
+
+struct MergerHandle {
+    redline::BurstMerger merger;
+    int width = 0;
+    int height = 0;
+};
+
+jintArray intArray(JNIEnv* env, const std::vector<int>& v) {
+    jintArray a = env->NewIntArray(static_cast<jsize>(v.size()));
+    if (a == nullptr) return nullptr;
+    std::vector<jint> j(v.begin(), v.end());
+    env->SetIntArrayRegion(a, 0, static_cast<jsize>(j.size()), j.data());
+    return a;
+}
+
+}  // namespace
+
+// One-shot merge of all frames (tests): stats as mergeStats.
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergeBurst(
+    JNIEnv* env, jclass, jobjectArray buffers, jint width, jint height, jint rowStrideBytes, jfloatArray black, jfloat white,
+    jdouble noiseS, jdouble noiseO, jint reference, jint threads, jobject out, jfloat outScale) {
+    redline::BurstParams p;
+    std::string err = burstParams(env, width, height, black, white, noiseS, noiseO, reference, threads, p);
+    std::vector<redline::BurstFrame> frames;
+    const jsize n = buffers == nullptr ? 0 : env->GetArrayLength(buffers);
+    if (err.empty() && n == 0) err = "no frames";
+    for (jsize i = 0; err.empty() && i < n; ++i) {
+        jobject buf = env->GetObjectArrayElement(buffers, i);
+        const std::uint16_t* data = frameData(env, buf, width, height, rowStrideBytes, err);
+        if (data != nullptr) frames.push_back({data, rowStrideBytes / 2});
+        if (buf != nullptr) env->DeleteLocalRef(buf);
+    }
+    void* outData = out == nullptr ? nullptr : env->GetDirectBufferAddress(out);
+    const jlong outNeed = static_cast<jlong>(width) * height * 2;
+    if (err.empty() && (outData == nullptr || env->GetDirectBufferCapacity(out) < outNeed)) err = "output buffer missing or too small";
+    redline::BurstResult r;
+    if (err.empty()) err = redline::mergeBurstU16(frames, p, static_cast<std::uint16_t*>(outData), static_cast<std::size_t>(width), outScale, r);
+    if (!err.empty()) {
+        throwIllegalArgument(env, err);
+        return nullptr;
+    }
+    return mergeStats(env, r);
+}
+
+// B22a streaming merge: create -> add (per frame, as it arrives) -> finish -> destroy. One thread per handle.
+extern "C" JNIEXPORT jlong JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergerCreate(
+    JNIEnv* env, jclass, jint width, jint height, jfloatArray black, jfloat white, jdouble noiseS, jdouble noiseO, jint reference,
+    jint threads) {
+    redline::BurstParams p;
+    std::string err = burstParams(env, width, height, black, white, noiseS, noiseO, reference, threads, p);
+    auto* h = new MergerHandle();
+    if (err.empty()) err = h->merger.begin(p);
+    if (!err.empty()) {
+        delete h;
+        throwIllegalArgument(env, err);
+        return 0;
+    }
+    h->width = width;
+    h->height = height;
+    return reinterpret_cast<jlong>(h);
+}
+
+// Adds the next frame; returns the indices of frames whose buffers the merger no longer needs.
+extern "C" JNIEXPORT jintArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergerAdd(JNIEnv* env, jclass,
+                                                                                                         jlong handle, jobject frame,
+                                                                                                         jint rowStrideBytes) {
+    auto* h = reinterpret_cast<MergerHandle*>(handle);
+    std::string err;
+    std::vector<int> released;
+    if (h == nullptr) err = "no merger";
+    const std::uint16_t* data = err.empty() ? frameData(env, frame, h->width, h->height, rowStrideBytes, err) : nullptr;
+    if (err.empty()) err = h->merger.add({data, rowStrideBytes / 2}, released);
+    if (!err.empty()) {
+        throwIllegalArgument(env, err);
+        return nullptr;
+    }
+    return intArray(env, released);
+}
+
+// Writes the merge (uint16 x outScale) into `out` (null: in place over the reference frame) and returns the stats;
+// every frame still held is released by this call.
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergerFinish(
+    JNIEnv* env, jclass, jlong handle, jobject out, jint rowStrideBytes, jfloat outScale) {
+    auto* h = reinterpret_cast<MergerHandle*>(handle);
+    std::string err;
+    if (h == nullptr) err = "no merger";
+    redline::BurstResult r;
+    std::vector<int> released;
+    if (err.empty() && out == nullptr) {
+        err = h->merger.finishU16(nullptr, 0, outScale, r, released);  // in place over the reference frame
+    } else if (err.empty()) {
+        const std::uint16_t* data = frameData(env, out, h->width, h->height, rowStrideBytes, err);
+        if (data != nullptr) {
+            err = h->merger.finishU16(const_cast<std::uint16_t*>(data), static_cast<std::size_t>(rowStrideBytes / 2), outScale, r,
+                                      released);
+        }
+    }
+    if (!err.empty()) {
+        throwIllegalArgument(env, err);
+        return nullptr;
+    }
+    return mergeStats(env, r);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeMergerDestroy(JNIEnv*, jclass, jlong handle) {
+    delete reinterpret_cast<MergerHandle*>(handle);
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBurstThreads(JNIEnv*, jclass) {
+    return redline::burstRecommendedThreads();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBurstWorkerNice(JNIEnv*, jclass, jint nice) {
+    redline::burstSetWorkerNice(nice);
 }
 
 // [alignedFraction, noiseRatio, ms]; throws IllegalArgumentException on an internal error.

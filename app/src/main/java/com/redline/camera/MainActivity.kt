@@ -350,6 +350,10 @@ class MainActivity : ComponentActivity() {
             updateBurst { it.copy(poolFrames = frames, frameMb = frameMb) }
         }
 
+        override fun onMergeWorker(threads: Int, nice: Int) {
+            updateBurst { it.copy(workerThreads = threads, workerNice = nice) }
+        }
+
         override fun onRawUnavailable(reason: String) {
             runOnUiThread {
                 rawOn.value = false
@@ -424,7 +428,7 @@ class MainActivity : ComponentActivity() {
                 refreshColourAvailability()
             }
             // B22: the native burst merge on a synthetic burst with known shifts (CPU only, ~0.1-0.3 s).
-            val check = runCatching { RedlineNative.burstSelfCheck(Runtime.getRuntime().availableProcessors().coerceIn(1, 8)) }
+            val check = runCatching { RedlineNative.burstSelfCheck(RedlineNative.burstThreads()) }
             runOnUiThread {
                 burstChecked = true
                 check.onSuccess { c ->

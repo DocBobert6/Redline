@@ -2,6 +2,34 @@ package com.redline.camera.capture
 
 import kotlin.math.max
 
+/**
+ * B22a: how one burst streamed through the merge. [framesMergedDuringCapture]: frames merged before the last frame
+ * arrived; [maxBacklog]: most frames copied but not yet merged; [maxResidentFrames]: most pool buffers the burst
+ * held at once; [mergeTailMs]: last frame in to merge finished; [peakResidentMb]: the burst's pool buffers at their
+ * peak plus the merger's own working set.
+ */
+data class BurstStreaming(
+    val framesMergedDuringCapture: Int = 0,
+    val maxBacklog: Int = 0,
+    val maxResidentFrames: Int = 0,
+    val maxHeldByMerger: Int = 0,
+    val threads: Int = 0,
+    val mergeTailMs: Long = 0,
+    val peakNativeMb: Double = 0.0,
+    val peakResidentMb: Double = 0.0
+) {
+    fun toMap(): Map<String, Any?> = linkedMapOf(
+        "frames_merged_during_capture" to framesMergedDuringCapture,
+        "max_backlog_frames" to maxBacklog,
+        "max_resident_frames" to maxResidentFrames,
+        "max_held_by_merger" to maxHeldByMerger,
+        "worker_threads" to threads,
+        "merge_tail_ms" to mergeTailMs,
+        "peak_native_mb" to r1(peakNativeMb),
+        "peak_resident_mb" to r1(peakResidentMb)
+    )
+}
+
 /** What one shot's burst step did (B22): planned, captured and merged frames, alignment and stage timings. */
 data class BurstShot(
     val plan: BurstPlan,
@@ -19,9 +47,12 @@ data class BurstShot(
     val rejectedFraction: Double? = null,
     /** Stage timings in ms: capture (shutter to last frame in), queue_wait, pyramid, reference, align, merge, finish, render, encode_save, dng, total. */
     val timingsMs: Map<String, Long> = emptyMap(),
-    /** Jobs ahead of this one when it was queued (0 = processed straight away). */
+    /** Shots still capturing, merging or saving when this one was pressed (0 = unhurried: nothing ahead of it). */
     val queuedBehind: Int = 0,
-    val stress: Boolean = false
+    val stress: Boolean = false,
+    /** B22a: "burst", "single_raw" (B21 single frame) or "camera_jpeg" (the cheapest path; [plan] says why). */
+    val path: String = if (plan.isBurst) PATH_BURST else PATH_SINGLE,
+    val streaming: BurstStreaming? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "plan" to plan.toMap(),
@@ -40,8 +71,29 @@ data class BurstShot(
             "rejected_tile_fraction" to rejectedFraction?.let { r3(it) }
         ),
         "timings_ms" to timingsMs,
-        "queued_behind" to queuedBehind
+        "queued_behind" to queuedBehind,
+        "path" to path,
+        "streaming" to streaming?.toMap()
     )
+
+    /** One line of the report's recent-shots list: frames planned against the light level, and how it went. */
+    fun brief(totalMs: Long?): Map<String, Any?> = linkedMapOf(
+        "stop_mm" to stopMm,
+        "path" to path,
+        "light" to plan.light,
+        "iso" to if (plan.isBurst) plan.iso else null,
+        "frames_planned" to plan.frames,
+        "frames_merged" to framesMerged,
+        "single_reason" to plan.singleReason,
+        "queued_behind" to queuedBehind,
+        "total_ms" to totalMs
+    )
+
+    companion object {
+        const val PATH_BURST = "burst"
+        const val PATH_SINGLE = "single_raw"
+        const val PATH_JPEG = "camera_jpeg"
+    }
 }
 
 /**
@@ -84,7 +136,24 @@ data class BurstReport(
     val stressFailures: Int = 0,
     val stressBlocked: Int = 0,
     val stressMaxQueue: Int = 0,
-    val stressRunning: Boolean = false
+    val stressRunning: Boolean = false,
+    /** B22a: merge worker threads and their nice value. */
+    val workerThreads: Int? = null,
+    val workerNice: Int? = null,
+    /** B22a: light level -> (shots, frames planned in total, fewest, most) for burst shots. */
+    val framesByLight: Map<String, List<Int>> = emptyMap(),
+    /** B22a: merged shots that queued behind another shot (excluded from the save gate): count, total and max ms. */
+    val queuedShots: Int = 0,
+    val queuedTotalMs: Long = 0,
+    val queuedMaxMs: Long = 0,
+    val cameraJpegShots: Int = 0,
+    val streamFramesMergedDuringCapture: Int = 0,
+    val streamMaxBacklog: Int = 0,
+    val streamMaxResidentFrames: Int = 0,
+    val streamTailTotalMs: Long = 0,
+    val peakResidentMb: Double = 0.0,
+    val peakNativeMb: Double = 0.0,
+    val recent: List<Map<String, Any?>> = emptyList()
 ) {
     val enabled: Boolean get() = userSetting && available == true
 
@@ -119,11 +188,39 @@ data class BurstReport(
             framesMerged = framesMerged + shot.framesMerged,
             last = shot,
             stressDone = stressDone + if (stress) 1 else 0,
-            stressFailures = stressFailures + if (stress && !ok) 1 else 0
+            stressFailures = stressFailures + if (stress && !ok) 1 else 0,
+            recent = (recent + shot.brief(shutterToSavedMs)).takeLast(RECENT_SHOTS)
         )
         if (!shot.plan.isBurst) {
             val why = shot.plan.singleReason ?: "?"
-            return next.copy(singleShots = singleShots + 1, singleReasons = singleReasons + (why to (singleReasons[why] ?: 0) + 1))
+            return next.copy(
+                singleShots = singleShots + 1,
+                singleReasons = singleReasons + (why to (singleReasons[why] ?: 0) + 1),
+                cameraJpegShots = cameraJpegShots + if (shot.path == BurstShot.PATH_JPEG) 1 else 0
+            )
+        }
+        shot.plan.light?.let { light ->
+            val prev = framesByLight[light]
+            val f = shot.plan.frames
+            next = next.copy(
+                framesByLight = framesByLight + (
+                    light to if (prev == null) {
+                        listOf(1, f, f, f)
+                    } else {
+                        listOf(prev[0] + 1, prev[1] + f, minOf(prev[2], f), maxOf(prev[3], f))
+                    }
+                    )
+            )
+        }
+        shot.streaming?.let { st ->
+            next = next.copy(
+                streamFramesMergedDuringCapture = next.streamFramesMergedDuringCapture + st.framesMergedDuringCapture,
+                streamMaxBacklog = max(next.streamMaxBacklog, st.maxBacklog),
+                streamMaxResidentFrames = max(next.streamMaxResidentFrames, st.maxResidentFrames),
+                streamTailTotalMs = next.streamTailTotalMs + st.mergeTailMs,
+                peakResidentMb = maxOf(next.peakResidentMb, st.peakResidentMb),
+                peakNativeMb = maxOf(next.peakNativeMb, st.peakNativeMb)
+            )
         }
         if (!shot.merged) return next.copy(fallbacks = fallbacks + 1)
         val totals = stageTotals.toMutableMap()
@@ -143,6 +240,8 @@ data class BurstReport(
             val prev = gateStops[shot.stopMm]
             val entry = (prev?.first ?: 0) + 1 to max(prev?.second ?: 0, ms)
             next = next.copy(gateStops = gateStops + (shot.stopMm to entry))
+        } else if (shot.queuedBehind > 0 && ok && shutterToSavedMs != null) {
+            next = next.copy(queuedShots = queuedShots + 1, queuedTotalMs = queuedTotalMs + ms, queuedMaxMs = max(queuedMaxMs, ms))
         }
         return next
     }
@@ -172,7 +271,14 @@ data class BurstReport(
             "ms" to selfCheckMs?.let { Math.round(it) },
             "error" to selfCheckError
         ),
-        "memory" to linkedMapOf("pool_frames" to poolFrames, "frame_mb" to frameMb?.let { r2(it) }),
+        "memory" to linkedMapOf(
+            "pool_frames" to poolFrames,
+            "frame_mb" to frameMb?.let { r2(it) },
+            "peak_resident_mb" to r1(peakResidentMb),
+            "peak_native_mb" to r1(peakNativeMb),
+            "max_resident_frames_per_burst" to streamMaxResidentFrames
+        ),
+        "worker" to linkedMapOf("threads" to workerThreads, "nice" to workerNice),
         "merged_shots" to mergedShots,
         "single_shots" to singleShots,
         "single_reasons" to singleReasons,
@@ -187,6 +293,22 @@ data class BurstReport(
         "gate_shots_by_stop" to gateStops.entries.sortedBy { it.key }.associate {
             "${it.key}" to linkedMapOf("shots" to it.value.first, "max_shutter_to_saved_ms" to it.value.second)
         },
+        "queued_shots" to linkedMapOf(
+            "shots" to queuedShots,
+            "avg_shutter_to_saved_ms" to if (queuedShots == 0) null else queuedTotalMs / queuedShots,
+            "max_shutter_to_saved_ms" to if (queuedShots == 0) null else queuedMaxMs
+        ),
+        "camera_jpeg_shots" to cameraJpegShots,
+        "frames_by_light" to framesByLight.entries.sortedBy { lightOrder(it.key) }.associate { (k, v) ->
+            k to linkedMapOf("shots" to v[0], "avg_frames" to r2(v[1].toDouble() / v[0]), "min_frames" to v[2], "max_frames" to v[3])
+        },
+        "streaming" to linkedMapOf(
+            "frames_merged_during_capture" to streamFramesMergedDuringCapture,
+            "max_backlog_frames" to streamMaxBacklog,
+            "max_resident_frames" to streamMaxResidentFrames,
+            "avg_merge_tail_ms" to if (mergedShots == 0) null else streamTailTotalMs / mergedShots
+        ),
+        "recent_shots" to recent,
         "queue_depth" to queueDepth,
         "max_queue_depth" to maxQueueDepth,
         "shutter_presses" to presses,
@@ -209,11 +331,15 @@ data class BurstReport(
     )
 
     companion object {
-        const val LABEL = "RAW burst merge (B22): 8-12 under-exposed RAW frames, tile align + merge, background queue"
+        const val LABEL = "RAW burst merge (B22a): 4-12 under-exposed RAW frames by light, streaming tile align + merge, background queue"
+        const val RECENT_SHOTS = 12
+
+        private fun lightOrder(light: String): Int =
+            BurstPlanner.LIGHT_LEVELS.indexOfFirst { it.first == light }.let { if (it < 0) BurstPlanner.LIGHT_LEVELS.size else it }
         const val SAVE_GATE_MS = 3_000L
         val GATE_STOPS = listOf(24, 35)
 
-        /** A press held longer than this behind the previous capture counts as blocked. */
+        /** A press held longer than this behind the previous capture counts as blocked (no press is ever refused). */
         const val SHUTTER_BLOCK_MS = 500L
         const val MIN_PRESSES = 10
         const val STRESS_SHOTS = 30
@@ -223,6 +349,8 @@ data class BurstReport(
         const val SELF_CHECK_MIN_NOISE_RATIO = 2.0
     }
 }
+
+private fun r1(v: Double): Double = Math.round(v * 10.0) / 10.0
 
 private fun r2(v: Double): Double = Math.round(v * 100.0) / 100.0
 

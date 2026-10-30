@@ -9,8 +9,9 @@ Input: N frames of RAW_SENSOR samples (uint16, H x W, both even, same exposure),
 the white level, and the noise model ``var(x) = S * x + O`` for a sample at normalised signal x (Camera2
 SENSOR_NOISE_PROFILE, averaged over the CFA channels).
 
-1. grey      L0[y][x] = sum of the 2x2 Bayer quad at (2y, 2x) (integer). One grey pixel = one quad, so every
-             displacement found on the grey image moves whole quads and keeps the CFA phase.
+1. grey      L0[y][x] = sum of the 2x2 Bayer quad at (2y, 2x) (integer), saturated at 65535 so every level fits
+             16 bits (never reached by a <= 14-bit sensor). One grey pixel = one quad, so every displacement found on
+             the grey image moves whole quads and keeps the CFA phase.
 2. pyramid   L1 = floor(2x2 box sum / 4) of L0, then L2, L3 = floor(4x4 box sum / 16) of the level above
              (dimensions floor-divided). A level is kept only while both its dimensions are >= COARSE_TILE.
 3. reference the sharpest of the first min(3, N) frames (HDR+ picks from the first few so the shutter moment holds):
@@ -38,6 +39,11 @@ SENSOR_NOISE_PROFILE, averaged over the CFA channels).
              reference keeps weight 1 everywhere; nothing is resampled (integer quad displacements), so the result is
              still a RAW mosaic with the reference frame's black and white levels.
 
+Streaming (B22a): the result does not depend on when frames arrive. The app feeds frames one at a time as the
+camera delivers them; the first min(3, N) are held until the reference is known (rule 3), then every alternate frame
+is aligned and accumulated on arrival and its buffer handed back, so only the reference, the accumulator and the frame
+in flight stay resident. The sums are the same (integer alignment identical; float accumulation order differs).
+
 The merged mosaic goes into the B21 pipeline as the reference frame would (its exposure is re-solved from the
 merged frame's median against the normally exposed camera JPEG, which restores the burst's under-exposure).
 """
@@ -61,7 +67,7 @@ PIX_K = 3.0
 
 def grey(raw: np.ndarray) -> np.ndarray:
     r = raw.astype(np.int64)
-    return r[0::2, 0::2] + r[0::2, 1::2] + r[1::2, 0::2] + r[1::2, 1::2]
+    return np.minimum(r[0::2, 0::2] + r[0::2, 1::2] + r[1::2, 0::2] + r[1::2, 1::2], 65535)
 
 
 def downsample(img: np.ndarray, f: int) -> np.ndarray:
