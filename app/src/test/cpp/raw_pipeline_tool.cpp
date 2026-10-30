@@ -10,6 +10,7 @@
 //   shading ROWS COLS PATH (float32 ROWS*COLS*4, Camera2 order) | shading none
 //   crop L T W H  out OW OH  matrix M0..M8  neutral N0 N1 N2  gain G
 //   curve N LO HI PATH (float32 N)  cube PATH (.cube file)  threads T  step S
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>

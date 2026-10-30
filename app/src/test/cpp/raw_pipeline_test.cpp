@@ -1,5 +1,6 @@
 // Host-side unit test of the native RAW pipeline (B21). Built and run by CI with CTest next to the parser test.
 // Pixel parity against the Python reference is checked separately (calibration/tests/test_raw_pipeline.py).
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
