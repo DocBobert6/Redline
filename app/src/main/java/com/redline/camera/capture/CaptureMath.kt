@@ -1,6 +1,7 @@
 package com.redline.camera.capture
 
 import com.redline.camera.capability.Dim
+import com.redline.camera.colour.ColourShot
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -67,8 +68,8 @@ object CaptureMath {
     }
 
     /**
-     * The EXIF look tag (PLAN 6 step 9). No look is applied before B21, so it says so; Make/Model are never
-     * changed (no Canon spoof).
+     * The EXIF look tag (PLAN 6 step 9): the look's name when the RAW pipeline rendered the still, else "none
+     * (camera JPEG)". Make/Model are never changed (no Canon spoof).
      */
     fun lookTag(version: String, look: String, stopLabel: String, trueEquivalentMm: Float?): String {
         val focal = if (trueEquivalentMm != null && stopLabel.endsWith("*")) {
@@ -95,7 +96,11 @@ data class ShotResult(
     val dngWanted: Boolean = false,
     val shutterToSavedMs: Long? = null,
     val error: String? = null,
-    val kept: Boolean = true
+    val kept: Boolean = true,
+    /** The look named in the EXIF tag. */
+    val look: String? = null,
+    /** B21 colour step: rendered by the pipeline, or the fallback reason; null when the pipeline was off. */
+    val colour: ColourShot? = null
 ) {
     fun summary(): String = when {
         !ok -> "Capture failed: ${error ?: "unknown"}"
@@ -104,6 +109,7 @@ data class ShotResult(
             append("JPEG ${jpegSize ?: "?"}")
             if (dngWanted) append(if (dngSaved) " + DNG" else " (DNG failed: ${error ?: "?"})")
             shutterToSavedMs?.let { append(" in $it ms") }
+            colour?.let { append(if (it.rendered) " · RAW look" else " · camera JPEG (${it.fallbackReason ?: "?"})") }
         }
     }
 }

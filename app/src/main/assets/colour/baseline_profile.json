@@ -1,119 +1,20 @@
 {
  "profile_id": "baseline",
- "description": "Baseline device profile: colour calibration from the device's own DNG tags (B04). Matched by SHA-256 of lowercase 'manufacturer|model'.",
+ "description": "Baseline device profile (B21): colour calibration of the main back camera, taken from the device's own DNG tags (B04). Matched by SHA-256 of lowercase 'manufacturer|model' and the camera facing.",
  "model_sha256": [
   "272adf572086d0543dd1ac274e090a9563513664b938f11400de93c9452b2bba"
  ],
+ "facing": "BACK",
  "source": "dng",
  "color": {
   "illuminant1": 17,
   "illuminant2": 21,
-  "color_matrix1": [
-   [
-    1.1599,
-    -0.6349,
-    0.0242
-   ],
-   [
-    -0.3076,
-    1.1736,
-    0.1491
-   ],
-   [
-    0.0019,
-    0.1402,
-    0.6484
-   ]
-  ],
-  "color_matrix2": [
-   [
-    0.8395,
-    -0.1991,
-    -0.1213
-   ],
-   [
-    -0.585,
-    1.4801,
-    0.1018
-   ],
-   [
-    -0.188,
-    0.4021,
-    0.4593
-   ]
-  ],
-  "forward_matrix1": [
-   [
-    0.547,
-    0.3098,
-    0.1076
-   ],
-   [
-    0.1158,
-    0.9276,
-    -0.0434
-   ],
-   [
-    -0.0762,
-    -0.5194,
-    1.4207
-   ]
-  ],
-  "forward_matrix2": [
-   [
-    0.6493,
-    0.1473,
-    0.1677
-   ],
-   [
-    0.2552,
-    0.7886,
-    -0.0439
-   ],
-   [
-    0.0286,
-    -0.4691,
-    1.2656
-   ]
-  ],
-  "calibration1": [
-   [
-    1.0096,
-    0.0,
-    0.0
-   ],
-   [
-    0.0,
-    1.0,
-    0.0
-   ],
-   [
-    0.0,
-    0.0,
-    0.9896
-   ]
-  ],
-  "calibration2": [
-   [
-    1.0112,
-    0.0,
-    0.0
-   ],
-   [
-    0.0,
-    1.0,
-    0.0
-   ],
-   [
-    0.0,
-    0.0,
-    0.9927
-   ]
-  ],
-  "analog_balance": [
-   1.0,
-   1.0,
-   1.0
-  ]
+  "color_matrix1": [[1.1599, -0.6349, 0.0242], [-0.3076, 1.1736, 0.1491], [0.0019, 0.1402, 0.6484]],
+  "color_matrix2": [[0.8395, -0.1991, -0.1213], [-0.585, 1.4801, 0.1018], [-0.188, 0.4021, 0.4593]],
+  "forward_matrix1": [[0.547, 0.3098, 0.1076], [0.1158, 0.9276, -0.0434], [-0.0762, -0.5194, 1.4207]],
+  "forward_matrix2": [[0.6493, 0.1473, 0.1677], [0.2552, 0.7886, -0.0439], [0.0286, -0.4691, 1.2656]],
+  "calibration1": [[1.0096, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.9896]],
+  "calibration2": [[1.0112, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.9927]],
+  "analog_balance": [1.0, 1.0, 1.0]
  }
 }

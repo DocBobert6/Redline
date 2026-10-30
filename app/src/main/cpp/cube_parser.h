@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#define REDLINE_NATIVE_VERSION "redline_native 0.1.0 (B20: C++17 .cube parser)"
+#define REDLINE_NATIVE_VERSION "redline_native 0.2.0 (B20 .cube parser, B21 RAW colour pipeline)"
 
 namespace redline {
 

@@ -31,6 +31,7 @@ import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.StillSaver
 import com.redline.camera.capture.StillShot
+import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
 import java.util.concurrent.CompletableFuture
@@ -142,7 +143,7 @@ data class ViewfinderSetup(
  * public call just posts there. Open on resume, close on pause; [close] completes once the device is
  * really closed, so the self-test can take the camera without fighting the viewfinder for it.
  */
-class ViewfinderController(context: Context, private val listener: Listener, version: String = "") {
+class ViewfinderController(context: Context, private val listener: Listener, version: String = "", colourPipeline: ColourPipeline? = null) {
     interface Listener {
         /** First onCaptureCompleted of a session, as SystemClock.elapsedRealtime(). */
         fun onFirstCapture(elapsedRealtimeMs: Long)
@@ -159,7 +160,10 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         /** The camera could not be opened or was lost; the controller has already cleaned up. */
         fun onError(message: String)
 
-        /** The session could not be configured with the RAW stream; RAW was turned off and the session rebuilt. */
+        /**
+         * The session could not be configured with the RAW stream; RAW (the DNG toggle and the B21 colour pipeline)
+         * was turned off and the session rebuilt.
+         */
         fun onRawUnavailable(reason: String) {}
 
         /** What the preview frames report (about twice a second): ISO, exposure and focus distance. */
@@ -199,7 +203,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     private val thread = HandlerThread("redline-viewfinder").apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
-    private val saver = StillSaver(context, version)
+    private val saver = StillSaver(context, version, colourPipeline)
     private val saveExecutor = Executors.newSingleThreadExecutor()
 
     // Camera-thread state.
@@ -221,8 +225,9 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     private var streamStartMs = 0L
     private var lastFpsReportMs = 0L
 
-    // B13 still capture (camera thread).
+    // B13 still capture (camera thread). rawWanted = the DNG toggle; pipelineWanted = B21 renders stills from RAW.
     private var rawWanted = false
+    private var pipelineWanted = false
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
     private var sessionHasRaw = false
@@ -235,6 +240,9 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val request: StillRequest,
         val jpegOrientation: Int,
         val wantRaw: Boolean,
+        val saveDng: Boolean,
+        val renderRaw: Boolean,
+        val zoomRatio: Float,
         val shutterAtMs: Long,
         val done: (ShotResult) -> Unit
     ) {
@@ -245,27 +253,56 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         var finished = false
     }
 
-    fun open(setup: ViewfinderSetup, texture: SurfaceTexture, zoomRatio: Float, stabilization: Boolean, raw: Boolean = false) {
+    fun open(
+        setup: ViewfinderSetup,
+        texture: SurfaceTexture,
+        zoomRatio: Float,
+        stabilization: Boolean,
+        raw: Boolean = false,
+        pipeline: Boolean = false
+    ) {
         handler.post {
             rawWanted = raw
+            pipelineWanted = pipeline
             openOnThread(setup, texture, zoomRatio, stabilization)
         }
     }
 
-    /** RAW (DNG) on/off. The RAW stream is only in the session while RAW is on, so the default session stays preview + JPEG. */
+    /**
+     * DNG on/off. The RAW stream is in the session while the DNG toggle or the B21 colour pipeline wants it (with
+     * the pipeline on, the default session is preview + JPEG + RAW, a verified combination).
+     */
     fun setRaw(on: Boolean) {
         handler.post {
             if (rawWanted == on) return@post
             rawWanted = on
-            val cam = device ?: return@post
-            val target = surface ?: return@post
-            if (pending != null) return@post // rebuilt after the shot in flight
-            rebuildSession(cam, target)
+            syncRawStream()
         }
     }
 
+    /** B21 colour pipeline on/off: stills are rendered from RAW (RAW is then always captured). */
+    fun setPipeline(on: Boolean) {
+        handler.post {
+            if (pipelineWanted == on) return@post
+            pipelineWanted = on
+            syncRawStream()
+        }
+    }
+
+    private fun sessionWantsRaw(): Boolean = (rawWanted || pipelineWanted) && setup?.rawSize != null
+
+    /** Camera thread: rebuilds the session when the RAW stream's presence no longer matches what is wanted. */
+    private fun syncRawStream() {
+        val cam = device ?: return
+        val target = surface ?: return
+        if (pending != null) return // rebuilt after the shot in flight
+        if (sessionWantsRaw() == sessionHasRaw) return
+        rebuildSession(cam, target)
+    }
+
     /**
-     * Takes one still (JPEG, plus DNG while RAW is on). [done] runs on the saver thread once the files are
+     * Takes one still (JPEG, rendered from RAW while the B21 pipeline is on; plus DNG while the DNG toggle is on).
+     * [done] runs on the saver thread once the files are
      * written, or with a failure. Refused (failure, nothing captured) while a shot is in flight or two saves
      * are queued.
      */
@@ -385,7 +422,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             jpegReader = r
             outputs += OutputConfiguration(r.surface)
         }
-        val withRaw = rawWanted && su?.rawSize != null
+        val withRaw = sessionWantsRaw() && su?.rawSize != null
         if (withRaw) {
             val size = su!!.rawSize!!
             val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 2)
@@ -410,6 +447,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                 if (gen != generation) return
                 if (withRaw) {
                     rawWanted = false
+                    pipelineWanted = false
                     listener.onRawUnavailable("session with RAW_SENSOR ${su?.rawSize} could not be configured")
                     createSession(camera, target, gen)
                 } else {
@@ -451,7 +489,16 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         }
         val wantRaw = sessionHasRaw && rawReader != null
         val orientation = CaptureMath.jpegOrientation(su!!.sensorOrientation, request.deviceDegrees, su.frontFacing)
-        val shot = PendingShot(request, orientation, wantRaw, SystemClock.elapsedRealtime(), done)
+        val shot = PendingShot(
+            request = request,
+            jpegOrientation = orientation,
+            wantRaw = wantRaw,
+            saveDng = wantRaw && rawWanted,
+            renderRaw = pipelineWanted,
+            zoomRatio = zoomRatio,
+            shutterAtMs = SystemClock.elapsedRealtime(),
+            done = done
+        )
         try {
             val req = cam!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(target!!)
@@ -552,7 +599,11 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             trueEquivalentMm = r.trueEquivalentMm,
             stopLongPx = r.stopLongPx,
             shutterAtMs = p.shutterAtMs,
-            keep = r.keep
+            keep = r.keep,
+            saveDng = p.saveDng,
+            renderRaw = p.renderRaw,
+            cameraId = setup?.cameraId ?: "",
+            zoomRatio = p.zoomRatio
         )
         saveExecutor.execute {
             val out = saver.save(shot) { SystemClock.elapsedRealtime() }
@@ -570,13 +621,13 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         p.finished = true
         if (pending === p) pending = null
         runCatching { p.raw?.close() }
-        saveExecutor.execute { p.done(ShotResult(ok = false, error = message, dngWanted = p.wantRaw, kept = p.request.keep)) }
+        saveExecutor.execute { p.done(ShotResult(ok = false, error = message, dngWanted = p.saveDng, kept = p.request.keep)) }
         afterShot()
     }
 
-    /** A RAW toggle that arrived during a shot is applied once the shot is out of the camera. */
+    /** A RAW / pipeline toggle that arrived during a shot is applied once the shot is out of the camera. */
     private fun afterShot() {
-        if (rawWanted != sessionHasRaw) {
+        if (sessionWantsRaw() != sessionHasRaw) {
             val cam = device ?: return
             val target = surface ?: return
             rebuildSession(cam, target)
