@@ -314,11 +314,14 @@ def area_weights(n_in: int, n_out: int) -> np.ndarray:
     """(n_out, n_in) box-filter weights: each output sample averages the input interval it covers."""
     s = n_in / n_out
     w = np.zeros((n_out, n_in))
-    for i in range(n_out):
-        a, b = i * s, (i + 1) * s
-        j0, j1 = int(math.floor(a)), min(int(math.ceil(b)), n_in)
-        for j in range(j0, j1):
-            w[i, j] = max(0.0, min(j + 1.0, b) - max(float(j), a)) / s
+    i = np.arange(n_out)
+    a, b = i * s, (i + 1) * s
+    j0 = np.floor(a).astype(int)
+    for k in range(int(math.ceil(s)) + 1):  # each output covers at most ceil(s) + 1 inputs
+        j = j0 + k
+        ok = j < np.minimum(np.ceil(b), n_in)
+        ov = np.maximum(0.0, np.minimum(j + 1.0, b) - np.maximum(j.astype(float), a)) / s
+        w[i[ok], j[ok]] = ov[ok]
     return w
 
 
@@ -346,9 +349,12 @@ def render(frame: RawFrame, p: RenderParams) -> np.ndarray:
     lin = balanced_linear(frame, p.crop, p.neutral, p.matrix)
     ow, oh = p.out_size
     if (ow, oh) != (lin.shape[1], lin.shape[0]):
-        ay, ax = area_weights(lin.shape[0], oh), area_weights(lin.shape[1], ow)
-        lin = np.einsum("ij,jkc->ikc", ay, lin)
-        lin = np.einsum("kj,ijc->ikc", ax, lin)
+        from scipy import sparse
+
+        h, w = lin.shape[:2]
+        ay, ax = sparse.csr_matrix(area_weights(h, oh)), sparse.csr_matrix(area_weights(w, ow))
+        lin = (ay @ lin.reshape(h, w * 3)).reshape(oh, w, 3)
+        lin = (ax @ lin.transpose(1, 0, 2).reshape(w, oh * 3)).reshape(ow, oh, 3).transpose(1, 0, 2)
     y = p.curve(p.curve.gain * lin)
     return np.clip(apply_lut(y, p.lut), 0.0, 1.0)
 
