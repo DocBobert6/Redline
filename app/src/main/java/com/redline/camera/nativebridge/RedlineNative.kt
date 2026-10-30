@@ -5,7 +5,7 @@ import com.redline.camera.look.CubeLut
 import java.nio.ByteBuffer
 
 /**
- * JNI wrapper for libredline_native.so (B20 LUT parser, B21 RAW colour pipeline; app/src/main/cpp). The library is loaded lazily and at most once;
+ * JNI wrapper for libredline_native.so (B20 LUT parser, B21 RAW colour pipeline, B22 burst merge; app/src/main/cpp). The library is loaded lazily and at most once;
  * a failed load is remembered with its reason (the look preview is then disabled and the report says why) and
  * never crashes the app.
  */
@@ -95,6 +95,124 @@ object RedlineNative {
             crop, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out
         )
     }
+
+    // ------------------------------------------------------------------------------------------- B22 burst merge
+
+    /** A frame-sized buffer in native memory (outside the Java heap), or null when it cannot be allocated. Free with [freeFrame]. */
+    fun allocFrame(bytes: Long): ByteBuffer? {
+        if (!load().loaded) return null
+        return try {
+            nativeAllocFrame(bytes)
+        } catch (e: OutOfMemoryError) {
+            null
+        }
+    }
+
+    /** Frees a buffer from [allocFrame]; it must not be used afterwards. */
+    fun freeFrame(buffer: ByteBuffer) {
+        if (load().loaded) nativeFreeFrame(buffer)
+    }
+
+    /** Per alternate frame: alignment and weights. Displacements in RAW pixels. */
+    class MergedFrame(
+        val index: Int,
+        val meanDispPx: Double,
+        val maxDispPx: Double,
+        val meanWeight: Double,
+        val rejectedFraction: Double,
+        val alignMs: Double,
+        val mergeMs: Double
+    )
+
+    class MergeStats(
+        val reference: Int,
+        val frames: Int,
+        val tilesX: Int,
+        val tilesY: Int,
+        val pyramidMs: Double,
+        val referenceMs: Double,
+        val alignMs: Double,
+        val mergeMs: Double,
+        val finishMs: Double,
+        val perFrame: List<MergedFrame>
+    )
+
+    /**
+     * Aligns and merges the RAW_SENSOR [frames] (same size, compact or strided, same exposure) into [out] as
+     * uint16 scaled by [outScale] (black and white scale with it). [reference] -1 picks the sharpest of the first 3.
+     * Throws IllegalArgumentException on bad input, IllegalStateException when the library is not loaded.
+     */
+    fun mergeBurst(
+        frames: List<ByteBuffer>,
+        width: Int,
+        height: Int,
+        rowStrideBytes: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        reference: Int,
+        threads: Int,
+        out: ByteBuffer,
+        outScale: Float
+    ): MergeStats {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        val r = nativeMergeBurst(
+            frames.toTypedArray(), width, height, rowStrideBytes, black, white, noiseS, noiseO, reference, threads, out, outScale
+        )
+        val per = (MERGE_HEADER until r.size step MERGE_PER_FRAME).map { i ->
+            MergedFrame(
+                r[i].toInt(),
+                r[i + 1].toDouble(),
+                r[i + 2].toDouble(),
+                r[i + 3].toDouble(),
+                r[i + 4].toDouble(),
+                r[i + 5].toDouble(),
+                r[i + 6].toDouble()
+            )
+        }
+        return MergeStats(
+            r[0].toInt(), r[1].toInt(), r[2].toInt(), r[3].toInt(), r[4].toDouble(), r[5].toDouble(), r[6].toDouble(),
+            r[7].toDouble(), r[8].toDouble(), per
+        )
+    }
+
+    class BurstSelfCheck(val alignedFraction: Double, val noiseRatio: Double, val ms: Double)
+
+    /** The native synthetic burst check (known shifts + noise). Throws like [mergeBurst]. */
+    fun burstSelfCheck(threads: Int): BurstSelfCheck {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        val r = nativeBurstSelfCheck(threads)
+        return BurstSelfCheck(r[0].toDouble(), r[1].toDouble(), r[2].toDouble())
+    }
+
+    private const val MERGE_HEADER = 9
+    private const val MERGE_PER_FRAME = 7
+
+    @JvmStatic
+    private external fun nativeAllocFrame(bytes: Long): ByteBuffer?
+
+    @JvmStatic
+    private external fun nativeFreeFrame(buffer: ByteBuffer)
+
+    @JvmStatic
+    private external fun nativeMergeBurst(
+        buffers: Array<ByteBuffer>,
+        width: Int,
+        height: Int,
+        rowStrideBytes: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        reference: Int,
+        threads: Int,
+        out: ByteBuffer,
+        outScale: Float
+    ): FloatArray
+
+    @JvmStatic
+    private external fun nativeBurstSelfCheck(threads: Int): FloatArray
 
     @JvmStatic
     private external fun nativeVersion(): String

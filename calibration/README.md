@@ -134,3 +134,22 @@ Gate: the native render matches the reference within dE2000 1.0 (max over every 
 8-bit rounding) and daylight greys stay neutral (CIELAB chroma <= 2.0). Bundled assets the pipeline reads:
 `app/src/main/assets/colour/standard_tone.json` (fitted Standard tone curve), `colour/baseline_profile.json` (the
 baseline device profile's colour numbers, matched by model hash), and `luts/redline_standard_preview_33.cube`.
+
+## B22: RAW burst align + merge (reference and parity)
+
+`redline_cal/burst_merge.py` is the reference implementation of the app's burst merge; its docstring is the contract
+(grey quads, x2/x4/x4 pyramid, reference = sharpest of the first 3 frames, coarse-to-fine tile alignment with
+whole-quad displacements, noise-model tile weights + per-quad outlier rejection, raised-cosine blended merge of the
+CFA samples). The app runs it in C++ (`app/src/main/cpp/burst_merge.cpp`) on the processing queue and feeds the merged
+mosaic to the B21 pipeline.
+
+```bash
+# Native parity on synthetic bursts (CI builds the host tool and sets REDLINE_BURST_TOOL)
+cmake -S app/src/test/cpp -B build/native-host && cmake --build build/native-host --target burst_merge_tool
+REDLINE_BURST_TOOL=build/native-host/burst_merge_tool python -m pytest calibration/tests/test_burst_merge.py
+
+# Merge quality on real sensor texture: simulated bursts from your own DNGs (numbers only, files named by index)
+python calibration/tools/burst_quality.py --tool build/native-host/burst_merge_tool path/to/*.dng --frames 8
+```
+
+Parity: identical reference frame and tile displacements, merged RAW within 0.05 RAW units.

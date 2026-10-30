@@ -28,3 +28,15 @@ add_executable(raw_pipeline_tool raw_pipeline_tool.cpp ${NATIVE_SRC}/raw_pipelin
 target_include_directories(raw_pipeline_tool PRIVATE ${NATIVE_SRC})
 target_compile_options(raw_pipeline_tool PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(raw_pipeline_tool PRIVATE Threads::Threads)
+
+# B22 burst align + merge: invariants and the self-check (CTest), and the host tool the Python parity test drives.
+add_executable(burst_merge_test burst_merge_test.cpp ${NATIVE_SRC}/burst_merge.cpp)
+target_include_directories(burst_merge_test PRIVATE ${NATIVE_SRC})
+target_compile_options(burst_merge_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(burst_merge_test PRIVATE Threads::Threads)
+add_test(NAME burst_merge COMMAND burst_merge_test)
+
+add_executable(burst_merge_tool burst_merge_tool.cpp ${NATIVE_SRC}/burst_merge.cpp)
+target_include_directories(burst_merge_tool PRIVATE ${NATIVE_SRC})
+target_compile_options(burst_merge_tool PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(burst_merge_tool PRIVATE Threads::Threads)

@@ -12,9 +12,11 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.redline.camera.capability.CapabilityProbe
 import com.redline.camera.capability.DeviceProfileProbe
+import com.redline.camera.capture.BurstReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ShootMode
 import com.redline.camera.ui.BACK_TAG
+import com.redline.camera.ui.BURST_SECTION_TITLE
 import com.redline.camera.ui.GRID_TOGGLE_TAG
 import com.redline.camera.ui.HISTOGRAM_TOGGLE_TAG
 import com.redline.camera.ui.LEVEL_TOGGLE_TAG
@@ -149,6 +151,20 @@ class LaunchSmokeTest {
         compose.waitUntil(TIMEOUT_MS) { scrolledTo(LookPreviewReport.LABEL) }
         compose.waitUntil(TIMEOUT_MS) { scrolledTo("LUT pass", substring = true) }
         compose.waitUntil(TIMEOUT_MS) { !scrolledTo("checking OpenGL ES", substring = true) }
+    }
+
+    /**
+     * B22: the Burst merge section is always there and its start-up check finishes. The emulator has no RAW stream,
+     * so burst merge must come out off with a reason (stills take the single-frame path) without crashing.
+     */
+    @Test
+    fun capabilityScreenShowsBurstSection() {
+        launch()
+        openCapabilityScreen()
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo(BURST_SECTION_TITLE) }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo(BurstReport.LABEL) }
+        compose.waitUntil(TIMEOUT_MS) { scrolledTo("Self-check: aligned", substring = true) }
+        compose.waitUntil(TIMEOUT_MS) { !scrolledTo("checking the native burst merge", substring = true) }
     }
 
     @Test
