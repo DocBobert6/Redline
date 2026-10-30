@@ -374,6 +374,11 @@ def raw_stats(frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) ->
     return {"median_y": float(np.median(yv)), "clipped_fraction": clipped, "cells": int(yv.size)}
 
 
+def quantise8(rgb_encoded: np.ndarray) -> np.ndarray:
+    """The reference rendered to the app's output encoding (8-bit sRGB), for the parity gate."""
+    return np.round(np.clip(np.asarray(rgb_encoded, float), 0.0, 1.0) * 255.0) / 255.0
+
+
 # ----------------------------------------------------------------------------------------------- assets and checks
 
 
@@ -404,3 +409,197 @@ def neutral_chroma(rgb_encoded: np.ndarray) -> np.ndarray:
     """CIELAB chroma C*ab of sRGB-encoded colours (0 = perfectly neutral)."""
     lab = srgb_encoded_to_lab(np.asarray(rgb_encoded, float).reshape(-1, 3))
     return np.hypot(lab[:, 1], lab[:, 2])
+
+
+# ----------------------------------------------------------------------------------------------- planning a shot
+
+
+def output_size(crop_w: int, crop_h: int, long_px: int) -> tuple[int, int]:
+    """Same as Kotlin CaptureMath.outputSize: scale so the long side is ``long_px``, never upscale."""
+    long = max(crop_w, crop_h)
+    if long_px <= 0 or long_px >= long:
+        return crop_w, crop_h
+    s = long_px / long
+    return max(1, int(math.floor(crop_w * s + 0.5))), max(1, int(math.floor(crop_h * s + 0.5)))
+
+
+@dataclass
+class ShotPlan:
+    solve: ColourSolve
+    crop: tuple[int, int, int, int]
+    out_size: tuple[int, int]
+    stats: dict
+    exposure_ev: float
+    exposure_method: str
+    curve: ToneCurve
+
+
+def plan_shot(frame: RawFrame, cal: dp.ColorCalibration, as_shot_neutral, tone: np.ndarray, *, zoom: float = 1.0,
+              long_px: int = 0, target_encoded: float | None = None, warmth: bool = True, stats: dict | None = None) -> ShotPlan:
+    """Per-shot decisions (what Kotlin ``ColourMath`` does on the phone). ``stats`` lets a caller supply the
+    native statistics so the native render is planned exactly as the app plans it."""
+    solve = solve_colour(cal, as_shot_neutral, warmth)
+    h, w = frame.raw.shape
+    crop = crop_32(w, h, zoom)
+    if stats is None:
+        stats = raw_stats(frame, crop, solve.neutral, solve.matrix)
+    ev, method = solve_exposure(tone, stats["median_y"], target_encoded)
+    curve = ToneCurve(tone, 2.0**ev)
+    return ShotPlan(solve, crop, output_size(crop[2], crop[3], long_px), stats, ev, method, curve)
+
+
+def render_plan(frame: RawFrame, plan: ShotPlan, lut: np.ndarray) -> np.ndarray:
+    return render(frame, RenderParams(plan.crop, plan.out_size, plan.solve.matrix, plan.solve.neutral, plan.curve, lut))
+
+
+# ----------------------------------------------------------------------------------------------- native host tool
+
+
+def _write_inputs(workdir: str, frame: RawFrame) -> list[str]:
+    import os
+
+    h, w = frame.raw.shape
+    raw_path = os.path.join(workdir, "raw.u16")
+    np.ascontiguousarray(frame.raw, dtype="<u2").tofile(raw_path)
+    lines = [f"width {w}", f"height {h}", f"cfa {frame.cfa}", "black " + " ".join(f"{b:.9g}" for b in frame.black),
+             f"white {frame.white:.9g}", f"raw {raw_path}"]
+    if frame.shading is None:
+        lines.append("shading none")
+    else:
+        sh = np.ascontiguousarray(frame.shading, dtype="<f4")
+        p = os.path.join(workdir, "shading.f32")
+        sh.tofile(p)
+        lines.append(f"shading {sh.shape[0]} {sh.shape[1]} {p}")
+    return lines
+
+
+def _colour_lines(crop, neutral, matrix) -> list[str]:
+    return ["crop " + " ".join(str(int(v)) for v in crop),
+            "matrix " + " ".join(f"{v:.9g}" for v in np.asarray(matrix, float).reshape(-1)),
+            "neutral " + " ".join(f"{v:.9g}" for v in np.asarray(neutral, float))]
+
+
+def native_stats(tool: str, frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) -> dict:
+    import os
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        lines = _write_inputs(d, frame) + _colour_lines(crop, neutral, matrix) + [f"step {step}"]
+        p = os.path.join(d, "params.txt")
+        with open(p, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        out = subprocess.run([tool, "stats", p], check=True, capture_output=True, text=True).stdout.split()
+    return {"median_y": float(out[0]), "clipped_fraction": float(out[1]), "cells": int(out[2])}
+
+
+def native_render(tool: str, frame: RawFrame, plan: ShotPlan, cube_path: str, threads: int = 4,
+                  precise: bool = True) -> tuple[np.ndarray, float]:
+    """Runs the C++ pipeline through the host tool; returns (sRGB-encoded float image, render ms). ``precise``
+    reads the native float output (before the 8-bit rounding the app's bitmap gets); otherwise the 8-bit one."""
+    import os
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        table = plan.curve.table().astype("<f4")
+        cp = os.path.join(d, "curve.f32")
+        table.tofile(cp)
+        ow, oh = plan.out_size
+        lines = _write_inputs(d, frame) + _colour_lines(plan.crop, plan.solve.neutral, plan.solve.matrix) + [
+            f"out {ow} {oh}", f"gain {plan.curve.gain:.9g}",
+            f"curve {len(table)} {EV_MIN:.9g} {plan.curve.clip_ev:.9g} {cp}", f"cube {cube_path}", f"threads {threads}"]
+        p = os.path.join(d, "params.txt")
+        with open(p, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        op = os.path.join(d, "out.bin")
+        mode = "renderf" if precise else "render"
+        res = subprocess.run([tool, mode, p, op], check=True, capture_output=True, text=True).stdout
+        if precise:
+            img = np.fromfile(op, dtype="<f4").reshape(oh, ow, 3).astype(float)
+        else:
+            img = np.fromfile(op, dtype=np.uint8).reshape(oh, ow, 3).astype(float) / 255.0
+    ms = float(res.split()[1]) if res.startswith("render_ms") else float("nan")
+    return img, ms
+
+
+# ----------------------------------------------------------------------------------------------- synthetic frames
+
+
+# sRGB-encoded test colours (greys first): the CI parity frame and the on-device self-check frame.
+TEST_PATCHES = np.array([
+    [0.95, 0.95, 0.95], [0.75, 0.75, 0.75], [0.46, 0.46, 0.46], [0.25, 0.25, 0.25], [0.10, 0.10, 0.10],
+    [0.45, 0.32, 0.27], [0.76, 0.58, 0.50], [0.36, 0.48, 0.61], [0.35, 0.42, 0.26], [0.51, 0.50, 0.69],
+    [0.38, 0.74, 0.66], [0.85, 0.47, 0.17], [0.27, 0.36, 0.65], [0.76, 0.32, 0.38], [0.36, 0.24, 0.42],
+    [0.62, 0.73, 0.25], [0.88, 0.63, 0.18], [0.16, 0.24, 0.58], [0.27, 0.58, 0.29], [0.69, 0.20, 0.23],
+    [0.93, 0.78, 0.12], [0.73, 0.33, 0.58], [0.00, 0.52, 0.65], [0.90, 0.80, 0.70],
+])
+N_GREYS = 5
+
+
+def camera_rgb_for_scene(solve: ColourSolve, lin_srgb: np.ndarray) -> np.ndarray:
+    """Camera RGB (un-normalised, before the balance) that the solved matrix maps to ``lin_srgb``."""
+    c = np.asarray(lin_srgb, float) @ np.linalg.inv(solve.matrix).T
+    return c * solve.neutral
+
+
+def synthetic_frame(cal: dp.ColorCalibration, neutral, width: int = 240, height: int = 160, cfa: int = 0, black: float = 64.0,
+                    white: float = 1023.0, shading: np.ndarray | None = None, exposure: float = 0.5,
+                    noise: float = 0.002, seed: int = 21) -> tuple[RawFrame, list[tuple[int, int, int, int]]]:
+    """A patch chart (TEST_PATCHES in a 6 x 4 grid) over a horizontal grey ramp, with a blown highlight strip at
+    the bottom, lit by the white whose camera response is ``neutral``. Scene values are linear sRGB (adapted to
+    D65) scaled by ``exposure``; the camera sees them through the inverse of the warmth-free colour solve, the
+    inverse shading and the levels, so a grey reaches the sensor as a multiple of ``neutral`` (as it physically
+    does) and any warmth the pipeline keeps shows up in the render. Returns the frame and each patch's inner box
+    (x0, y0, x1, y1) in full-frame pixels."""
+    solve = solve_colour(cal, neutral, warmth=False)
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:height, 0:width]
+    ramp = (xx / (width - 1)) ** 2.2
+    scene = np.repeat(ramp[..., None], 3, axis=-1) * 1.0
+    boxes = []
+    cols, rows = 6, 4
+    top, bottom = int(height * 0.06), int(height * 0.80)
+    left, right = int(width * 0.04), int(width * 0.96)
+    pw, ph = (right - left) / cols, (bottom - top) / rows
+    lin = srgb_decode(TEST_PATCHES)
+    for i, c in enumerate(lin):
+        r, k = divmod(i, cols)
+        x0, y0 = int(left + k * pw + pw * 0.08), int(top + r * ph + ph * 0.08)
+        x1, y1 = int(left + (k + 1) * pw - pw * 0.08), int(top + (r + 1) * ph - ph * 0.08)
+        scene[y0:y1, x0:x1] = c
+        bx, by = (x1 - x0) // 4, (y1 - y0) // 4
+        boxes.append((x0 + bx, y0 + by, x1 - bx, y1 - by))
+    scene[int(height * 0.90):, int(width * 0.5):] = 4.0  # blown highlight (scene above the sensor clip)
+    cam = camera_rgb_for_scene(solve, scene * exposure)
+    layout = CFA_LAYOUTS[cfa]
+    mosaic = np.empty((height, width))
+    for p in range(4):
+        mosaic[p >> 1 :: 2, p & 1 :: 2] = cam[p >> 1 :: 2, p & 1 :: 2, layout[p]]
+    frame = RawFrame(np.zeros((height, width), np.uint16), cfa, (black,) * 4, white, shading)
+    gain = shading_gain_image(frame)
+    v = mosaic / gain + rng.normal(0.0, noise, mosaic.shape)
+    frame.raw = np.clip(np.round(black + v * (white - black)), 0, 65535).astype(np.uint16)
+    return frame, boxes
+
+
+def synthetic_shading(rows: int = 12, cols: int = 16, corner_gain: float = 1.8) -> np.ndarray:
+    """A radial lens shading map (Camera2 layout) with a slight colour tilt between the channels."""
+    y, x = np.mgrid[0:rows, 0:cols]
+    r2 = ((x - (cols - 1) / 2) / ((cols - 1) / 2)) ** 2 + ((y - (rows - 1) / 2) / ((rows - 1) / 2)) ** 2
+    base = 1.0 + (corner_gain - 1.0) * r2 / 2.0
+    return np.stack([base * 1.03, base, base, base * 0.97], axis=-1)
+
+
+def patch_means(img: np.ndarray, boxes, crop, out_size) -> np.ndarray:
+    """Mean colour of each patch's inner box in an output image (boxes are full-frame coordinates)."""
+    l, t, w, h = crop
+    sx, sy = out_size[0] / w, out_size[1] / h
+    out = []
+    for x0, y0, x1, y1 in boxes:
+        a0, a1 = int(math.ceil((x0 - l) * sx)), int(math.floor((x1 - l) * sx))
+        b0, b1 = int(math.ceil((y0 - t) * sy)), int(math.floor((y1 - t) * sy))
+        a0, b0 = max(a0, 0), max(b0, 0)
+        a1, b1 = min(a1, out_size[0]), min(b1, out_size[1])
+        out.append(img[b0:b1, a0:a1].reshape(-1, 3).mean(axis=0) if a1 > a0 and b1 > b0 else np.full(3, np.nan))
+    return np.asarray(out)

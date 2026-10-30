@@ -65,6 +65,10 @@ struct RawStats {
 // Returns an empty string on success, else a short error (nothing useful is written then).
 std::string renderRaw(const RawInput& in, const RenderSpec& spec, std::uint8_t* rgba, std::size_t strideBytes);
 
+// Same render as full-precision float RGB (sRGB-encoded, 0..1), row stride in floats. Used by the host parity
+// tool so the comparison with the Python reference is not limited by 8-bit rounding.
+std::string renderRawFloat(const RawInput& in, const RenderSpec& spec, float* rgb, std::size_t strideFloats);
+
 // Exposure statistics from CFA cells sampled every `step` cells inside the crop (no demosaic).
 std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec& colour, int step, RawStats& out);
 
