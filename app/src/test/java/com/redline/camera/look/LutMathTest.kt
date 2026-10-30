@@ -239,4 +239,15 @@ class LutMathTest {
         val mid = data[(16 * 33 + 16) * 33 + 16].trim().split(Regex("\\s+")).map { it.toFloat() }
         assertTrue("mid grey stays near grey: $mid", mid.all { abs(it - 0.5f) < 0.03f })
     }
+
+    @Test
+    fun cpuEstimateGateNeedsOnly20Samples() {
+        val t = TimingSnapshot(21, 4.7, 5.85, 6.2)
+        val gpu = LookPreviewReport(available = true, timing = t, timerMethod = "GL_EXT_disjoint_timer_query")
+        assertEquals(null, gpu.gateLutLe8Ms)
+        val cpu = LookPreviewReport(available = true, timing = t, timerMethod = "cpu_glfinish_estimate (every 15th frame)")
+        assertEquals(true, cpu.gateLutLe8Ms)
+        val few = TimingSnapshot(19, 4.7, 5.85, 6.2)
+        assertEquals(null, LookPreviewReport(available = true, timing = few, timerMethod = "cpu_glfinish_estimate").gateLutLe8Ms)
+    }
 }
