@@ -38,7 +38,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | Build | Tag | Scope | Acceptance gate |
 | --- | --- | --- | --- |
 | [x] B20 | `v0.2.0-alpha.1` | NDK/CMake native module (C++; Halide deferred), GPU LUT in live preview | Preview LUT <= 8 ms per frame. Passed on the baseline device profile: p95 5.85 ms, max 6.21 ms (CPU glFinish estimate, 21 samples; the GPU timer reported every query disjoint), 0 dropped frames, fps min 29.85 |
-| [ ] B21 | `v0.2.1-alpha.1` | RAW color pipeline: phone matrices -> XYZ -> Standard LUT, tone curve, highlight shoulder, Canon-style AWB warmth | Phone DNG -> XYZ -> Standard matches the reference (Python) pipeline within dE2000 1.0 on the same frames; neutrals stay neutral |
+| [x] B21 | `v0.2.1-alpha.1` | RAW color pipeline: phone matrices -> XYZ -> Standard LUT, tone curve, highlight shoulder, Canon-style AWB warmth | Phone DNG -> XYZ -> Standard matches the reference (Python) pipeline within dE2000 1.0 on the same frames; neutrals stay neutral. Passed on the baseline device profile: on-device self-check mean dE2000 0.0009, max 0.87, grey chroma 1.31; 11/11 shots rendered, 0 fallbacks; shutter-to-saved avg 861 ms |
 | [ ] B22 | `v0.2.2-alpha.1` | RAW burst capture (8-12 frames, under-exposed), tile align + merge, background processing queue | 24/35mm save < 3 s; no shutter blocking |
 | [ ] B23 | `v0.2.3-alpha.1` | Handheld multi-frame super-resolution at 50/70mm; per-stop output sizes | 50/70mm save < 5 s; resolution chart gain measured |
 | [ ] B24 | `v0.2.4-alpha.1` | Vignetting (in-camera residual), distortion (off by default, RAW-feel toggle), sharpening, grain; full Picture Style set | Visual sign-off on shoot list |
