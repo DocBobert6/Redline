@@ -7,12 +7,12 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
-import android.media.Image
 import android.os.Build
 import android.os.SystemClock
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.JsonParse
 import com.redline.camera.capture.CaptureMath
+import com.redline.camera.capture.RawCopy
 import com.redline.camera.look.CubeLut
 import com.redline.camera.nativebridge.RedlineNative
 
@@ -116,15 +116,19 @@ class ColourPipeline(context: Context) {
     /**
      * One still: renders the RAW frame (sensor orientation, the zoom stop's 3:2 crop and output size). The bitmap
      * is null when the pipeline could not render; [Outcome.shot] then says why and the caller saves the camera JPEG.
+     * B22: [raw] is a pool copy of the frame, or the merged burst; [levelScale] is the factor its samples were scaled
+     * by (16 for the merge's extra precision), applied to the result's black and white levels. The exposure is solved
+     * from the frame's own median against the camera JPEG's, so an under-exposed burst is brought back up here.
      */
     fun render(
-        raw: Image,
+        raw: RawCopy,
         result: TotalCaptureResult,
         characteristics: CameraCharacteristics,
         cameraId: String,
         jpeg: ByteArray,
         zoomRatio: Float,
-        stopLongPx: Int
+        stopLongPx: Int,
+        levelScale: Float = 1f
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -135,7 +139,7 @@ class ColourPipeline(context: Context) {
         val choice = profileFor(cameraId)
         val cal = choice.calibration ?: return fail(choice.reason ?: "no colour profile")
         return try {
-            val frame = rawFrame(raw, result, characteristics) ?: return fail("unsupported RAW layout or missing levels")
+            val frame = rawFrame(raw, result, characteristics, levelScale) ?: return fail("unsupported RAW layout or missing levels")
             val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.map { it.toDouble() }?.toDoubleArray()
                 ?: return fail("no SENSOR_NEUTRAL_COLOR_POINT in the capture result")
             var t1 = SystemClock.elapsedRealtime()
@@ -185,25 +189,32 @@ class ColourPipeline(context: Context) {
         }
     }
 
-    /** The RAW_SENSOR plane plus levels, CFA layout and lens shading map from the result and characteristics. */
-    private fun rawFrame(raw: Image, result: TotalCaptureResult, ch: CameraCharacteristics): RedlineNative.RawFrame? {
-        val plane = raw.planes.firstOrNull() ?: return null
-        if (plane.pixelStride != 2) return null
+    /** The RAW samples plus levels (times [scale]), CFA layout and lens shading map from the result and characteristics. */
+    private fun rawFrame(raw: RawCopy, result: TotalCaptureResult, ch: CameraCharacteristics, scale: Float): RedlineNative.RawFrame? {
         val cfa = runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) }.getOrNull() ?: return null
         if (cfa !in 0..3) return null
+        val (black, white) = levels(result, ch) ?: return null
+        val map = runCatching { result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP) }.getOrNull()
+        val shading = map?.let { FloatArray(it.gainFactorCount).also { a -> it.copyGainFactors(a, 0) } }
+        return RedlineNative.RawFrame(
+            raw.buffer, raw.width, raw.height, raw.rowStrideBytes, cfa, FloatArray(4) { black[it] * scale }, white * scale, shading,
+            map?.rowCount ?: 0, map?.columnCount ?: 0
+        )
+    }
+
+    /** Black and white levels of a frame (dynamic from the result, else static), for the burst merge. */
+    fun levels(result: TotalCaptureResult, ch: CameraCharacteristics): Pair<FloatArray, Float>? {
         val black = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)?.takeIf { it.size == 4 }
             ?: ch.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)?.let { p ->
                 FloatArray(4) { i -> p.getOffsetForIndex(i % 2, i / 2).toFloat() }
             } ?: return null
         val white = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)?.toFloat()
             ?: ch.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)?.toFloat() ?: return null
-        val map = runCatching { result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP) }.getOrNull()
-        val shading = map?.let { FloatArray(it.gainFactorCount).also { a -> it.copyGainFactors(a, 0) } }
-        return RedlineNative.RawFrame(
-            plane.buffer, raw.width, raw.height, plane.rowStride, cfa, black, white, shading,
-            map?.rowCount ?: 0, map?.columnCount ?: 0
-        )
+        return black to white
     }
+
+    /** True once the self-check passed (the burst merge renders through the same pipeline). */
+    val isReady: Boolean get() = ready
 
     /** The camera JPEG's median luma (encoded) over the same 3:2 framing, from an 1/8-scale decode. */
     private fun jpegMedian(jpeg: ByteArray): Double? {

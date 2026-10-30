@@ -41,6 +41,7 @@ import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.QuirksRepository
 import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
+import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.colour.ColourPipeline
@@ -69,6 +70,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.sqrt
 
 /**
  * Opens on the 3:2 viewfinder (B12); the capability screen (B10/B11) is one tap away.
@@ -97,6 +99,7 @@ class MainActivity : ComponentActivity() {
     private val streaming = mutableStateOf(false)
     private var deviceDegrees = 0
     private var stressPending = false
+    private var burstStressPending = false
     private var stressAbort = false
 
     // B14 manual controls and pro tools (main thread).
@@ -171,6 +174,14 @@ class MainActivity : ComponentActivity() {
     private var colourSetting = true
     private var colourPrepared: ColourPipeline.Prepared? = null
     private var colourChoice: ProfileChoice? = null
+
+    // B22 burst merge (main thread): the setting, its native self-check, the gyroscope for the planner, the stress run.
+    private var burstSetting = true
+    private var burstChecked = false
+    private var gyroSensor: Sensor? = null
+    private var gyroRegistered = false
+    private var motion = 0.0
+    private var burstStressAbort = false
 
     /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
     private fun useLook(): Boolean = lookSetting && lookReady && lookRuntimeError == null
@@ -303,6 +314,10 @@ class MainActivity : ComponentActivity() {
                     stressPending = false
                     startStress()
                 }
+                if (burstStressPending) {
+                    burstStressPending = false
+                    startBurstStress()
+                }
             }
             updateViewfinder { m ->
                 m.copy(
@@ -325,6 +340,14 @@ class MainActivity : ComponentActivity() {
 
         override fun onStillValues(values: ViewfinderController.ResultValues) {
             runOnUiThread { checkResult(values) }
+        }
+
+        override fun onQueueDepth(depth: Int) {
+            updateBurst { it.queue(depth) }
+        }
+
+        override fun onPool(frames: Int, frameMb: Double) {
+            updateBurst { it.copy(poolFrames = frames, frameMb = frameMb) }
         }
 
         override fun onRawUnavailable(reason: String) {
@@ -354,6 +377,7 @@ class MainActivity : ComponentActivity() {
         controller = ViewfinderController(this, cameraListener, BuildConfig.VERSION_NAME, colourPipeline)
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         colourSetting = prefs.getBoolean(PREF_COLOUR_PIPELINE, true)
+        burstSetting = prefs.getBoolean(PREF_BURST_MERGE, true)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
         lookRenderer = LookPreviewRenderer(lookListener)
@@ -389,7 +413,8 @@ class MainActivity : ComponentActivity() {
                 status = "starting"
             ),
             lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET),
-            colourPipeline = ColourPipelineReport(userSetting = colourSetting, lookName = ColourPipeline.LOOK_NAME)
+            colourPipeline = ColourPipelineReport(userSetting = colourSetting, lookName = ColourPipeline.LOOK_NAME),
+            burst = BurstReport(userSetting = burstSetting)
         )
         colourWorker.execute {
             val prepared = colourPipeline.prepare()
@@ -397,6 +422,15 @@ class MainActivity : ComponentActivity() {
                 colourPrepared = prepared
                 updateColour { it.copy(nativeVersion = prepared.nativeVersion, selfCheck = prepared.selfCheck) }
                 refreshColourAvailability()
+            }
+            // B22: the native burst merge on a synthetic burst with known shifts (CPU only, ~0.1-0.3 s).
+            val check = runCatching { RedlineNative.burstSelfCheck(Runtime.getRuntime().availableProcessors().coerceIn(1, 8)) }
+            runOnUiThread {
+                burstChecked = true
+                check.onSuccess { c ->
+                    updateBurst { it.copy(selfCheckAligned = c.alignedFraction, selfCheckNoiseRatio = c.noiseRatio, selfCheckMs = c.ms) }
+                }.onFailure { e -> updateBurst { it.copy(selfCheckError = "${e.javaClass.simpleName}: ${e.message}") } }
+                refreshBurstAvailability()
             }
         }
 
@@ -419,6 +453,7 @@ class MainActivity : ComponentActivity() {
                 ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
                 ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         }
+        gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     }
 
     private fun onProfileReady(loaded: DeviceProfile?, cacheHit: Boolean, setup: ViewfinderSetup?) {
@@ -474,6 +509,7 @@ class MainActivity : ComponentActivity() {
         permissionGranted.value = SelfTest(this).hasPermission()
         syncCamera()
         syncLevelSensor()
+        syncGyro()
         mainHandler.removeCallbacks(histogramTick)
         mainHandler.postDelayed(histogramTick, HISTOGRAM_PERIOD_MS)
     }
@@ -483,6 +519,7 @@ class MainActivity : ComponentActivity() {
         orientationListener.disable()
         mainHandler.removeCallbacks(histogramTick)
         syncLevelSensor()
+        syncGyro()
         syncCamera()
         super.onPause()
     }
@@ -551,11 +588,12 @@ class MainActivity : ComponentActivity() {
                 onRequestPermission = { permissionRequest.launch(Manifest.permission.CAMERA) },
                 onOpenCapability = ::showCapability,
                 onShutter = { shoot(keep = true) {} },
-                shutterEnabled = streaming.value && !shotInFlight.value && !state.value.capture.stressRunning,
+                // B22: the shutter stays live during a capture (the press waits for the camera, one deep).
+                shutterEnabled = streaming.value && !state.value.capture.stressRunning && !state.value.burst.stressRunning,
                 rawAvailable = rawAvailable(),
                 rawOn = rawOn.value,
                 onToggleRaw = ::toggleRaw,
-                captureText = state.value.capture.overlayText(),
+                captureText = listOfNotNull(burstOverlay(), state.value.capture.overlayText()).joinToString(" · ").ifEmpty { null },
                 manualUi = ManualUi(
                     caps = setup?.manual,
                     settings = manualSettings.value,
@@ -599,6 +637,15 @@ class MainActivity : ComponentActivity() {
                 },
                 onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
                 onToggleColourPipeline = if (state.value.colourPipeline.available == true) ::toggleColourPipeline else null,
+                onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
+                onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
+                    {
+                        burstStressPending = true
+                        showViewfinder()
+                    }
+                } else {
+                    null
+                },
                 onCycleLookStrength = ::cycleLookStrength,
                 onBack = ::showViewfinder
             )
@@ -750,6 +797,32 @@ class MainActivity : ComponentActivity() {
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
     }
 
+    /** B22: hand motion for the burst planner, a smoothed gyroscope magnitude (rad/s). */
+    private val gyroListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val m = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2]).toDouble()
+            motion += GYRO_SMOOTHING * (m - motion)
+            controller.setMotion(motion)
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    private fun syncGyro() {
+        val sm = sensorManager ?: return
+        val sensor = gyroSensor
+        if (sensor == null) {
+            controller.setMotion(null)
+            return
+        }
+        if (resumed && !gyroRegistered) {
+            gyroRegistered = sm.registerListener(gyroListener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        } else if (!resumed && gyroRegistered) {
+            sm.unregisterListener(gyroListener)
+            gyroRegistered = false
+        }
+    }
+
     private fun syncLevelSensor() {
         val sm = sensorManager ?: return
         val sensor = levelSensor ?: return
@@ -805,8 +878,8 @@ class MainActivity : ComponentActivity() {
         controller.setRaw(rawOn.value)
     }
 
-    /** One still with the selected stop's framing. [done] runs on the main thread. */
-    private fun shoot(keep: Boolean, done: (ShotResult) -> Unit) {
+    /** One still with the selected stop's framing. [onCaptured] and [done] run on the main thread. */
+    private fun shoot(keep: Boolean, stress: Boolean = false, onCaptured: () -> Unit = {}, done: (ShotResult) -> Unit) {
         val stop = setupState.value?.zoomPlan?.stop(selectedStop.intValue)
         val request = ViewfinderController.StillRequest(
             stopLabel = stop?.label ?: "${selectedStop.intValue}",
@@ -814,20 +887,62 @@ class MainActivity : ComponentActivity() {
             trueEquivalentMm = stop?.trueEquivalentMm,
             stopLongPx = stop?.outputWidthPx ?: 0,
             deviceDegrees = deviceDegrees,
-            keep = keep
+            keep = keep,
+            stress = stress
         )
         shotInFlight.value = true
-        controller.capture(request) { result ->
+        controller.capture(request, onCaptured = {
             runOnUiThread {
                 shotInFlight.value = false
-                val stress = !keep
+                onCaptured()
+            }
+        }) { result ->
+            runOnUiThread {
+                val b13Stress = !keep && !stress
                 val colour =
                     result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
-                state.value = state.value.copy(capture = state.value.capture.add(result, stress), colourPipeline = colour)
+                var burst = state.value.burst.press(result.shutterWaitMs, result.shutterBlocked, stress)
+                result.burst?.let { burst = burst.record(it, result.shutterToSavedMs, result.ok) }
+                if (stress && result.burst == null) {
+                    burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (result.ok) 0 else 1)
+                }
+                state.value = state.value.copy(capture = state.value.capture.add(result, b13Stress), colourPipeline = colour, burst = burst)
                 done(result)
             }
         }
     }
+
+    /**
+     * B22 burst stress: [BurstReport.STRESS_SHOTS] shots fired as fast as the camera frees up (each press as soon as
+     * the previous capture is out of the camera, not when it is saved), files deleted. Measures shutter blocking and
+     * the queue under load; the save gate ignores these shots.
+     */
+    private fun startBurstStress() {
+        if (state.value.burst.stressRunning) return
+        burstStressAbort = false
+        val runs = BurstReport.STRESS_SHOTS
+        updateBurstNow {
+            it.copy(stressRequested = runs, stressDone = 0, stressFailures = 0, stressBlocked = 0, stressMaxQueue = 0, stressRunning = true)
+        }
+        var fired = 0
+        fun finishIfDone() {
+            val b = state.value.burst
+            if (b.stressRunning && (b.stressDone >= runs || (burstStressAbort && b.stressDone >= fired))) {
+                updateBurstNow { it.copy(stressRunning = false) }
+            }
+        }
+        fun next() {
+            if (burstStressAbort || !cameraOpen || fired >= runs) {
+                finishIfDone()
+                return
+            }
+            fired++
+            shoot(keep = false, stress = true, onCaptured = { next() }) { finishIfDone() }
+        }
+        next()
+    }
+
+    private fun burstOverlay(): String? = state.value.burst.overlay()
 
     /**
      * B13 gate: 500 consecutive captures through the full save path (files written via MediaStore, then
@@ -890,6 +1005,7 @@ class MainActivity : ComponentActivity() {
             cameraOpen = false
             streaming.value = false
             stressAbort = true
+            burstStressAbort = true
             updateLook { it.copy(active = false) }
             lastClose = controller.close()
             // Once closed, settle the renderer and reopen on the right path if the camera is still wanted.
@@ -922,6 +1038,7 @@ class MainActivity : ComponentActivity() {
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
             controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable(), colourEnabled())
+            controller.setBurst(burstEnabled())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
         }
         return CompletableFuture.completedFuture(Unit)
@@ -994,6 +1111,57 @@ class MainActivity : ComponentActivity() {
         }
         updateColour { it.copy(available = available, reason = reason, profileSource = choice?.source, profileId = choice?.profileId) }
         syncColourPipeline()
+        runOnUiThread { refreshBurstAvailability() }
+    }
+
+    /**
+     * B22: burst merge is available when the native self-check passed, the B21 pipeline is available, and the camera
+     * has RAW, BURST_CAPTURE and manual exposure (the burst frames are AE-off). On by default then; off with the reason
+     * otherwise, and the still takes the B21 single-frame path.
+     */
+    private fun refreshBurstAvailability() {
+        val b = state.value.burst
+        val cam = FeaturePolicy.defaultCamera(profile)
+        val caps = setupState.value?.manual
+        val selfOk = b.selfCheckError == null &&
+            (b.selfCheckAligned ?: 0.0) >= BurstReport.SELF_CHECK_MIN_ALIGNED &&
+            (b.selfCheckNoiseRatio ?: 0.0) >= BurstReport.SELF_CHECK_MIN_NOISE_RATIO
+        val colour = state.value.colourPipeline
+        val (available, reason) = when {
+            burstChecked && !selfOk -> false to "native self-check failed: ${b.selfCheckError ?: selfCheckSummary(b)}"
+            colour.available == false -> false to "needs the RAW colour pipeline (${colour.reason ?: "unavailable"})"
+            !burstChecked || colour.available == null || setupState.value == null -> null to null
+            cam == null || !cam.has("BURST_CAPTURE") -> false to "camera does not report BURST_CAPTURE"
+            caps == null || !caps.manualExposure -> false to "camera has no manual exposure (burst frames are AE-off)"
+            !rawAvailable() -> false to "no RAW_SENSOR stream"
+            else -> true to null
+        }
+        updateBurst { it.copy(available = available, reason = reason) }
+        syncBurst()
+    }
+
+    private fun selfCheckSummary(b: BurstReport): String = "aligned ${b.selfCheckAligned}, noise ratio ${b.selfCheckNoiseRatio}"
+
+    private fun burstEnabled(): Boolean = state.value.burst.enabled && colourEnabled()
+
+    private fun syncBurst() {
+        if (cameraOpen) controller.setBurst(burstEnabled())
+    }
+
+    private fun toggleBurst() {
+        burstSetting = !burstSetting
+        prefs.edit { putBoolean(PREF_BURST_MERGE, burstSetting) }
+        state.value = state.value.copy(burst = state.value.burst.copy(userSetting = burstSetting))
+        syncBurst()
+    }
+
+    private fun updateBurst(change: (BurstReport) -> BurstReport) {
+        update { s -> s.copy(burst = change(s.burst)) }
+    }
+
+    /** Main thread only: applies at once (the stress run reads its own counters back immediately). */
+    private fun updateBurstNow(change: (BurstReport) -> BurstReport) {
+        state.value = state.value.copy(burst = change(state.value.burst))
     }
 
     /** Stills are rendered from RAW: setting on, prepared, profile found, RAW offered and no session failure. */
@@ -1156,6 +1324,7 @@ class MainActivity : ComponentActivity() {
     private fun applyPolicyToCamera() {
         if (!cameraOpen) return
         controller.setPipeline(colourEnabled())
+        controller.setBurst(burstEnabled())
         val stab = wantedStabilization()
         if (stab != appliedStabilization) {
             appliedStabilization = stab
@@ -1215,6 +1384,8 @@ class MainActivity : ComponentActivity() {
         private const val PREF_LOOK_PREVIEW = "look_preview"
         private const val PREF_LOOK_STRENGTH = "look_strength"
         private const val PREF_COLOUR_PIPELINE = "colour_pipeline"
+        private const val PREF_BURST_MERGE = "burst_merge"
+        private const val GYRO_SMOOTHING = 0.1
         private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
         private const val LOOK_BADGE = "Look preview (approx.)"
         private const val LOOK_PREPARE_TIMEOUT_MS = 1_500L

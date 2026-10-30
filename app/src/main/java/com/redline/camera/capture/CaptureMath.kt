@@ -100,7 +100,13 @@ data class ShotResult(
     /** The look named in the EXIF tag. */
     val look: String? = null,
     /** B21 colour step: rendered by the pipeline, or the fallback reason; null when the pipeline was off. */
-    val colour: ColourShot? = null
+    val colour: ColourShot? = null,
+    /** B22 burst step (merged, single-frame and why, or fallback); null when burst merge was off. */
+    val burst: BurstShot? = null,
+    /** B22: how long the press waited for the previous capture to leave the camera (0 = started at once). */
+    val shutterWaitMs: Long? = null,
+    /** B22: the press was refused, or held longer than BurstReport.SHUTTER_BLOCK_MS. */
+    val shutterBlocked: Boolean = false
 ) {
     fun summary(): String = when {
         !ok -> "Capture failed: ${error ?: "unknown"}"
@@ -110,6 +116,12 @@ data class ShotResult(
             if (dngWanted) append(if (dngSaved) " + DNG" else " (DNG failed: ${error ?: "?"})")
             shutterToSavedMs?.let { append(" in $it ms") }
             colour?.let { append(if (it.rendered) " · RAW look" else " · camera JPEG (${it.fallbackReason ?: "?"})") }
+            burst?.let { b ->
+                when {
+                    b.merged -> append(" · ${b.framesMerged}-frame merge")
+                    b.plan.isBurst -> append(" · single frame (${b.fallbackReason ?: "?"})")
+                }
+            }
         }
     }
 }

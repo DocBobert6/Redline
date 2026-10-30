@@ -25,6 +25,7 @@ import com.redline.camera.capability.DeviceProfile
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
+import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
@@ -46,6 +47,8 @@ fun CapabilityScreen(
     onToggleLook: (() -> Unit)? = null,
     onCycleLookStrength: (() -> Unit)? = null,
     onToggleColourPipeline: (() -> Unit)? = null,
+    onToggleBurst: (() -> Unit)? = null,
+    onRunBurstStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
@@ -185,6 +188,9 @@ fun CapabilityScreen(
                     ColourPipelineCard(state.colourPipeline, onToggleColourPipeline)
                 }
                 item {
+                    BurstCard(state.burst, onToggleBurst, onRunBurstStress)
+                }
+                item {
                     LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
                 }
                 item {
@@ -263,6 +269,76 @@ private fun ColourPipelineCard(r: ColourPipelineReport, onToggle: (() -> Unit)?)
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(COLOUR_TOGGLE_TAG)) {
                 Text("Turn colour pipeline ${if (r.userSetting) "off" else "on"} (default on when the self-check passes)")
+            }
+        }
+    }
+}
+
+const val BURST_SECTION_TITLE = "Burst merge"
+const val BURST_TOGGLE_TAG = "burst_merge_toggle"
+const val BURST_STRESS_TAG = "burst_merge_stress"
+
+/** B22: RAW burst merge state, native self-check, the last shot's frames/alignment/timings, queue, shutter, gates. */
+@Composable
+private fun BurstCard(r: BurstReport, onToggle: (() -> Unit)?, onRunStress: (() -> Unit)?) {
+    SectionCard(BURST_SECTION_TITLE) {
+        Text(BurstReport.LABEL, style = MaterialTheme.typography.bodySmall)
+        Text(if (r.enabled) "On: stills merge a RAW burst on the processing queue" else "Off: ${r.whyOff()}")
+        val f = { v: Double? -> v?.let { "%.3f".format(it) } ?: "-" }
+        Text(
+            "Self-check: aligned ${f(r.selfCheckAligned)}, noise reduction ${f(r.selfCheckNoiseRatio)}x, " +
+                "${r.selfCheckMs?.let { Math.round(it) } ?: "-"} ms${r.selfCheckError?.let { " ($it)" } ?: ""}",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Text(
+            "Memory pool ${r.poolFrames ?: "-"} frames x ${r.frameMb?.let {
+                "%.0f".format(it)
+            } ?: "-"} MB",
+            style = MaterialTheme.typography.bodySmall
+        )
+        val avg = if (r.mergedShots == 0) "-" else "${r.totalSaveMs / r.mergedShots}"
+        Text(
+            "Merged ${r.mergedShots}, single-frame ${r.singleShots}, fallbacks ${r.fallbacks}; frames requested ${r.framesRequested}, " +
+                "captured ${r.framesCaptured}, merged ${r.framesMerged}; shutter-to-saved avg $avg ms (max ${r.maxSaveMs})"
+        )
+        if (r.singleReasons.isNotEmpty()) Text("Single-frame because: ${r.singleReasons}", style = MaterialTheme.typography.bodySmall)
+        Text(
+            "Queue ${r.queueDepth} (max ${r.maxQueueDepth}); presses ${r.presses}, blocked ${r.shutterBlocked}, " +
+                "waited ${r.shutterWaits} (max ${r.maxShutterWaitMs} ms)"
+        )
+        r.last?.let { l ->
+            Text(
+                "Last: ${l.plan.frames} planned / ${l.framesCaptured} captured / ${l.framesMerged} merged at ${l.stopMm} mm, " +
+                    "ISO ${l.plan.iso}, ${l.plan.exposureNs / 1000} us, ${"%.2f".format(
+                        l.plan.underEv
+                    )} EV under, ref ${l.reference ?: "-"}, " +
+                    "shift ${l.meanDispPx?.let { "%.1f".format(it) } ?: "-"} px, rejected ${f(l.rejectedFraction)}" +
+                    (l.fallbackReason?.let { " · fallback: $it" } ?: "") + (l.plan.singleReason?.let { " · single: $it" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (l.timingsMs.isNotEmpty()) Text("Stages ${l.timingsMs}", style = MaterialTheme.typography.bodySmall)
+        }
+        Text(
+            "Gates: 24/35 mm save < 3 s ${gateWord(r.saveGate)} ${r.gateStops}, no shutter blocking ${gateWord(r.shutterGate)}"
+        )
+        if (r.stressRequested > 0) {
+            Text(
+                "Burst stress ${r.stressDone}/${r.stressRequested}, failures ${r.stressFailures}, blocked ${r.stressBlocked}, " +
+                    "max queue ${r.stressMaxQueue}${if (r.stressRunning) " (running)" else ""}"
+            )
+        }
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(BURST_TOGGLE_TAG)) {
+                Text("Turn burst merge ${if (r.userSetting) "off" else "on"} (default on when its checks pass)")
+            }
+        }
+        if (onRunStress != null) {
+            OutlinedButton(
+                onClick = onRunStress,
+                enabled = !r.stressRunning,
+                modifier = Modifier.padding(top = 8.dp).testTag(BURST_STRESS_TAG)
+            ) {
+                Text("Run burst stress (${BurstReport.STRESS_SHOTS} rapid shots, files deleted)")
             }
         }
     }

@@ -1,5 +1,6 @@
 package com.redline.camera.capability
 
+import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
@@ -35,7 +36,9 @@ data class CapabilityState(
     /** B20 GPU look preview: availability (GLES 3, native module, LUT), self-check, LUT-pass timing and its gate. */
     val lookPreview: LookPreviewReport = LookPreviewReport(),
     /** B21 RAW colour pipeline: availability, profile, on-device self-check (parity, neutrals), per-shot timings. */
-    val colourPipeline: ColourPipelineReport = ColourPipelineReport()
+    val colourPipeline: ColourPipelineReport = ColourPipelineReport(),
+    /** B22 RAW burst merge: availability, self-check, frames, alignment, stage timings, queue, shutter blocking, gates. */
+    val burst: BurstReport = BurstReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -46,7 +49,7 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections, B12 viewfinder, B13 capture, B14 manual controls, B20 look preview and B21 colour pipeline. */
+    /** The B10 profile plus the B11 sections, B12 viewfinder, B13 capture, B14 manual controls, B20 look preview, B21 colour pipeline and B22 burst merge. */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -66,6 +69,7 @@ object CapabilityReport {
         out["manual"] = state.manual.toMap()
         out["look_preview"] = state.lookPreview.toMap()
         out["colour_pipeline"] = state.colourPipeline.toMap()
+        out["burst"] = state.burst.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }
