@@ -43,6 +43,9 @@ import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.capture.ShotResult
+import com.redline.camera.colour.ColourPipeline
+import com.redline.camera.colour.ColourPipelineReport
+import com.redline.camera.colour.ProfileChoice
 import com.redline.camera.look.CubeLut
 import com.redline.camera.look.LookPreviewRenderer
 import com.redline.camera.look.LookPreviewReport
@@ -88,7 +91,7 @@ class MainActivity : ComponentActivity() {
     private val status = mutableStateOf<String?>(null)
     private val permissionGranted = mutableStateOf(false)
 
-    /** B13: save a DNG next to the JPEG. Off by default (PLAN 5: RAW file is a toggle). */
+    /** B13: save a DNG next to the JPEG. Off by default (PLAN 5: RAW file is a toggle; B21 captures RAW for the look regardless). */
     private val rawOn = mutableStateOf(false)
     private val shotInFlight = mutableStateOf(false)
     private val streaming = mutableStateOf(false)
@@ -161,6 +164,13 @@ class MainActivity : ComponentActivity() {
     private var cameraTexture: SurfaceTexture? = null
     private var openedWithLook = false
     private var lastDetach: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+
+    // B21 RAW colour pipeline (main thread). Prepared (native, assets, self-check) and the profile chosen on its own
+    // worker; stills are rendered from RAW while it is enabled, else they come from the camera JPEG.
+    private lateinit var colourPipeline: ColourPipeline
+    private var colourSetting = true
+    private var colourPrepared: ColourPipeline.Prepared? = null
+    private var colourChoice: ProfileChoice? = null
 
     /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
     private fun useLook(): Boolean = lookSetting && lookReady && lookRuntimeError == null
@@ -321,6 +331,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 rawOn.value = false
                 status.value = "RAW unavailable: $reason"
+                updateColour { it.copy(sessionRawUnavailable = reason) }
             }
         }
 
@@ -339,8 +350,10 @@ class MainActivity : ComponentActivity() {
         createdAtMs = SystemClock.elapsedRealtime()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        controller = ViewfinderController(this, cameraListener, BuildConfig.VERSION_NAME)
+        colourPipeline = ColourPipeline(this)
+        controller = ViewfinderController(this, cameraListener, BuildConfig.VERSION_NAME, colourPipeline)
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        colourSetting = prefs.getBoolean(PREF_COLOUR_PIPELINE, true)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
         lookRenderer = LookPreviewRenderer(lookListener)
@@ -375,8 +388,17 @@ class MainActivity : ComponentActivity() {
                 permissionPrompted = awaitingPermission,
                 status = "starting"
             ),
-            lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET)
+            lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET),
+            colourPipeline = ColourPipelineReport(userSetting = colourSetting, lookName = ColourPipeline.LOOK_NAME)
         )
+        colourWorker.execute {
+            val prepared = colourPipeline.prepare()
+            runOnUiThread {
+                colourPrepared = prepared
+                updateColour { it.copy(nativeVersion = prepared.nativeVersion, selfCheck = prepared.selfCheck) }
+                refreshColourAvailability()
+            }
+        }
 
         setContent { Content() }
 
@@ -429,6 +451,18 @@ class MainActivity : ComponentActivity() {
             )
         }
         applyManual()
+        if (setup != null) {
+            colourWorker.execute {
+                val choice = colourPipeline.profileFor(setup.cameraId)
+                runOnUiThread {
+                    colourChoice = choice
+                    refreshColourAvailability()
+                }
+            }
+        } else {
+            colourChoice = ProfileChoice(null, null, null, "no usable camera")
+            refreshColourAvailability()
+        }
         syncCamera()
         if (!awaitingPermission) scheduleChecks(immediate = !permissionGranted.value || setup == null)
     }
@@ -564,6 +598,7 @@ class MainActivity : ComponentActivity() {
                     showViewfinder()
                 },
                 onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
+                onToggleColourPipeline = if (state.value.colourPipeline.available == true) ::toggleColourPipeline else null,
                 onCycleLookStrength = ::cycleLookStrength,
                 onBack = ::showViewfinder
             )
@@ -786,7 +821,9 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 shotInFlight.value = false
                 val stress = !keep
-                state.value = state.value.copy(capture = state.value.capture.add(result, stress))
+                val colour =
+                    result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
+                state.value = state.value.copy(capture = state.value.capture.add(result, stress), colourPipeline = colour)
                 done(result)
             }
         }
@@ -884,7 +921,7 @@ class MainActivity : ComponentActivity() {
             val stop = setup.zoomPlan.stop(selectedStop.intValue)
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
-            controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable())
+            controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable(), colourEnabled())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
         }
         return CompletableFuture.completedFuture(Unit)
@@ -942,6 +979,39 @@ class MainActivity : ComponentActivity() {
         check(native.loaded) { "native module not loaded (${native.error})" }
         val bytes = applicationContext.assets.open(LOOK_LUT_ASSET).use { it.readBytes() }
         return RedlineNative.parseCube(bytes)
+    }
+
+    /** B21: available once the self-check passed and a profile was found for the camera, which must offer RAW. */
+    private fun refreshColourAvailability() {
+        val prepared = colourPrepared
+        val choice = colourChoice
+        val (available, reason) = when {
+            prepared != null && !prepared.ok -> false to prepared.reason
+            choice != null && !choice.ok -> false to choice.reason
+            prepared == null || choice == null || setupState.value == null -> null to null
+            !rawAvailable() -> false to "this camera offers no RAW_SENSOR stream (or the RAW path was demoted); camera JPEG is used"
+            else -> true to null
+        }
+        updateColour { it.copy(available = available, reason = reason, profileSource = choice?.source, profileId = choice?.profileId) }
+        syncColourPipeline()
+    }
+
+    /** Stills are rendered from RAW: setting on, prepared, profile found, RAW offered and no session failure. */
+    private fun colourEnabled(): Boolean = state.value.colourPipeline.enabled && rawAvailable()
+
+    private fun syncColourPipeline() {
+        if (cameraOpen) controller.setPipeline(colourEnabled())
+    }
+
+    private fun toggleColourPipeline() {
+        colourSetting = !colourSetting
+        prefs.edit { putBoolean(PREF_COLOUR_PIPELINE, colourSetting) }
+        state.value = state.value.copy(colourPipeline = state.value.colourPipeline.copy(userSetting = colourSetting))
+        syncColourPipeline()
+    }
+
+    private fun updateColour(change: (ColourPipelineReport) -> ColourPipelineReport) {
+        update { s -> s.copy(colourPipeline = change(s.colourPipeline)) }
     }
 
     private fun toggleLook() {
@@ -1085,6 +1155,7 @@ class MainActivity : ComponentActivity() {
     /** Combination results can demote preview stabilization after the preview opened; follow the policy. */
     private fun applyPolicyToCamera() {
         if (!cameraOpen) return
+        controller.setPipeline(colourEnabled())
         val stab = wantedStabilization()
         if (stab != appliedStabilization) {
             appliedStabilization = stab
@@ -1143,6 +1214,7 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_NAME = "redline_settings"
         private const val PREF_LOOK_PREVIEW = "look_preview"
         private const val PREF_LOOK_STRENGTH = "look_strength"
+        private const val PREF_COLOUR_PIPELINE = "colour_pipeline"
         private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
         private const val LOOK_BADGE = "Look preview (approx.)"
         private const val LOOK_PREPARE_TIMEOUT_MS = 1_500L
@@ -1151,5 +1223,8 @@ class MainActivity : ComponentActivity() {
 
         /** One worker for every check so two runs never hold the camera at once. */
         private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+
+        /** B21 preparation (native, assets, self-check) and profile selection, off the camera checks' worker. */
+        private val colourWorker: ExecutorService = Executors.newSingleThreadExecutor()
     }
 }

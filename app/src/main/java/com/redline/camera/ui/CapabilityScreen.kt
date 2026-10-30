@@ -26,6 +26,7 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
@@ -44,6 +45,7 @@ fun CapabilityScreen(
     onRunStress: (() -> Unit)? = null,
     onToggleLook: (() -> Unit)? = null,
     onCycleLookStrength: (() -> Unit)? = null,
+    onToggleColourPipeline: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
     val policy = state.policy(profile)
@@ -180,6 +182,9 @@ fun CapabilityScreen(
                     }
                 }
                 item {
+                    ColourPipelineCard(state.colourPipeline, onToggleColourPipeline)
+                }
+                item {
                     LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
                 }
                 item {
@@ -222,6 +227,46 @@ const val BACK_TAG = "back_to_viewfinder"
 const val LOOK_SECTION_TITLE = "Look preview"
 const val LOOK_TOGGLE_TAG = "look_preview_toggle"
 const val LOOK_STRENGTH_TAG = "look_preview_strength"
+
+const val COLOUR_SECTION_TITLE = "Colour pipeline"
+const val COLOUR_TOGGLE_TAG = "colour_pipeline_toggle"
+
+/** B21: RAW colour pipeline state, profile, the on-device self-check (parity and neutral gates) and shot timings. */
+@Composable
+private fun ColourPipelineCard(r: ColourPipelineReport, onToggle: (() -> Unit)?) {
+    SectionCard(COLOUR_SECTION_TITLE) {
+        Text(ColourPipelineReport.LABEL, style = MaterialTheme.typography.bodySmall)
+        Text(if (r.enabled) "On: stills are rendered from RAW (${r.lookName})" else "Off: ${r.whyOff()}")
+        Text("Profile ${r.profileId ?: "-"} (${r.profileSource ?: "none"}); fallback: camera JPEG")
+        Text("Native ${r.nativeVersion ?: "not loaded yet"}", style = MaterialTheme.typography.bodySmall)
+        r.selfCheck?.let { c ->
+            val f = { v: Double? -> v?.let { "%.3f".format(it) } ?: "-" }
+            Text(
+                "Self-check: mean dE2000 ${f(c.meanDe2000)}, max ${f(c.maxDe2000)} (max step ${c.maxStep8bit ?: "-"}/255), " +
+                    "grey chroma ${f(c.greyChromaMax)}, Kotlin maths ${c.kotlinMathsMatch ?: "-"}, ${c.ms ?: "-"} ms"
+            )
+            Text("Gates: parity <= 1 dE2000 ${gateWord(c.parityPassed)}, neutrals ${gateWord(c.neutralPassed)}")
+            c.error?.let { Text("Self-check error: $it", style = MaterialTheme.typography.bodySmall) }
+        }
+        val avg = if (r.rendered == 0) "-" else "${r.totalRenderMs / r.rendered}"
+        val shot = if (r.rendered == 0) "-" else "${r.totalShotMs / r.rendered}"
+        Text("Rendered ${r.rendered}, fallbacks ${r.fallbacks}; render avg $avg ms (max ${r.maxRenderMs}), shutter-to-saved avg $shot ms")
+        r.last?.let { l ->
+            val what = if (l.rendered) {
+                "Last: ${l.outSize} CCT ${l.cct?.let { Math.round(it) } ?: "-"} K, warmth ${l.warmth?.let { "%.2f".format(it) }}, " +
+                    "exposure ${l.exposureEv?.let { "%+.2f".format(it) }} EV (${l.exposureMethod}), ${l.timingsMs}"
+            } else {
+                "Last: camera JPEG (${l.fallbackReason})"
+            }
+            Text(what, style = MaterialTheme.typography.bodySmall)
+        }
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(COLOUR_TOGGLE_TAG)) {
+                Text("Turn colour pipeline ${if (r.userSetting) "off" else "on"} (default on when the self-check passes)")
+            }
+        }
+    }
+}
 
 /** B20: GPU look preview state, capabilities, LUT-pass timing and the <= 8 ms gate. */
 @Composable

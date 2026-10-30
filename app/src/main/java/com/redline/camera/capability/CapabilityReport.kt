@@ -1,6 +1,7 @@
 package com.redline.camera.capability
 
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
 import com.redline.camera.viewfinder.ViewfinderMetrics
@@ -32,7 +33,9 @@ data class CapabilityState(
     /** B14 manual controls: ranges read, mode, current values, clamp events and the range gate. */
     val manual: ManualReport = ManualReport(),
     /** B20 GPU look preview: availability (GLES 3, native module, LUT), self-check, LUT-pass timing and its gate. */
-    val lookPreview: LookPreviewReport = LookPreviewReport()
+    val lookPreview: LookPreviewReport = LookPreviewReport(),
+    /** B21 RAW colour pipeline: availability, profile, on-device self-check (parity, neutrals), per-shot timings. */
+    val colourPipeline: ColourPipelineReport = ColourPipelineReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -43,7 +46,7 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections, the B12 viewfinder, B13 capture, B14 manual controls and the B20 look preview. */
+    /** The B10 profile plus the B11 sections, B12 viewfinder, B13 capture, B14 manual controls, B20 look preview and B21 colour pipeline. */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -62,6 +65,7 @@ object CapabilityReport {
         out["capture"] = state.capture.toMap()
         out["manual"] = state.manual.toMap()
         out["look_preview"] = state.lookPreview.toMap()
+        out["colour_pipeline"] = state.colourPipeline.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

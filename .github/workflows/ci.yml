@@ -37,7 +37,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Native parser host tests (CTest)
+      - name: Native host tests (CTest)
         run: |
           cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
           cmake --build build/native-host
@@ -83,6 +83,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r calibration/requirements-ci.txt rawpy
+
+      # B21: the host build of the native RAW pipeline, for the Python parity test (tests/test_raw_pipeline.py).
+      - name: Build native RAW pipeline host tool
+        run: |
+          cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-host --target raw_pipeline_tool
+          echo "REDLINE_RAW_TOOL=$PWD/build/native-host/raw_pipeline_tool" >> "$GITHUB_ENV"
+          echo "REDLINE_REQUIRE_NATIVE=1" >> "$GITHUB_ENV"
 
       - name: Cache real-file fixtures
         uses: actions/cache@v4

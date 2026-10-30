@@ -109,3 +109,28 @@ Some phones (the baseline device among them) leave every `SENSOR_COLOR_TRANSFORM
 - the device profile comes from the stock camera's DNG tags (`profile_device.py` without `--camera2`);
 - Redline's own RAW capture (B13) has to write the matrices from that bundled profile, because `DngCreator` has nothing to copy;
 - an unprofiled phone with no Camera2 calibration falls back to the generic sRGB path, and its profile is labelled as uncalibrated.
+
+## B21: RAW colour pipeline (reference and parity)
+
+`redline_cal/raw_pipeline.py` is the reference implementation of the app's RAW colour pipeline; its docstring is the
+contract (normalise with levels + lens shading map, Malvar-He-Cutler demosaic, 3:2 crop at the zoom stop, white
+balance on AsShotNeutral then clip, DNG forward-matrix path into a warmth-adjusted D65, linear sRGB, area downscale,
+fitted Standard tone curve with a highlight shoulder, 33^3 residual LUT). The app runs the same steps: Kotlin
+`colour/ColourMath.kt` plans each shot, C++ `app/src/main/cpp/raw_pipeline.cpp` does the pixels.
+
+```bash
+# Kotlin fixture + on-device self-check frame (re-run after changing the reference or the bundled assets)
+python calibration/tools/make_colour_fixtures.py          # --check to verify the committed files
+
+# Native parity on synthetic frames (CI builds the host tool and sets REDLINE_RAW_TOOL)
+cmake -S app/src/test/cpp -B build/native-host && cmake --build build/native-host --target raw_pipeline_tool
+REDLINE_RAW_TOOL=build/native-host/raw_pipeline_tool python -m pytest calibration/tests/test_raw_pipeline.py
+
+# Native parity on your own phone DNGs (private files stay outside the repo; output is numbers only)
+python calibration/tools/raw_parity.py --tool build/native-host/raw_pipeline_tool path/to/*.dng --zoom 1.37 --long-px 2910
+```
+
+Gate: the native render matches the reference within dE2000 1.0 (max over every pixel, compared before the final
+8-bit rounding) and daylight greys stay neutral (CIELAB chroma <= 2.0). Bundled assets the pipeline reads:
+`app/src/main/assets/colour/standard_tone.json` (fitted Standard tone curve), `colour/baseline_profile.json` (the
+baseline device profile's colour numbers, matched by model hash), and `luts/redline_standard_preview_33.cube`.
