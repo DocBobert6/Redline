@@ -3,6 +3,7 @@
 // against the Python reference, calibration/redline_cal/raw_pipeline.py, whose docstring is the contract:
 // normalise (black/white, lens shading map) -> Malvar-He-Cutler demosaic (mirror borders) -> crop ->
 // white balance + clip -> 3x3 to linear sRGB -> area downscale -> tone curve with highlight shoulder -> 3D LUT.
+// B23: the same stages 4-8 on linear camera RGB that the super-resolution merge produced at the output size.
 #pragma once
 
 #include <cstddef>
@@ -73,5 +74,23 @@ std::string renderRawFloat(const RawInput& in, const RenderSpec& spec, float* rg
 std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec& colour, int step, RawStats& out);
 
 std::string validate(const RawInput& in);
+
+// B23: camera RGB already on the output grid (the super-resolution merge's normalised, shading-corrected values),
+// planar: plane c at data + c * planeStride, rows rowStride floats apart.
+struct LinearRgb {
+    const float* data = nullptr;
+    int width = 0;
+    int height = 0;
+    std::size_t rowStride = 0;
+    std::size_t planeStride = 0;
+};
+
+// B23: stages 4-8 of the pipeline on linear camera RGB at the output size (balance + clip, matrix, tone curve, LUT;
+// nothing is resampled; spec.crop is ignored and spec.outWidth/outHeight must equal the image size).
+std::string renderLinear(const LinearRgb& in, const RenderSpec& spec, std::uint8_t* rgba, std::size_t strideBytes);
+std::string renderLinearFloat(const LinearRgb& in, const RenderSpec& spec, float* rgb, std::size_t strideFloats);
+
+// B23: rawStats for linear camera RGB: every `step`-th pixel in each direction from (0, 0).
+std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step, RawStats& out);
 
 }  // namespace redline

@@ -9,6 +9,7 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.os.Build
 import android.os.SystemClock
+import com.redline.camera.capability.Dim
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.JsonParse
 import com.redline.camera.capture.CaptureMath
@@ -188,6 +189,81 @@ class ColourPipeline(context: Context) {
             fail("out of memory")
         }
     }
+
+    /**
+     * B23: renders a finished super-resolution merge (normalised camera RGB already on the [outWidth] x [outHeight] grid
+     * of the stop's crop) through stages 4-8, planned exactly as [render] plans a frame: the colour solve from the
+     * reference frame's [result], the exposure from the merge's own median against the camera JPEG's.
+     */
+    fun renderSuperRes(
+        sr: RedlineNative.SuperResMerger,
+        result: TotalCaptureResult,
+        characteristics: CameraCharacteristics,
+        cameraId: String,
+        jpeg: ByteArray,
+        outWidth: Int,
+        outHeight: Int
+    ): Outcome {
+        val t0 = SystemClock.elapsedRealtime()
+        val timings = LinkedHashMap<String, Long>()
+        fun fail(why: String) = Outcome(null, ColourShot(rendered = false, fallbackReason = why, timingsMs = timings))
+        if (!ready) return fail("pipeline not ready")
+        val t = tone ?: return fail("tone not loaded")
+        val l = lut ?: return fail("LUT not loaded")
+        val choice = profileFor(cameraId)
+        val cal = choice.calibration ?: return fail(choice.reason ?: "no colour profile")
+        return try {
+            val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.map { it.toDouble() }?.toDoubleArray()
+                ?: return fail("no SENSOR_NEUTRAL_COLOR_POINT in the capture result")
+            var t1 = SystemClock.elapsedRealtime()
+            val median = runCatching { jpegMedian(jpeg) }.getOrNull()
+            timings["jpeg_median"] = SystemClock.elapsedRealtime() - t1
+            t1 = SystemClock.elapsedRealtime()
+            val solve = ColourMath.solveColour(cal, neutral, true)
+            val m = ShotPlanner.floats(solve.matrix)
+            val n = ShotPlanner.floats(solve.neutral)
+            val st = sr.stats(m, n, 2 * ColourMath.STATS_STEP)
+            timings["stats"] = SystemClock.elapsedRealtime() - t1
+            t1 = SystemClock.elapsedRealtime()
+            val tn = ShotPlanner.tone(t, st.medianY, median)
+            val table = tn.table
+            timings["plan"] = SystemClock.elapsedRealtime() - t1
+            t1 = SystemClock.elapsedRealtime()
+            val out = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+            val err = sr.render(
+                m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), l, threads(), out
+            )
+            timings["render"] = SystemClock.elapsedRealtime() - t1
+            timings["total"] = SystemClock.elapsedRealtime() - t0
+            if (err != null) {
+                out.recycle()
+                return fail("native super-resolution render: $err")
+            }
+            Outcome(
+                out,
+                ColourShot(
+                    rendered = true,
+                    profile = choice.profileId,
+                    cct = solve.cct,
+                    warmth = solve.warmth,
+                    exposureEv = tn.exposure.ev,
+                    exposureMethod = tn.exposure.method,
+                    jpegMedian = median,
+                    clippedFraction = st.clippedFraction,
+                    outSize = Dim(outWidth, outHeight),
+                    timingsMs = timings
+                )
+            )
+        } catch (e: Exception) {
+            fail("${e.javaClass.simpleName}: ${e.message}")
+        } catch (e: OutOfMemoryError) {
+            fail("out of memory")
+        }
+    }
+
+    /** B23: the CFA layout of the camera (Camera2 0..3), or null when it is not a supported Bayer layout. */
+    fun cfaOf(ch: CameraCharacteristics): Int? =
+        runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) }.getOrNull()?.takeIf { it in 0..3 }
 
     /** The RAW samples plus levels (times [scale]), CFA layout and lens shading map from the result and characteristics. */
     private fun rawFrame(raw: RawCopy, result: TotalCaptureResult, ch: CameraCharacteristics, scale: Float): RedlineNative.RawFrame? {

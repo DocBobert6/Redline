@@ -5,7 +5,8 @@ import com.redline.camera.look.CubeLut
 import java.nio.ByteBuffer
 
 /**
- * JNI wrapper for libredline_native.so (B20 LUT parser, B21 RAW colour pipeline, B22 burst merge; app/src/main/cpp). The library is loaded lazily and at most once;
+ * JNI wrapper for libredline_native.so (B20 LUT parser, B21 RAW colour pipeline, B22 burst merge, B23 super-resolution;
+ * app/src/main/cpp). The library is loaded lazily and at most once;
  * a failed load is remembered with its reason (the look preview is then disabled and the report says why) and
  * never crashes the app.
  */
@@ -245,6 +246,195 @@ object RedlineNative {
         val r = nativeBurstSelfCheck(threads)
         return BurstSelfCheck(r[0].toDouble(), r[1].toDouble(), r[2].toDouble())
     }
+
+    // ------------------------------------------------------------------------------------------- B23 super-resolution
+
+    /** Per alternate frame of a super-resolution merge. Displacements and motion in RAW pixels. */
+    class SrFrame(
+        val index: Int,
+        val meanDispPx: Double,
+        val meanSubpixPx: Double,
+        val meanRobustness: Double,
+        val rejectedFraction: Double,
+        val modelResolved: Double,
+        val model: Boolean,
+        val motionYPx: Double,
+        val motionXPx: Double,
+        val alignMs: Double,
+        val robustMs: Double
+    )
+
+    class SrStats(
+        val reference: Int,
+        val frames: Int,
+        /** left, top, width, height of the RAW region read (the crop plus a margin). */
+        val region: IntArray,
+        val coverage: Double,
+        val sigmaG: Double,
+        val sigmaRB: Double,
+        val copyMs: Double,
+        val referenceMs: Double,
+        val alignMs: Double,
+        val robustMs: Double,
+        val gatherMs: Double,
+        val threads: Int,
+        val maxRegionsHeld: Int,
+        val peakNativeMb: Double,
+        val outputMb: Double,
+        val perFrame: List<SrFrame>
+    )
+
+    internal fun srStats(r: FloatArray): SrStats {
+        val per = (SR_HEADER until r.size step SR_PER_FRAME).map { i ->
+            SrFrame(
+                r[i].toInt(), r[i + 1].toDouble(), r[i + 2].toDouble(), r[i + 3].toDouble(), r[i + 4].toDouble(), r[i + 5].toDouble(),
+                r[i + 6] > 0.5f, r[i + 7].toDouble(), r[i + 8].toDouble(), r[i + 9].toDouble(), r[i + 10].toDouble()
+            )
+        }
+        return SrStats(
+            r[0].toInt(), r[1].toInt(), intArrayOf(r[2].toInt(), r[3].toInt(), r[4].toInt(), r[5].toInt()), r[8].toDouble(),
+            r[9].toDouble(), r[10].toDouble(), r[11].toDouble(), r[12].toDouble(), r[13].toDouble(), r[14].toDouble(),
+            r[15].toDouble(), r[16].toInt(), r[17].toInt(), r[18].toDouble(), r[19].toDouble(), per
+        )
+    }
+
+    /**
+     * B23 streaming super-resolution merge of one burst at a 50/70 mm stop: [add] each RAW frame in capture order (the
+     * merger copies the crop region and the frame's buffer is free again at once), [finish] (gathers every frame onto the
+     * output grid, held natively: ~72 MB at 3000 x 2000), then [render] / [stats] on the result. Use from one thread at a
+     * time; always [close].
+     */
+    class SuperResMerger internal constructor(private var handle: Long) : AutoCloseable {
+        fun add(frame: ByteBuffer, rowStrideBytes: Int): IntArray {
+            check(handle != 0L) { "merger closed" }
+            return nativeSrAdd(handle, frame, rowStrideBytes)
+        }
+
+        /** [shading]: a burst frame's lens shading map (Camera2 layout), or null. */
+        fun finish(shading: FloatArray?, shadingRows: Int, shadingCols: Int): SrStats {
+            check(handle != 0L) { "merger closed" }
+            return srStats(nativeSrFinish(handle, shading, shadingRows, shadingCols))
+        }
+
+        /** Exposure statistics of the finished merge (as [rawStats]). */
+        fun stats(matrix: FloatArray, neutral: FloatArray, step: Int): Stats {
+            check(handle != 0L) { "merger closed" }
+            val r = nativeSrStats(handle, matrix, neutral, step)
+            return Stats(r[0].toDouble(), r[1].toDouble(), r[2].toInt())
+        }
+
+        /** Renders the finished merge into [out] (ARGB_8888 at the output size) through B21 stages 4-8; null or the error. */
+        fun render(
+            matrix: FloatArray,
+            neutral: FloatArray,
+            gain: Float,
+            curve: FloatArray,
+            curveLo: Float,
+            curveHi: Float,
+            lut: CubeLut,
+            threads: Int,
+            out: Bitmap
+        ): String? {
+            if (handle == 0L) return "merger closed"
+            return nativeSrRender(handle, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out)
+        }
+
+        override fun close() {
+            if (handle != 0L) {
+                nativeSrDestroy(handle)
+                handle = 0L
+            }
+        }
+    }
+
+    /** A super-resolution merger for [crop] (left, top, width, height, even) to [outWidth] x [outHeight]. Throws like [mergeBurst]. */
+    fun superResMerger(
+        width: Int,
+        height: Int,
+        cfa: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        crop: IntArray,
+        outWidth: Int,
+        outHeight: Int,
+        reference: Int,
+        threads: Int
+    ): SuperResMerger {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        return SuperResMerger(
+            nativeSrCreate(width, height, cfa, black, white, noiseS, noiseO, null, 0, 0, crop, outWidth, outHeight, reference, threads)
+        )
+    }
+
+    class SrSelfCheck(
+        val flowErrorPx: Double,
+        val coverage: Double,
+        val rmseMerge: Double,
+        val rmseSingle: Double,
+        val gain: Double,
+        val ms: Double
+    )
+
+    /** The native synthetic super-resolution check (known sub-pixel shifts, grating on texture). Throws like [mergeBurst]. */
+    fun superResSelfCheck(threads: Int): SrSelfCheck {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        val r = nativeSrSelfCheck(threads)
+        return SrSelfCheck(r[0].toDouble(), r[1].toDouble(), r[2].toDouble(), r[3].toDouble(), r[4].toDouble(), r[5].toDouble())
+    }
+
+    internal const val SR_HEADER = 20
+    internal const val SR_PER_FRAME = 11
+
+    @JvmStatic
+    private external fun nativeSrCreate(
+        width: Int,
+        height: Int,
+        cfa: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        shading: FloatArray?,
+        shadingRows: Int,
+        shadingCols: Int,
+        crop: IntArray,
+        outWidth: Int,
+        outHeight: Int,
+        reference: Int,
+        threads: Int
+    ): Long
+
+    @JvmStatic
+    private external fun nativeSrAdd(handle: Long, frame: ByteBuffer, rowStrideBytes: Int): IntArray
+
+    @JvmStatic
+    private external fun nativeSrFinish(handle: Long, shading: FloatArray?, shadingRows: Int, shadingCols: Int): FloatArray
+
+    @JvmStatic
+    private external fun nativeSrStats(handle: Long, matrix: FloatArray, neutral: FloatArray, step: Int): FloatArray
+
+    @JvmStatic
+    private external fun nativeSrRender(
+        handle: Long,
+        matrix: FloatArray,
+        neutral: FloatArray,
+        gain: Float,
+        curve: FloatArray,
+        curveLo: Float,
+        curveHi: Float,
+        lut: FloatArray,
+        lutSize: Int,
+        threads: Int,
+        out: Bitmap
+    ): String?
+
+    @JvmStatic
+    private external fun nativeSrDestroy(handle: Long)
+
+    @JvmStatic
+    private external fun nativeSrSelfCheck(threads: Int): FloatArray
 
     private const val MERGE_HEADER = 12
     private const val MERGE_PER_FRAME = 7

@@ -4,12 +4,15 @@
 //   raw_pipeline_tool render <params.txt> <out.rgb>   writes outWidth x outHeight RGB8, row-major, no padding
 //   raw_pipeline_tool renderf <params.txt> <out.f32>  the same render as float32 RGB (parity before 8-bit rounding)
 //   raw_pipeline_tool stats  <params.txt>             prints "median_y clipped_fraction cells"
+//   raw_pipeline_tool linearf <params.txt> <out.f32>  B23: stages 4-8 on planar linear camera RGB (key "linear")
+//   raw_pipeline_tool linearstats <params.txt>        B23: the statistics of that linear image
 //
 // params.txt is whitespace-separated "key value..." records:
 //   width W  height H  cfa C  black B0 B1 B2 B3  white WL  raw PATH (uint16 little-endian, W*H, no padding)
 //   shading ROWS COLS PATH (float32 ROWS*COLS*4, Camera2 order) | shading none
 //   crop L T W H  out OW OH  matrix M0..M8  neutral N0 N1 N2  gain G
 //   curve N LO HI PATH (float32 N)  cube PATH (.cube file)  threads T  step S
+//   linear W H PATH (float32 planar R, G, B planes of W*H; the linear modes need no raw)
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -52,6 +55,8 @@ int main(int argc, char** argv) {
     redline::CubeLut lut;
     std::string rawPath, shadingPath, curvePath, cubePath;
     int step = 8;
+    int linW = 0, linH = 0;
+    std::string linPath;
     std::string key;
     while (pf >> key) {
         if (key == "width") pf >> in.width;
@@ -75,10 +80,26 @@ int main(int argc, char** argv) {
         else if (key == "cube") pf >> cubePath;
         else if (key == "threads") pf >> spec.threads;
         else if (key == "step") pf >> step;
+        else if (key == "linear") pf >> linW >> linH >> linPath;
         else return fail("unknown key " + key);
     }
+    const bool linearMode = mode == "linearf" || mode == "linearstats";
+    std::vector<float> linear;
+    redline::LinearRgb lin;
+    if (linearMode) {
+        const std::size_t plane = static_cast<std::size_t>(linW) * linH;
+        if (!readBinary(linPath, linear, plane * 3)) return fail("cannot read linear image");
+        lin = redline::LinearRgb{linear.data(), linW, linH, static_cast<std::size_t>(linW), plane};
+    }
+    if (mode == "linearstats") {
+        redline::RawStats st;
+        const std::string err = redline::linearStats(lin, spec.colour, step, st);
+        if (!err.empty()) return fail(err);
+        std::printf("%.9g %.9g %d\n", st.medianY, st.clippedFraction, st.cells);
+        return 0;
+    }
     in.rowStride = in.width;
-    if (!readBinary(rawPath, raw, static_cast<std::size_t>(in.width) * in.height)) return fail("cannot read raw");
+    if (!linearMode && !readBinary(rawPath, raw, static_cast<std::size_t>(in.width) * in.height)) return fail("cannot read raw");
     in.data = raw.data();
     if (in.shadingRows > 0) {
         if (!readBinary(shadingPath, shading, static_cast<std::size_t>(in.shadingRows) * in.shadingCols * 4)) {
@@ -93,7 +114,7 @@ int main(int argc, char** argv) {
         std::printf("%.9g %.9g %d\n", st.medianY, st.clippedFraction, st.cells);
         return 0;
     }
-    if ((mode != "render" && mode != "renderf") || argc < 4) return fail("render needs an output path");
+    if ((mode != "render" && mode != "renderf" && mode != "linearf") || argc < 4) return fail("render needs an output path");
     if (!readBinary(curvePath, curve, static_cast<std::size_t>(spec.curvePoints))) return fail("cannot read curve");
     spec.curve = curve.data();
     std::ifstream cf(cubePath, std::ios::binary);
@@ -108,7 +129,14 @@ int main(int argc, char** argv) {
     const std::size_t pixels = static_cast<std::size_t>(spec.outWidth) * spec.outHeight;
     std::ofstream of(argv[3], std::ios::binary);
     double ms = 0.0;
-    if (mode == "renderf") {
+    if (mode == "linearf") {
+        std::vector<float> rgb(pixels * 3);
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string err = redline::renderLinearFloat(lin, spec, rgb.data(), static_cast<std::size_t>(spec.outWidth) * 3);
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!err.empty()) return fail(err);
+        of.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size() * sizeof(float)));
+    } else if (mode == "renderf") {
         std::vector<float> rgb(pixels * 3);
         const auto t0 = std::chrono::steady_clock::now();
         const std::string err = redline::renderRawFloat(in, spec, rgb.data(), static_cast<std::size_t>(spec.outWidth) * 3);

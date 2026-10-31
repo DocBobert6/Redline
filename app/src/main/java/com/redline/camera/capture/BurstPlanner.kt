@@ -127,8 +127,8 @@ object BurstPlanner {
         if (i.pressesWaiting > 0) return single("presses waiting (single frame keeps the shutter free)")
         if (i.burstsQueued >= MAX_QUEUED_BURSTS) return single("queue full ($MAX_QUEUED_BURSTS bursts pending)")
         val manual = i.manualIso != null && i.manualExposureNs != null
-        val baseIso = if (manual) i.manualIso!! else i.meteredIso ?: return single("no metered exposure yet")
-        val baseExp = if (manual) i.manualExposureNs!! else i.meteredExposureNs ?: return single("no metered exposure yet")
+        val baseIso = if (manual) i.manualIso else i.meteredIso ?: return single("no metered exposure yet")
+        val baseExp = if (manual) i.manualExposureNs else i.meteredExposureNs ?: return single("no metered exposure yet")
         val (isoLo, isoHi) = i.isoRange
         val (expLo, expHi) = i.exposureRangeNs
         var iso = baseIso.coerceIn(isoLo, isoHi)

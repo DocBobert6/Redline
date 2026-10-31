@@ -111,7 +111,9 @@ data class ShotResult(
      * B22b: the press or shot ended without a photo for a reason that is not a capture failure: the user left the
      * viewfinder, the session was rebuilt under it, or (with [shutterBlocked]) the waiting queue was full.
      */
-    val dropped: String? = null
+    val dropped: String? = null,
+    /** B23: the 50/70 mm super-resolution step (merged, or upscaled and why); null at other stops or with it off. */
+    val superRes: SuperResShot? = null
 ) {
     fun summary(): String = when {
         dropped != null && shutterBlocked -> "Not taken: $dropped"
