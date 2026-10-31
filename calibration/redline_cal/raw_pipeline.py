@@ -380,6 +380,24 @@ def raw_stats(frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) ->
     return {"median_y": float(np.median(yv)), "clipped_fraction": clipped, "cells": int(yv.size)}
 
 
+def render_linear(rgb_camera: np.ndarray, matrix, neutral, curve: ToneCurve, lut: np.ndarray) -> np.ndarray:
+    """B23: stages 4-8 on camera RGB that is already on the output grid (the super-resolution merge's normalised,
+    shading-corrected values, ``superres.merge``): balance + clip, matrix, tone curve, LUT. Nothing is resampled."""
+    c = np.clip(np.asarray(rgb_camera, float) / np.asarray(neutral, float), 0.0, 1.0)
+    lin = c @ np.asarray(matrix, float).T
+    y = curve(curve.gain * lin)
+    return np.clip(apply_lut(y, lut), 0.0, 1.0)
+
+
+def linear_stats(rgb_camera: np.ndarray, neutral, matrix, step: int = 2 * STATS_STEP) -> dict:
+    """B23: ``raw_stats`` for camera RGB on the output grid: every ``step``-th pixel in each direction from (0, 0)."""
+    c = np.asarray(rgb_camera, float)[::step, ::step] / np.asarray(neutral, float)
+    clipped = float(np.mean(np.any(c >= 1.0, axis=-1)))
+    lin = np.clip(c, 0.0, 1.0) @ np.asarray(matrix, float).T
+    yv = (lin @ LUMA).reshape(-1)
+    return {"median_y": float(np.median(yv)), "clipped_fraction": clipped, "cells": int(yv.size)}
+
+
 def quantise8(rgb_encoded: np.ndarray) -> np.ndarray:
     """The reference rendered to the app's output encoding (8-bit sRGB), for the parity gate."""
     return np.round(np.clip(np.asarray(rgb_encoded, float), 0.0, 1.0) * 255.0) / 255.0

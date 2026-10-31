@@ -84,14 +84,15 @@ jobs:
           python-version: "3.12"
       - run: pip install -r calibration/requirements-ci.txt rawpy
 
-      # B21/B22: host builds of the native RAW pipeline and burst merge, for the Python parity tests
-      # (tests/test_raw_pipeline.py, tests/test_burst_merge.py).
-      - name: Build native RAW pipeline + burst merge host tools
+      # B21/B22/B23: host builds of the native RAW pipeline, burst merge and super-resolution merge, for the Python
+      # parity tests (tests/test_raw_pipeline.py, tests/test_burst_merge.py, tests/test_superres.py).
+      - name: Build native RAW pipeline + burst merge + super-resolution host tools
         run: |
           cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool
+          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool superres_tool
           echo "REDLINE_RAW_TOOL=$PWD/build/native-host/raw_pipeline_tool" >> "$GITHUB_ENV"
           echo "REDLINE_BURST_TOOL=$PWD/build/native-host/burst_merge_tool" >> "$GITHUB_ENV"
+          echo "REDLINE_SR_TOOL=$PWD/build/native-host/superres_tool" >> "$GITHUB_ENV"
           echo "REDLINE_REQUIRE_NATIVE=1" >> "$GITHUB_ENV"
 
       - name: Cache real-file fixtures

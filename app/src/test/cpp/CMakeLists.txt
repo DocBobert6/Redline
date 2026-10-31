@@ -40,3 +40,15 @@ add_executable(burst_merge_tool burst_merge_tool.cpp ${NATIVE_SRC}/burst_merge.c
 target_include_directories(burst_merge_tool PRIVATE ${NATIVE_SRC})
 target_compile_options(burst_merge_tool PRIVATE -Wall -Wextra -Werror -O3)
 target_link_libraries(burst_merge_tool PRIVATE Threads::Threads)
+
+# B23 super-resolution merge: invariants and the self-check (CTest), and the host tool the Python parity test drives.
+add_executable(superres_test superres_test.cpp ${NATIVE_SRC}/superres.cpp ${NATIVE_SRC}/burst_merge.cpp ${NATIVE_SRC}/raw_pipeline.cpp)
+target_include_directories(superres_test PRIVATE ${NATIVE_SRC})
+target_compile_options(superres_test PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(superres_test PRIVATE Threads::Threads)
+add_test(NAME superres COMMAND superres_test)
+
+add_executable(superres_tool superres_tool.cpp ${NATIVE_SRC}/superres.cpp ${NATIVE_SRC}/burst_merge.cpp ${NATIVE_SRC}/raw_pipeline.cpp)
+target_include_directories(superres_tool PRIVATE ${NATIVE_SRC})
+target_compile_options(superres_tool PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(superres_tool PRIVATE Threads::Threads)

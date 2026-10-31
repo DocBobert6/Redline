@@ -22,10 +22,22 @@ size (Wo, Ho), normally larger than the crop (3000 x 2000 at 50 and 70 mm).
 3. align      B22 coarse-to-fine integer tile alignment (``burst_merge.align``) on the region's grey pyramid: per
               fine tile (16 x 16 grey px at stride 8, tile i centred on grey 8 i = RAW 16 i), (dy, dx) in grey px
               (alt(q + d) ~ ref(q)).
-4. sub-pixel  per tile, the L2 tile distance D(d) of ``burst_merge`` (inside pixels, clamped alternate; exact
-              integers) at d, d +- (0, 1) and d +- (1, 0); per axis o = (D- - D+) / (2 (D- - 2 D0 + D+)) when the
-              denominator is > 0, else 0, clamped to +-SUBPIX_CLAMP. Flow in RAW px: f = 2 (d + o).
-5. flow       f at any RAW position (y, x) of the region is the bilinear interpolation of the tile flows at the tile
+4. sub-pixel  per tile, LK_ITERS Gauss-Newton steps of inverse compositional Lucas-Kanade on the grey level, from the
+              integer displacement: gradients of the reference by central differences (zero on the border rows and
+              columns), over the tile's inside pixels that are not on the border; H = sum J J^T plus LK_REG trace(H) on the
+              diagonal; per step e = alt(q + d) - ref(q) with alt sampled bilinearly (clamped), d -= H^-1 sum J e, then d
+              is clamped to +-SUBPIX_CLAMP of the start. The tile's texture strength is the smaller eigenvalue of the
+              unregularised H. Flow in RAW px: f = 2 d.
+5. motion     the frame's global motion: an affine flow f(y, x) = [1, y / MODEL_SCALE, x / MODEL_SCALE] P fitted to the
+              flows of the tiles wholly inside the region, weighted by texture strength (tiles below MODEL_MIN_STRENGTH x
+              the strongest get no weight): start from the weighted median translation, then weighted least squares on
+              the tiles within each band of MODEL_BANDS of the current prediction (max-abs per axis; fewer than
+              MODEL_MIN_TILES tiles: no model). A tile whose flow is more than MODEL_TOL RAW px (either axis) from the
+              model takes the model's flow. This is what keeps periodic detail (fabric, brick, a resolution chart)
+              usable: above a quarter cycle per RAW px the grey level aliases, the tile search and LK lock onto the
+              alias, and the frame's motion, seen on the textured tiles, is the only right answer there. A subject that
+              really moved also takes the global flow and is then rejected by the robustness step.
+   flow       f at any RAW position (y, x) of the region is the bilinear interpolation of the tile flows at the tile
               centres (16 i, 16 j): fi = y / 16, i0 = clip(floor(fi), 0, nty - 2), t = clip(fi - i0, 0, 1) (same in x).
 6. robustness per alternate frame, at quad (grey) resolution: g = (L0 / 4 - mean(black)) / range for the reference,
               and for the alternate its grey sampled bilinearly (clamped) at q + f(2 q + 0.5) / 2. 3x3 box means
@@ -40,8 +52,12 @@ size (Wo, Ho), normally larger than the crop (3000 x 2000 at 50 and 70 mm).
               floor(ay) - 1 .. floor(ay) + 2 (mirror, reflect-101, into the region, which keeps the CFA phase), each
               add to their own colour c: num_c += w v, den_c += w, with
               w = R * K_c(ky - 1 - qy / KERNEL_Q) * K_c(kx - 1 - qx / KERNEL_Q), q = floor(KERNEL_Q (a - floor(a)) + 0.5)
-              (the sub-pixel phase quantised to 1/64 px), K_c(t) = exp(-t^2 / (2 sigma_c^2)), sigma = SIGMA_G for green,
-              SIGMA_RB for red and blue. v = (raw - black[p]) / (white - black[p]) * shade (as B21 stage 1).
+              (the sub-pixel phase quantised to 1/64 px), K_c(t) = exp(-t^2 / (2 sigma_c^2)), sigma_c from the burst's
+              coverage (``kernel_sigmas``): SIGMA_G / SIGMA_RB (green / red and blue) at coverage >= COV_HI, the wide
+              SIGMA_WIDE_G / SIGMA_WIDE_RB (close to a plain demosaic's sharpness) at <= COV_LO, linear between. A narrow
+              kernel is what resolves detail beyond the sensor's Nyquist, but only where other frames filled the gaps
+              between same-colour samples; a tripod burst or a single frame needs the wide one.
+              v = (raw - black[p]) / (white - black[p]) * shade (as B21 stage 1).
 8. output     rgb_c = num_c / den_c: normalised, shading-corrected camera RGB (B21's stage-1/2 values, not yet
               balanced or clipped) on the Wo x Ho grid of the crop. It goes into the B21 pipeline from stage 4
               (``raw_pipeline.render_linear``): balance + clip, matrix, tone curve, LUT; nothing is resampled.
@@ -49,9 +65,16 @@ size (Wo, Ho), normally larger than the crop (3000 x 2000 at 50 and 70 mm).
 Streaming: steps 1-6 run per frame on arrival (the region is copied and the frame's buffer handed back); step 7 runs
 once all frames are in, over all frames at once (so no full-size accumulator is needed).
 
-Sub-pixel coverage (reported): per interior tile, the RAW-px phases (f mod 2) of all frames (reference 0) fall into
-4 x 4 bins of 0.5 px; coverage = mean over tiles of (bins hit) / min(16, N). A tripod burst covers one bin (1/N):
-the merge then is a denoise + kernel upscale with no real resolution gain.
+Sub-pixel coverage: per interior tile, the RAW-px phases of all frames (reference 0) fall into 4 x 4 bins of 0.5 px
+centred on 0, 0.5, 1, 1.5 (floor(mod(f + 0.25, 2) * 2)); coverage = (mean over tiles of bins hit - 1) / (min(16, N) - 1),
+so 0 for a tripod burst or one frame and 1 when every frame landed on its own phase. Low coverage widens the kernel
+(step 7) and is reported: the merge is then a denoise + kernel upscale with no real resolution gain.
+
+Measured (synthetic, ``tests/test_superres.py`` and calibration/tools/superres_quality.py): MTF10 of luma on a grating
+blended into texture, 8 or 12 frames with random handheld shifts up to 3 RAW px: ~0.77 cycles/RAW px for the merge
+against ~0.55 for one frame demosaicked and upscaled, so about 1.4x linear (the plan's 1.5-2x estimate is not reached
+by this metric without sharpening; the 1 px pixel aperture caps it near 0.8). Error against the true scene on texture:
+1.5-1.75x lower than one frame upscaled.
 """
 from __future__ import annotations
 
@@ -65,10 +88,21 @@ from . import burst_merge as bm
 from .raw_pipeline import CFA_LAYOUTS, RawFrame, shading_gain_image
 
 MARGIN = 64
-SUBPIX_CLAMP = 0.5
+SUBPIX_CLAMP = 1.0
+LK_ITERS = 3
+LK_REG = 0.01
+MODEL_SCALE = 1000.0  # RAW px per unit of the affine model's y and x terms (conditioning)
+MODEL_MIN_STRENGTH = 0.05
+MODEL_MIN_TILES = 12
+MODEL_BANDS = (3.0, 1.5, 1.0)
+MODEL_TOL = 0.5
 KERNEL_Q = 64
-SIGMA_G = 0.25  # WIP: provisional (synthetic MTF sweep 2026-10-31), not final
-SIGMA_RB = 0.35  # WIP: provisional
+SIGMA_G = 0.25
+SIGMA_RB = 0.35
+SIGMA_WIDE_G = 0.65
+SIGMA_WIDE_RB = 0.75
+COV_LO = 0.2
+COV_HI = 0.45
 ROB_KN = 3.0
 ROB_KL = 1.0
 OUTPUT_LONG = 3000  # 3000 x 2000 (6 MP) at 50 and 70 mm (PLAN 5)
@@ -86,30 +120,119 @@ def region_of(crop, width: int, height: int) -> tuple[int, int, int, int]:
     return rl, rt, rr - rl, rb - rt
 
 
-def tile_cost_l2(ref0: np.ndarray, alt0: np.ndarray, grid: bm.TileGrid, disp: np.ndarray) -> np.ndarray:
-    """B22 L2 tile distance per tile (exact integers) for the displacement field ``disp`` (nty, ntx, 2)."""
+def bilinear(img: np.ndarray, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Bilinear sample of ``img`` at (y, x), coordinates clamped to the image (needs h, w >= 2)."""
+    h, w = img.shape
+    y = np.clip(y, 0.0, h - 1.0)
+    x = np.clip(x, 0.0, w - 1.0)
+    y0 = np.minimum(np.floor(y).astype(np.int64), h - 2)
+    x0 = np.minimum(np.floor(x).astype(np.int64), w - 2)
+    ty, tx = y - y0, x - x0
+    return (img[y0, x0] * (1 - ty) * (1 - tx) + img[y0, x0 + 1] * (1 - ty) * tx + img[y0 + 1, x0] * ty * (1 - tx)
+            + img[y0 + 1, x0 + 1] * ty * tx)
+
+
+def lucas_kanade(ref0, alt0, grid, start: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-tile displacement (nty, ntx, 2) in grey px refined from ``start`` (float, grey px) by LK_ITERS Gauss-Newton
+    (inverse compositional Lucas-Kanade) steps, kept within +-SUBPIX_CLAMP of ``start``; and the tile's texture
+    strength (the smaller eigenvalue of its gradient matrix), which weights the motion model fit."""
     h, w = ref0.shape
+    r = ref0.astype(np.float64)
+    a = alt0.astype(np.float64)
+    gy = np.zeros_like(r)
+    gx = np.zeros_like(r)
+    gy[1:-1] = (r[2:] - r[:-2]) * 0.5
+    gx[:, 1:-1] = (r[:, 2:] - r[:, :-2]) * 0.5
     yy, xx, inside = bm._tile_coords(grid, h, w)
-    rv = np.where(inside, ref0[np.clip(yy, 0, h - 1), np.clip(xx, 0, w - 1)], 0).astype(np.int64)
-    ay = np.clip(yy + disp[..., 0][:, :, None, None], 0, h - 1)
-    ax = np.clip(xx + disp[..., 1][:, :, None, None], 0, w - 1)
-    d = np.where(inside, rv - alt0[ay, ax].astype(np.int64), 0)
-    return (d * d).sum(axis=(2, 3))
+    inside = inside & (yy >= 1) & (yy <= h - 2) & (xx >= 1) & (xx <= w - 2)
+    yc = np.clip(yy, 0, h - 1)
+    xc = np.clip(xx, 0, w - 1)
+    jy = np.where(inside, gy[yc, xc], 0.0)
+    jx = np.where(inside, gx[yc, xc], 0.0)
+    hyy = (jy * jy).sum((2, 3))
+    hxx = (jx * jx).sum((2, 3))
+    hxy = (jy * jx).sum((2, 3))
+    strength = 0.5 * (hyy + hxx - np.sqrt((hyy - hxx) ** 2 + 4.0 * hxy * hxy))
+    reg = LK_REG * (hyy + hxx)
+    hyy = hyy + reg
+    hxx = hxx + reg
+    det = hyy * hxx - hxy * hxy
+    ok = det > 0.0
+    sdet = np.where(ok, det, 1.0)
+    rv = np.where(inside, r[yc, xc], 0.0)
+    start = np.asarray(start, dtype=np.float64)
+    d = start.copy()
+    for _ in range(LK_ITERS):
+        py = yy + d[..., 0][:, :, None, None]
+        px = xx + d[..., 1][:, :, None, None]
+        e = np.where(inside, bilinear(a, py, px) - rv, 0.0)
+        by = (jy * e).sum((2, 3))
+        bx = (jx * e).sum((2, 3))
+        d[..., 0] -= np.where(ok, (hxx * by - hxy * bx) / sdet, 0.0)
+        d[..., 1] -= np.where(ok, (hyy * bx - hxy * by) / sdet, 0.0)
+        d = np.clip(d, start - SUBPIX_CLAMP, start + SUBPIX_CLAMP)
+    return d, strength
 
 
-def subpixel(ref0, alt0, grid, disp) -> np.ndarray:
-    """Per-tile sub-pixel offsets (nty, ntx, 2) in grey px from parabola fits of the L2 distance."""
-    c0 = tile_cost_l2(ref0, alt0, grid, disp).astype(np.float64)
-    out = np.zeros(disp.shape, dtype=np.float64)
-    for axis in (0, 1):
-        e = np.zeros(2, dtype=np.int64)
-        e[axis] = 1
-        cm = tile_cost_l2(ref0, alt0, grid, disp - e).astype(np.float64)
-        cp = tile_cost_l2(ref0, alt0, grid, disp + e).astype(np.float64)
-        den = 2.0 * (cm - 2.0 * c0 + cp)
-        o = np.where(den > 0, (cm - cp) / np.where(den > 0, den, 1.0), 0.0)
-        out[..., axis] = np.clip(o, -SUBPIX_CLAMP, SUBPIX_CLAMP)
-    return out
+def tile_centres_raw(grid: bm.TileGrid) -> tuple[np.ndarray, np.ndarray]:
+    """RAW coordinates of the fine tile centres (16 i, 16 j)."""
+    return 2.0 * grid.cy.astype(np.float64), 2.0 * grid.cx.astype(np.float64)
+
+
+def fit_motion(flow: np.ndarray, strength: np.ndarray, grid: bm.TileGrid, h0: int, w0: int) -> np.ndarray | None:
+    """The frame's global motion: an affine flow f(y, x) = [1, y, x] P (RAW px, P is 3 x 2), fitted robustly to the
+    interior tile flows weighted by texture strength. None when too few textured tiles agree."""
+    cy, cx = tile_centres_raw(grid)
+    iy = (grid.oy >= 0) & (grid.oy + bm.FINE_TILE <= h0)
+    ix = (grid.ox >= 0) & (grid.ox + bm.FINE_TILE <= w0)
+    Y, X = np.meshgrid(cy, cx, indexing="ij")
+    sel = iy[:, None] & ix[None, :]
+    wt = np.where(sel, strength, 0.0)
+    if wt.max() <= 0:
+        return None
+    wt = np.where(wt >= MODEL_MIN_STRENGTH * wt.max(), wt, 0.0)
+    f = flow.reshape(-1, 2)
+    w = wt.reshape(-1)
+    a = np.stack([np.ones(w.size), Y.reshape(-1) / MODEL_SCALE, X.reshape(-1) / MODEL_SCALE], axis=1)
+    # Start: the weighted median translation; then affine fits on the tiles that agree, tightening the band.
+    t = np.empty(2)
+    for c in range(2):
+        o = np.argsort(f[:, c])
+        cw = np.cumsum(w[o])
+        t[c] = f[o[np.searchsorted(cw, 0.5 * cw[-1])], c]
+    pred = np.broadcast_to(t, f.shape)
+    p = None
+    for band in MODEL_BANDS:
+        inl = (np.abs(f - pred).max(axis=1) <= band) & (w > 0)
+        if inl.sum() < MODEL_MIN_TILES:
+            return None
+        sw = np.sqrt(w[inl])[:, None]
+        p, *_ = np.linalg.lstsq(a[inl] * sw, f[inl] * sw, rcond=None)
+        pred = a @ p
+    return p
+
+
+def motion_flow(p: np.ndarray, y, x):
+    """Flow (fy, fx) of the motion model at RAW positions."""
+    return (p[0, 0] + p[1, 0] * (y / MODEL_SCALE) + p[2, 0] * (x / MODEL_SCALE),
+            p[0, 1] + p[1, 1] * (y / MODEL_SCALE) + p[2, 1] * (x / MODEL_SCALE))
+
+
+def frame_flow(ref0, alt0, grid, disp) -> tuple[np.ndarray, float]:
+    """Steps 4-5: tile flows in RAW px (nty, ntx, 2) and the fraction of tiles re-solved from the motion model."""
+    h0, w0 = ref0.shape
+    d1, strength = lucas_kanade(ref0, alt0, grid, disp.astype(np.float64))
+    flow = 2.0 * d1
+    p = fit_motion(flow, strength, grid, h0, w0)
+    if p is None:
+        return flow, 0.0
+    cy, cx = tile_centres_raw(grid)
+    Y, X = np.meshgrid(cy, cx, indexing="ij")
+    my, mx = motion_flow(p, Y, X)
+    model = np.stack([my, mx], axis=-1)
+    off = np.abs(flow - model).max(axis=-1) > MODEL_TOL
+    flow = np.where(off[..., None], model, flow)
+    return flow, float(off.mean())
 
 
 def interp_flow(flow: np.ndarray, y: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -180,6 +303,7 @@ class SrFrameStats:
     mean_abs_subpix: float  # mean |o| in RAW px
     mean_robustness: float
     rejected_fraction: float  # quads with R < 0.5
+    model_resolved: float = 0.0  # tiles whose flow disagreed with the frame's motion model and were re-solved from it
 
 
 @dataclass
@@ -191,9 +315,13 @@ class SrResult:
     displacements: dict = field(default_factory=dict)  # frame index -> integer (nty, ntx, 2) grey px
     frames: list = field(default_factory=list)
     coverage: float = 0.0
+    sigma: tuple = (SIGMA_G, SIGMA_RB)
 
 
 def coverage(flows: dict, n_frames: int, grid: bm.TileGrid, h0: int, w0: int, margin: int = 16) -> float:
+    """Sub-pixel diversity of the burst, 0 (every frame on the reference's phase: a tripod, or one frame) to 1."""
+    if n_frames < 2 or not flows:
+        return 0.0
     iy = (grid.oy >= margin) & (grid.oy + bm.FINE_TILE <= h0 - margin)
     ix = (grid.ox >= margin) & (grid.ox + bm.FINE_TILE <= w0 - margin)
     if not iy.any() or not ix.any():
@@ -203,11 +331,17 @@ def coverage(flows: dict, n_frames: int, grid: bm.TileGrid, h0: int, w0: int, ma
     hits = np.zeros((nty, ntx, 16), dtype=bool)
     hits[..., 0] = True  # the reference: phase (0, 0)
     for f in flows.values():
-        by = np.floor(np.mod(f[..., 0], 2.0) * 2.0).astype(np.int64) % 4
-        bx = np.floor(np.mod(f[..., 1], 2.0) * 2.0).astype(np.int64) % 4
+        by = np.floor(np.mod(f[..., 0] + 0.25, 2.0) * 2.0).astype(np.int64) % 4
+        bx = np.floor(np.mod(f[..., 1] + 0.25, 2.0) * 2.0).astype(np.int64) % 4
         hits[np.arange(nty)[:, None], np.arange(ntx)[None, :], by * 4 + bx] = True
     sel = hits[np.ix_(iy, ix)]
-    return float(sel.sum(axis=-1).mean() / min(16, n_frames))
+    return float((sel.sum(axis=-1).mean() - 1.0) / (min(16, n_frames) - 1))
+
+
+def kernel_sigmas(cov: float) -> tuple[float, float]:
+    """(sigma green, sigma red/blue): narrow for a well-spread burst, wide (close to a plain demosaic) without spread."""
+    s = min(max((cov - COV_LO) / (COV_HI - COV_LO), 0.0), 1.0)
+    return SIGMA_WIDE_G + s * (SIGMA_G - SIGMA_WIDE_G), SIGMA_WIDE_RB + s * (SIGMA_RB - SIGMA_WIDE_RB)
 
 
 def merge(frames: list[np.ndarray], cfa: int, black, white: float, noise_s: float, noise_o: float, crop, out_size,
@@ -234,8 +368,8 @@ def merge(frames: list[np.ndarray], cfa: int, black, white: float, noise_s: floa
         if i == ref_i:
             continue
         d = bm.align(pyrs[ref_i], pyrs[i])
-        o = subpixel(ref0, pyrs[i][0], g0, d)
-        flow = 2.0 * (d + o)
+        flow, resolved = frame_flow(ref0, pyrs[i][0], g0, d)
+        o = flow / 2.0 - d
         if known_shifts is not None:
             flow = np.empty(d.shape, dtype=np.float64)
             flow[..., 0] = known_shifts[ref_i][0] - known_shifts[i][0]
@@ -246,7 +380,8 @@ def merge(frames: list[np.ndarray], cfa: int, black, white: float, noise_s: floa
         r = robustness(ref0, pyrs[i][0], flow, black_mean, rng, noise_s, noise_o)
         robs[i] = r
         mag = np.abs(d).max(axis=-1) * 2.0
-        res.frames.append(SrFrameStats(i, float(mag.mean()), float(np.abs(2.0 * o).mean()), float(r.mean()), float((r < 0.5).mean())))
+        res.frames.append(SrFrameStats(i, float(mag.mean()), float(np.abs(2.0 * o).mean()), float(r.mean()), float((r < 0.5).mean()),
+                                       resolved if known_shifts is None else 0.0))
     res.coverage = coverage(res.flows, len(frames), g0, h0, w0)
 
     # Normalisation of the region (B21 stage 1).
@@ -260,7 +395,9 @@ def merge(frames: list[np.ndarray], cfa: int, black, white: float, noise_s: floa
     colour = np.empty((rh, rw), np.int64)
     for p in range(4):
         colour[p >> 1 :: 2, p & 1 :: 2] = layout[p]
-    tables = {0: kernel_table(SIGMA_G), 1: kernel_table(SIGMA_RB)}
+    sg, srb = kernel_sigmas(res.coverage)
+    res.sigma = (sg, srb)
+    tables = {0: kernel_table(sg), 1: kernel_table(srb)}
 
     oy = np.arange(ho, dtype=np.float64)
     ox = np.arange(wo, dtype=np.float64)
@@ -416,3 +553,107 @@ def random_shifts(n: int, seed: int = 5, span: float = 3.0, still: bool = False)
         else:
             out.append((float(rs.uniform(-span, span)), float(rs.uniform(-span, span))))
     return out
+
+
+# ------------------------------------------------------------------------------------------- textured bursts
+
+SUPERSAMPLE = 4  # the continuous scene is drawn at 4x the RAW resolution
+
+
+def hires_scene(h: int, w: int, seed: int = 1, grating=None) -> np.ndarray:
+    """A linear RGB scene at SUPERSAMPLE x the RAW resolution (h, w in RAW px): the B22 synthetic texture, upsampled
+    (cubic), and optionally a grey grating (f cycles/RAW px, angle theta, amplitude) over the central quarter with the
+    texture's fine detail kept on it, so the tiles on the grating still see the scene's motion."""
+    os_ = SUPERSAMPLE
+    s = bm.synthetic_scene(h + 8, w + 8, seed=seed)
+    big = np.clip(np.stack([ndimage.zoom(s[..., c], os_, order=3) for c in range(3)], -1), 0.0, 1.0)
+    if grating is not None:
+        f, th, amp = grating
+        hh, ww = big.shape[:2]
+        yy, xx = np.mgrid[0:hh, 0:ww] / os_
+        g = 0.45 + amp * np.cos(2.0 * math.pi * (f * math.cos(th) * xx + f * math.sin(th) * yy))
+        lum = big.mean(-1)
+        g = g + 0.5 * (lum - ndimage.uniform_filter(lum, 64))
+        m = np.zeros((hh, ww), bool)
+        m[hh // 4 : 3 * hh // 4, ww // 4 : 3 * ww // 4] = True
+        big[m] = g[m][:, None]
+    return big
+
+
+def render_shifted(big: np.ndarray, sy: float, sx: float, h: int, w: int) -> np.ndarray:
+    """RAW-resolution RGB of the scene shifted by (sy, sx) RAW px, each pixel integrating its 1 x 1 RAW px area."""
+    os_ = SUPERSAMPLE
+    sh = np.stack([ndimage.shift(big[..., c], (-sy * os_, -sx * os_), order=3, mode="reflect") for c in range(3)], -1)
+    return sh[: h * os_, : w * os_].reshape(h, os_, w, os_, 3).mean(axis=(1, 3))
+
+
+def scene_truth(big: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+    """The scene integrated over 1 RAW px boxes centred at RAW coordinates ys x xs (the ideal sensor value there)."""
+    os_ = SUPERSAMPLE
+    box = np.stack([ndimage.uniform_filter(big[..., c], os_, mode="reflect") for c in range(3)], -1)
+    yy, xx = np.meshgrid(ys * os_ + (os_ - 1) / 2.0, xs * os_ + (os_ - 1) / 2.0, indexing="ij")
+    return np.stack([ndimage.map_coordinates(box[..., c], [yy, xx], order=1) for c in range(3)], -1)
+
+
+def textured_burst(big: np.ndarray, shifts, h: int, w: int, black=64.0, white=1023.0, noise_s=2e-4, noise_o=2e-6, seed=3,
+                   moving=None) -> list[np.ndarray]:
+    """RGGB RAW frames of the scene, frame k shifted by shifts[k] (real RAW px), with Poisson-Gaussian noise.
+    ``moving`` = (frame, y, x, size): a bright square only in that frame (a subject that moved)."""
+    rs = np.random.default_rng(seed)
+    out = []
+    for k, (sy, sx) in enumerate(shifts):
+        m = bm.mosaic(render_shifted(big, sy, sx, h, w))
+        if moving is not None and moving[0] == k:
+            _, my, mx, size = moving
+            m[my : my + size, mx : mx + size] = 0.9
+        noisy = m + rs.standard_normal(m.shape) * np.sqrt(np.maximum(noise_s * m + noise_o, 0.0))
+        out.append(np.clip(np.round(noisy * (white - black) + black), 0, white).astype(np.uint16))
+    return out
+
+
+# ------------------------------------------------------------------------------------------- native host tool
+
+
+def native_merge(tool: str, frames: list[np.ndarray], cfa: int, black, white: float, noise_s: float, noise_o: float, crop,
+                 out_size, shading: np.ndarray | None = None, reference: int = -1, threads: int = 4, repeat: int = 1):
+    """Runs the C++ merge through the host tool: (rgb (Ho, Wo, 3), flows {index: (nty, ntx, 2)},
+    displacements {index: (nty, ntx, 2)}, stats dict)."""
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    h, w = frames[0].shape
+    wo, ho = out_size
+    with tempfile.TemporaryDirectory() as d:
+        paths = []
+        for i, f in enumerate(frames):
+            p = os.path.join(d, f"f{i}.u16")
+            np.ascontiguousarray(f, dtype="<u2").tofile(p)
+            paths.append(p)
+        lines = [f"width {w}", f"height {h}", f"cfa {cfa}", "black " + " ".join(f"{b:.9g}" for b in black), f"white {white:.9g}",
+                 f"noise {noise_s:.9g} {noise_o:.9g}", f"threads {threads}", f"reference {reference}",
+                 "crop " + " ".join(str(int(v)) for v in crop), f"out {wo} {ho}", f"repeat {repeat}"]
+        if shading is None:
+            lines.append("shading none")
+        else:
+            sh = np.ascontiguousarray(shading, dtype="<f4")
+            sp = os.path.join(d, "shading.f32")
+            sh.tofile(sp)
+            lines.append(f"shading {sh.shape[0]} {sh.shape[1]} {sp}")
+        lines.append(f"frames {len(paths)} " + " ".join(paths))
+        pp = os.path.join(d, "params.txt")
+        with open(pp, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        op, fp, dp = (os.path.join(d, n) for n in ("out.f32", "flows.f32", "disp.i32"))
+        res = subprocess.run([tool, "merge", pp, op, fp, dp], check=True, capture_output=True, text=True)
+        stats = json.loads(res.stdout)
+        rgb = np.fromfile(op, dtype="<f4").reshape(3, ho, wo).transpose(1, 2, 0).astype(np.float64)
+        nty, ntx = stats["tiles_y"], stats["tiles_x"]
+        fl = np.fromfile(fp, dtype="<f4").reshape(len(frames), nty, ntx, 2).astype(np.float64)
+        dd = np.fromfile(dp, dtype="<i4").reshape(len(frames), nty, ntx, 2)
+    ref = stats["reference"]
+    flows = {i: fl[i] for i in range(len(frames)) if i != ref}
+    disps = {i: dd[i] for i in range(len(frames)) if i != ref}
+    return rgb, flows, disps, stats
+
