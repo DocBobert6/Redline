@@ -504,4 +504,121 @@ std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec&
     return "";
 }
 
+// ------------------------------------------------------------------------------------------------ B23 linear input
+
+namespace {
+
+std::string validateLinear(const LinearRgb& in, const RenderSpec& s) {
+    if (in.data == nullptr || in.width < 1 || in.height < 1 || in.width > kMaxSide || in.height > kMaxSide) return "bad linear image";
+    if (in.rowStride < static_cast<std::size_t>(in.width) || in.planeStride < in.rowStride * static_cast<std::size_t>(in.height)) {
+        return "bad linear image strides";
+    }
+    if (s.outWidth != in.width || s.outHeight != in.height) return "output size must equal the linear image size";
+    for (float v : s.colour.matrix) {
+        if (!std::isfinite(v)) return "matrix not finite";
+    }
+    for (float v : s.colour.neutral) {
+        if (!(v > 0.0f) || !std::isfinite(v)) return "neutral must be positive";
+    }
+    if (!(s.gain > 0.0f) || !std::isfinite(s.gain)) return "gain must be positive";
+    if (s.curve == nullptr || s.curvePoints < 2 || !(s.curveHi > s.curveLo)) return "bad tone curve";
+    if (s.lut == nullptr || s.lutSize < 2 || s.lutSize > 256) return "bad LUT";
+    return "";
+}
+
+template <typename Writer>
+void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y1, const Writer& out) {
+    const Curve curve(spec);
+    const float* m = spec.colour.matrix;
+    const float inv[3] = {1.0f / spec.colour.neutral[0], 1.0f / spec.colour.neutral[1], 1.0f / spec.colour.neutral[2]};
+    for (int y = y0; y < y1; ++y) {
+        const float* r = in.data + static_cast<std::size_t>(y) * in.rowStride;
+        const float* g = r + in.planeStride;
+        const float* b = g + in.planeStride;
+        for (int x = 0; x < in.width; ++x) {
+            const float c[3] = {std::min(std::max(r[x] * inv[0], 0.0f), 1.0f), std::min(std::max(g[x] * inv[1], 0.0f), 1.0f),
+                                std::min(std::max(b[x] * inv[2], 0.0f), 1.0f)};
+            float toned[3];
+            for (int k = 0; k < 3; ++k) toned[k] = curve(m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2]);
+            float o[3];
+            lutSample(spec.lut, spec.lutSize, toned, o);
+            out.put(x, y, o);
+        }
+    }
+}
+
+template <typename Writer>
+void renderLinearAll(const LinearRgb& in, const RenderSpec& spec, const Writer& out) {
+    const int threads = std::min(std::max(spec.threads, 1), std::min(kMaxThreads, in.height));
+    if (threads == 1) {
+        renderLinearRows(in, spec, 0, in.height, out);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (int t = 0; t < threads; ++t) {
+        const int a = static_cast<int>(static_cast<long long>(in.height) * t / threads);
+        const int b = static_cast<int>(static_cast<long long>(in.height) * (t + 1) / threads);
+        pool.emplace_back([&, a, b] { renderLinearRows(in, spec, a, b, out); });
+    }
+    for (auto& th : pool) th.join();
+}
+
+}  // namespace
+
+std::string renderLinear(const LinearRgb& in, const RenderSpec& spec, std::uint8_t* rgba, std::size_t strideBytes) {
+    std::string err = validateLinear(in, spec);
+    if (err.empty() && (rgba == nullptr || strideBytes < static_cast<std::size_t>(in.width) * 4)) err = "bad output buffer";
+    if (!err.empty()) return err;
+    renderLinearAll(in, spec, Rgba8Writer{rgba, strideBytes});
+    return "";
+}
+
+std::string renderLinearFloat(const LinearRgb& in, const RenderSpec& spec, float* rgb, std::size_t strideFloats) {
+    std::string err = validateLinear(in, spec);
+    if (err.empty() && (rgb == nullptr || strideFloats < static_cast<std::size_t>(in.width) * 3)) err = "bad output buffer";
+    if (!err.empty()) return err;
+    renderLinearAll(in, spec, FloatWriter{rgb, strideFloats});
+    return "";
+}
+
+std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step, RawStats& out) {
+    if (in.data == nullptr || in.width < 1 || in.height < 1) return "bad linear image";
+    if (step < 1) return "step must be >= 1";
+    for (float v : colour.neutral) {
+        if (!(v > 0.0f)) return "neutral must be positive";
+    }
+    const float* m = colour.matrix;
+    std::vector<float> ys;
+    int clipped = 0;
+    for (int y = 0; y < in.height; y += step) {
+        const float* r = in.data + static_cast<std::size_t>(y) * in.rowStride;
+        const float* planes[3] = {r, r + in.planeStride, r + 2 * in.planeStride};
+        for (int x = 0; x < in.width; x += step) {
+            float c[3];
+            bool clip = false;
+            for (int k = 0; k < 3; ++k) {
+                c[k] = planes[k][x] / colour.neutral[k];
+                clip = clip || c[k] >= 1.0f;
+                c[k] = std::min(std::max(c[k], 0.0f), 1.0f);
+            }
+            if (clip) ++clipped;
+            float yv = 0.0f;
+            for (int k = 0; k < 3; ++k) yv += kLuma[k] * (m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2]);
+            ys.push_back(yv);
+        }
+    }
+    const std::size_t n = ys.size();
+    std::nth_element(ys.begin(), ys.begin() + n / 2, ys.end());
+    float med = ys[n / 2];
+    if (n % 2 == 0) {
+        const float lower = *std::max_element(ys.begin(), ys.begin() + n / 2);
+        med = 0.5f * (med + lower);
+    }
+    out.medianY = med;
+    out.clippedFraction = static_cast<float>(clipped) / static_cast<float>(n);
+    out.cells = static_cast<int>(n);
+    return "";
+}
+
 }  // namespace redline

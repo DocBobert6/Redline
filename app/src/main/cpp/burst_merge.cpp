@@ -11,6 +11,7 @@
 // - the merge blends 4 quads per NEON step in float;
 // - a persistent pool hands out small chunks dynamically (no thread start per stage, slow cores take fewer chunks).
 #include "burst_merge.h"
+#include "burst_internal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,8 +41,11 @@
 namespace redline {
 namespace {
 
-constexpr int kFineTile = 16;
-constexpr int kFineStride = 8;
+using detail::Grid;
+using detail::Image;
+using detail::kFineStride;
+using detail::kFineTile;
+using detail::Pyramid;
 constexpr int kBlock = 8;  // block of the distance sums: a coarse tile, or a quarter of a fine tile
 constexpr int kCoarseTile = 8;
 constexpr int kCoarseRadius = 4;
@@ -162,17 +166,6 @@ void parallelFor(int n, int threads, const std::function<void(int, int)>& body) 
 
 // ------------------------------------------------------------------------------------------------ images
 
-struct Image {
-    int w = 0;
-    int h = 0;
-    std::vector<std::uint16_t> px;
-    std::uint16_t maxv = 65535;  // largest value (picks the narrow-accumulator kernels when they cannot overflow)
-    std::uint16_t at(int y, int x) const { return px[static_cast<std::size_t>(y) * w + x]; }
-    const std::uint16_t* row(int y) const { return px.data() + static_cast<std::size_t>(y) * w; }
-    std::size_t bytes() const { return px.size() * sizeof(std::uint16_t); }
-};
-
-using Pyramid = std::vector<Image>;
 
 std::size_t pyramidBytes(const Pyramid& p) {
     std::size_t s = 0;
@@ -399,18 +392,6 @@ inline bool coarseWindowFast(const Image& ref, const Image& alt, int oy, int ox,
 #endif
 }
 
-struct Grid {
-    int size = 0;
-    int stride = 0;
-    int offset = 0;  // origin of tile i = i * stride + offset
-    int nx = 0;
-    int ny = 0;
-    int ox(int j) const { return j * stride + offset; }
-    int oy(int i) const { return i * stride + offset; }
-    int cx(int j) const { return ox(j) + size / 2; }
-    int cy(int i) const { return oy(i) + size / 2; }
-};
-
 Grid coarseGrid(int h, int w) {
     Grid g;
     g.size = kCoarseTile;
@@ -635,6 +616,19 @@ std::string checkParams(const BurstParams& p) {
 }
 
 }  // namespace
+
+// ------------------------------------------------------------------------------------------------ shared with B23
+
+namespace detail {
+
+void runParallel(int n, int threads, const std::function<void(int, int)>& body) { redline::parallelFor(n, threads, body); }
+Pyramid buildPyramid(const BurstFrame& f, int width, int height, int threads) { return redline::pyramidOf(f, width, height, threads); }
+std::size_t pyramidSizeBytes(const Pyramid& p) { return redline::pyramidBytes(p); }
+std::int64_t pyramidSharpness(const Pyramid& p) { return redline::sharpness(p); }
+Grid fineTileGrid(int h, int w) { return redline::fineGrid(h, w); }
+std::vector<int> alignTiles(const Pyramid& ref, const Pyramid& alt, int threads) { return redline::align(ref, alt, threads); }
+
+}  // namespace detail
 
 // ------------------------------------------------------------------------------------------------ streaming merger
 

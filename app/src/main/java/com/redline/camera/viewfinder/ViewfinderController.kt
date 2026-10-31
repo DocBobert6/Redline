@@ -50,7 +50,12 @@ import com.redline.camera.capture.ShotTimeline
 import com.redline.camera.capture.StillSaver
 import com.redline.camera.capture.StillShot
 import com.redline.camera.capture.StreamingMerge
+import com.redline.camera.capture.SuperResDecision
+import com.redline.camera.capture.SuperResInputs
+import com.redline.camera.capture.SuperResPlanner
+import com.redline.camera.capture.SuperResSetup
 import com.redline.camera.capture.identitySet
+import com.redline.camera.colour.ColourMath
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
@@ -305,6 +310,9 @@ class ViewfinderController(
 
     // B22 burst capture and processing queue (camera thread).
     private var burstWanted = false
+
+    /** B23: super-resolution at 50/70 mm (the setting and its self-check). */
+    private var superResWanted = false
     private var pool: FramePool? = null
     private var rawMinFrameNs = 0L
     private var meteredIso: Int? = null
@@ -358,7 +366,9 @@ class ViewfinderController(
         /** Shots in flight when this one was pressed. */
         val queuedBehind: Int,
         /** B22b: press-to-file timings for the report. */
-        val timeline: ShotTimeline
+        val timeline: ShotTimeline,
+        /** B23: the 50/70 mm super-resolution decision (null when it does not apply). */
+        val superRes: SuperResDecision? = null
     ) {
         /** Sensor timestamp of the camera-JPEG frame (matches its JPEG image). */
         var timestamp: Long? = null
@@ -380,8 +390,12 @@ class ViewfinderController(
      * The burst owns at most [BurstPlan.residentFrames] pool buffers for its frames (plus the DNG's merge output);
      * a buffer the merger hands back is reused for a later frame, or returned to the pool once all frames are in.
      */
-    private inner class BurstRun(val plan: BurstPlan, slots: List<ByteBuffer>, val dngOut: ByteBuffer?) {
-        val merge = StreamingMerge(mergeThreads)
+    private inner class BurstRun(val plan: BurstPlan, slots: List<ByteBuffer>, val dngOut: ByteBuffer?, superRes: SuperResSetup? = null) {
+        val merge = StreamingMerge(mergeThreads, superRes)
+
+        /** B23: the finished super-resolution merge (handed to the saver) and its stats. */
+        var srImage: RedlineNative.SuperResMerger? = null
+        var srStats: RedlineNative.SrStats? = null
         val free = ArrayDeque(slots)
 
         // B22b: identity sets only. ByteBuffer equality compares the 24 MB contents (and hashes every byte).
@@ -448,6 +462,11 @@ class ViewfinderController(
     /** B22 burst merge on/off (the setting, its self-check and the B21 pipeline all on); takes effect at the next shot. */
     fun setBurst(on: Boolean) {
         handler.post { burstWanted = on }
+    }
+
+    /** B23 super-resolution at 50/70 mm on/off (the setting and its self-check passed); takes effect at the next shot. */
+    fun setSuperRes(on: Boolean) {
+        handler.post { superResWanted = on }
     }
 
     /** B22: smoothed hand motion from the gyroscope (rad/s), read by the burst planner; null = no gyroscope. */
@@ -602,7 +621,7 @@ class ViewfinderController(
         }
         val withRaw = sessionWantsRaw() && su?.rawSize != null
         if (withRaw) {
-            val size = su!!.rawSize!!
+            val size = su.rawSize
             // B22: frames are copied into pool buffers on arrival and closed at once; a few spare images absorb a burst.
             val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, RAW_MAX_IMAGES)
             r.setOnImageAvailableListener({ drainRaw() }, handler)
@@ -630,7 +649,7 @@ class ViewfinderController(
                 if (withRaw) {
                     rawWanted = false
                     pipelineWanted = false
-                    listener.onRawUnavailable("session with RAW_SENSOR ${su?.rawSize} could not be configured")
+                    listener.onRawUnavailable("session with RAW_SENSOR ${su.rawSize} could not be configured")
                     createSession(camera, target, gen)
                 } else {
                     listener.onError("preview session configuration failed")
@@ -781,8 +800,25 @@ class ViewfinderController(
         ) -> Unit = { r -> q.done(r.copy(shutterWaitMs = waitMs, shutterBlocked = r.shutterBlocked || blocked)) }
         var plan = planShot(su)
         var run: BurstRun? = null
+        // B23: at 50/70 mm a burst becomes a super-resolution burst (8-12 frames); otherwise the still is upscaled.
+        val rawCrop = su.rawSize?.let { ColourMath.rawCrop(it.width, it.height, zoomRatio.toDouble()) }
+        val cfa = characteristics?.let { colourPipeline?.cfaOf(it) }
+        var srDecision = SuperResPlanner.decide(
+            SuperResInputs(
+                stopMm = request.stopTargetMm,
+                enabled = superResWanted && pipelineWanted,
+                cropLongPx = rawCrop?.let { maxOf(it[2], it[3]) } ?: 0,
+                plan = plan,
+                motionRadPerSec = motionRadPerSec
+            )
+        )
+        if (srDecision.active && (rawCrop == null || cfa == null)) {
+            srDecision = srDecision.copy(active = false, frames = 0, reason = "no Bayer RAW layout: burst merge upscaled")
+        }
+        if (srDecision.active && plan != null) plan = SuperResPlanner.plan(plan, srDecision)
         if (plan?.isBurst == true) {
-            val dngSlot = if (rawWanted) 1 else 0
+            // A super-resolution burst never writes over its frames: frame 0 stays untouched (DNG), so no output slot.
+            val dngSlot = if (rawWanted && !srDecision.active) 1 else 0
             val slots = pool!!.acquire(plan.residentFrames + dngSlot)
             if (slots.size < BurstPlanner.MIN_FRAMES + dngSlot) {
                 pool!!.release(slots)
@@ -793,10 +829,25 @@ class ViewfinderController(
                     val n = minOf(plan.frames, BurstPlanner.streamCap(resident, plan.frames, plan.frameDurationNs))
                     plan = plan.copy(frames = n, residentFrames = resident, limits = plan.limits + "memory")
                 }
-                run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null)
+                if (srDecision.active) {
+                    // Frame 0 stays held for the whole burst (DNG and fallback), so one buffer fewer streams.
+                    val n = minOf(plan.frames, BurstPlanner.streamCap(resident - 1, plan.frames, plan.frameDurationNs))
+                    if (n < plan.frames) plan = plan.copy(frames = n, limits = plan.limits + "memory")
+                    srDecision = srDecision.copy(frames = plan.frames)
+                }
+                val srSetup = if (srDecision.active && rawCrop != null && cfa != null) {
+                    SuperResSetup(cfa, rawCrop, srDecision.outWidth, srDecision.outHeight)
+                } else {
+                    null
+                }
+                run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup)
             }
         }
         val burst = run != null
+        if (srDecision.active && !burst) {
+            val why = plan?.singleReason ?: "memory"
+            srDecision = srDecision.copy(active = false, frames = 0, reason = "no burst ($why): one frame upscaled")
+        }
         // Not a burst: the B21 single RAW frame, or the camera JPEG when the single-frame queue is full or memory is short.
         var buffers: List<ByteBuffer> = emptyList()
         var singlePath = BurstShot.PATH_JPEG
@@ -831,7 +882,8 @@ class ViewfinderController(
             run = run,
             singlePath = singlePath,
             queuedBehind = inFlight,
-            timeline = timeline
+            timeline = timeline,
+            superRes = srDecision.takeIf { it.applies }
         )
         inFlight++
         if (burst) burstsPending++
@@ -946,6 +998,8 @@ class ViewfinderController(
                 if (p.timestamp == null) p.timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 endOfBurst(p)
             }
+            // B23: a super-resolution finish waits for a burst result (its lens shading map) or the JPEG frame's.
+            p.run?.let { if (it.started && it.finishWanted && it.captureDone) queueMergeFinish(p, it) }
             progress(p)
         }
 
@@ -1193,22 +1247,55 @@ class ViewfinderController(
             }
             run.merge.fail("merge: no burst frame arrived")
         }
+        val superRes = run.merge.superRes != null
+        var shading: FloatArray? = null
+        var shadingRows = 0
+        var shadingCols = 0
+        if (superRes && run.copies.isNotEmpty()) {
+            // B23: the gather applies the lens shading map of a burst frame's result; wait for one (or the JPEG frame's
+            // result, after which none will come).
+            val r = p.burstResults.values.firstOrNull()
+            if (r == null && p.result == null) {
+                run.finishWanted = true
+                return
+            }
+            r?.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.let { map ->
+                shading = FloatArray(map.gainFactorCount).also { map.copyGainFactors(it, 0) }
+                shadingRows = map.rowCount
+                shadingCols = map.columnCount
+            }
+        }
         run.finishQueued = true
         val out = run.dngOut
         val lastFrameAtMs = run.lastFrameAtMs
         val first = run.copies.firstOrNull()
+        val sh = shading
         mergeExecutor.execute {
             p.timeline.mark(ShotTimeline.MERGE_FINISH, SystemClock.elapsedRealtime())
-            val stats = if (first != null) run.merge.finish(out, first.rowStrideBytes) else null
+            var srStats: RedlineNative.SrStats? = null
+            var srImage: RedlineNative.SuperResMerger? = null
+            val stats = when {
+                first == null -> null
+                superRes -> {
+                    srStats = run.merge.finishSuperRes(sh, shadingRows, shadingCols)
+                    srImage = run.merge.takeSuperRes()
+                    null
+                }
+                else -> run.merge.finish(out, first.rowStrideBytes)
+            }
             run.merge.close()
             val doneAtMs = SystemClock.elapsedRealtime()
             p.timeline.mark(ShotTimeline.MERGE_DONE, doneAtMs)
             handler.post {
                 if (!run.closed) {
                     run.mergeStats = stats
+                    run.srStats = srStats
+                    run.srImage = srImage
                     run.mergeTailMs = doneAtMs - lastFrameAtMs
                     run.mergeDone = true
                     progress(p)
+                } else {
+                    srImage?.close()
                 }
             }
         }
@@ -1228,7 +1315,20 @@ class ViewfinderController(
         var fallbackRaw: RawCopy? = null
         var refResult = result
         val ref = stats?.reference?.let { run.copies.getOrNull(it) }
-        if (stats != null && ref != null) {
+        val srImage = run.srImage.also { run.srImage = null }
+        val srStats = run.srStats
+        if (run.merge.superRes != null) {
+            // B23: frame 0 was kept untouched (the DNG, and the fallback render when the merge failed); the colour plan
+            // comes from the reference frame's result.
+            val f0 = run.copies.firstOrNull()
+            refResult = srStats?.reference?.let { run.copies.getOrNull(it) }?.let { resultFor(it) }
+                ?: f0?.let { resultFor(it) } ?: result
+            if (f0 != null) {
+                fallbackRaw = f0
+                if (p.saveDng) dngRaw = f0
+                keep += f0.buffer
+            }
+        } else if (stats != null && ref != null) {
             refResult = resultFor(ref)
             val out = run.dngOut
             if (out != null) {
@@ -1257,11 +1357,12 @@ class ViewfinderController(
             framesMergedDuringCapture = run.mergedAtCapture,
             maxBacklog = run.maxBacklog,
             maxResidentFrames = run.maxResident,
-            maxHeldByMerger = stats?.maxHeldFrames ?: 0,
-            threads = stats?.threads ?: mergeThreads,
+            maxHeldByMerger = stats?.maxHeldFrames ?: srStats?.maxRegionsHeld ?: 0,
+            threads = stats?.threads ?: srStats?.threads ?: mergeThreads,
             mergeTailMs = run.mergeTailMs,
-            peakNativeMb = stats?.peakNativeMb ?: 0.0,
-            peakResidentMb = (run.maxResident + if (run.dngOut != null) 1 else 0) * frameMb + (stats?.peakNativeMb ?: 0.0)
+            peakNativeMb = stats?.peakNativeMb ?: srStats?.let { it.peakNativeMb + it.outputMb } ?: 0.0,
+            peakResidentMb = (run.maxResident + if (run.dngOut != null) 1 else 0) * frameMb +
+                (stats?.peakNativeMb ?: srStats?.let { it.peakNativeMb + it.outputMb } ?: 0.0)
         )
         val capture = BurstCapture(
             plan = run.plan,
@@ -1272,13 +1373,20 @@ class ViewfinderController(
             referenceResult = refResult,
             dngRaw = dngRaw,
             fallbackRaw = fallbackRaw,
-            fallbackResult = fallbackRaw?.let { refResult },
-            fallbackReason = if (stats == null) run.merge.error ?: "merge: no frames merged" else null,
+            fallbackResult = fallbackRaw?.let { f -> if (run.merge.superRes != null) resultFor(f) else refResult },
+            fallbackReason = when {
+                run.merge.superRes != null -> if (srImage == null) run.merge.error ?: "superres: no result" else null
+                stats == null -> run.merge.error ?: "merge: no frames merged"
+                else -> null
+            },
             noiseModel = run.merge.noiseModel,
             captureMs = run.captureMs,
             mergeTailMs = run.mergeTailMs,
             streaming = streaming,
-            releaseMs = p.timeline.releaseMs()
+            releaseMs = p.timeline.releaseMs(),
+            srImage = srImage,
+            srStats = srStats,
+            srError = if (run.merge.superRes != null && srImage == null) run.merge.error ?: "superres: no result" else null
         )
         queueSave(p, buildShot(p, result, jpeg, ch, capture, SystemClock.elapsedRealtime(), keep))
     }
@@ -1295,7 +1403,7 @@ class ViewfinderController(
         val r = p.request
         val plan = p.plan
         val currentPool = pool
-        val hasRaw = p.raw != null || burst?.merged != null || burst?.fallbackRaw != null
+        val hasRaw = p.raw != null || burst?.merged != null || burst?.fallbackRaw != null || burst?.srImage != null
         p.timeline.mark(ShotTimeline.SAVE_QUEUED, queuedAtMs)
         return StillShot(
             jpeg = jpeg,
@@ -1320,6 +1428,7 @@ class ViewfinderController(
             queuedBehind = p.queuedBehind,
             queuedAtMs = queuedAtMs,
             timeline = p.timeline,
+            superRes = p.superRes,
             release = { currentPool?.release(keep) }
         )
     }
@@ -1355,6 +1464,8 @@ class ViewfinderController(
             // Queued merge work finishes first (it still reads the frames); then every buffer goes back.
             run.closed = true
             run.captureDone = true
+            run.srImage?.close()
+            run.srImage = null
             val owned = run.owned.toList()
             run.owned.clear()
             mergeExecutor.execute {

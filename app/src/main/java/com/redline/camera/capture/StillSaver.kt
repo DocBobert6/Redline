@@ -24,6 +24,7 @@ import com.redline.camera.nativebridge.RedlineNative
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.OutputStream
+import kotlin.math.abs
 
 /** Everything one still capture produced, handed from the camera thread to the saver. */
 class StillShot(
@@ -59,6 +60,8 @@ class StillShot(
     val queuedAtMs: Long = shutterAtMs,
     /** B22b: the shot's press-to-file timings (the saver adds its own steps). */
     val timeline: ShotTimeline? = null,
+    /** B23: the 50/70 mm super-resolution decision (applies: saved at its output size, merged or upscaled). */
+    val superRes: SuperResDecision? = null,
     /** Returns the shot's pool buffers; called exactly once by the saver when it is done. */
     val release: () -> Unit = {}
 )
@@ -86,7 +89,11 @@ class BurstCapture(
     val mergeTailMs: Long,
     val streaming: BurstStreaming,
     /** B22b: press to the shutter being free (all RAW frames in), ms. */
-    val releaseMs: Long? = null
+    val releaseMs: Long? = null,
+    /** B23: the finished super-resolution merge (the saver renders and closes it), its stats, or why it failed. */
+    val srImage: RedlineNative.SuperResMerger? = null,
+    val srStats: RedlineNative.SrStats? = null,
+    val srError: String? = null
 )
 
 /**
@@ -111,6 +118,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         try {
             return saveInner(shot, nowMs)
         } finally {
+            runCatching { shot.burst?.srImage?.close() }
             runCatching { shot.release() }
         }
     }
@@ -126,6 +134,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
         var burstShot: BurstShot? = shot.singlePlan?.let {
             BurstShot(plan = it, stopMm = shot.stopTargetMm, stress = shot.stress, queuedBehind = shot.queuedBehind, path = shot.singlePath)
         }
+        var srMerged = false
+        var srFallback: String? = null
         val b = shot.burst
         if (b != null) {
             val timings = linkedMapOf(
@@ -145,9 +155,36 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 timings["finish"] = Math.round(it.finishMs)
             }
             var mergedOk = false
+            val srImage = b.srImage
+            val srStats = b.srStats
+            val sr = shot.superRes
+            if (sr != null && sr.active) {
+                srFallback = b.srError
+                srStats?.let {
+                    timings["sr_copy"] = Math.round(it.copyMs)
+                    timings["sr_align"] = Math.round(it.alignMs + it.referenceMs)
+                    timings["sr_robust"] = Math.round(it.robustMs)
+                    timings["sr_gather"] = Math.round(it.gatherMs)
+                }
+            }
+            if (shot.renderRaw && pipeline != null && sr != null && srImage != null && srStats != null) {
+                val o = pipeline.renderSuperRes(
+                    srImage,
+                    b.referenceResult,
+                    shot.characteristics,
+                    shot.cameraId,
+                    shot.jpeg,
+                    sr.outWidth,
+                    sr.outHeight
+                )
+                srImage.close()
+                rendered = o.bitmap
+                colour = o.shot
+                if (rendered == null) srFallback = "super-resolution render: ${o.shot.fallbackReason}" else srMerged = true
+            }
             if (shot.renderRaw && pipeline != null) {
                 val m = b.merged
-                if (m != null && stats != null) {
+                if (rendered == null && m != null && stats != null) {
                     val o = pipeline.render(
                         m,
                         b.referenceResult,
@@ -182,13 +219,20 @@ class StillSaver(context: Context, private val version: String, private val pipe
             }
             dngRaw = b.dngRaw
             dngResult = b.referenceResult
+            if (srMerged) mergedOk = true
             val per = stats?.perFrame.orEmpty()
             burstShot = BurstShot(
                 plan = b.plan,
                 stopMm = shot.stopTargetMm,
                 framesCaptured = b.framesCaptured,
-                framesMerged = if (mergedOk) stats?.frames ?: 0 else 0,
-                reference = stats?.reference,
+                framesMerged = if (srMerged) {
+                    srStats?.frames ?: 0
+                } else if (mergedOk) {
+                    stats?.frames ?: 0
+                } else {
+                    0
+                },
+                reference = if (srMerged) srStats?.reference else stats?.reference,
                 merged = mergedOk,
                 fallbackReason = if (mergedOk) null else fallback ?: "merge unavailable",
                 noiseModel = b.noiseModel,
@@ -209,8 +253,32 @@ class StillSaver(context: Context, private val version: String, private val pipe
             colour =
                 ColourShot(rendered = false, fallbackReason = if (shot.raw == null) "no RAW frame in this shot" else "pipeline unavailable")
         }
+        // B23: a 50/70 mm still with super-resolution on is saved at its output size: the merge itself, or the B22 merge
+        // (or one frame) upscaled, with the reason recorded and named in the EXIF note.
+        val sr = shot.superRes
+        var upscaledFrom: Dim? = null
+        if (sr != null && sr.applies && !srMerged) {
+            val bmp = rendered
+            if (bmp != null && (bmp.width != sr.outWidth || bmp.height != sr.outHeight)) {
+                upscaledFrom = Dim(bmp.width, bmp.height)
+                val up = runCatching { Bitmap.createScaledBitmap(bmp, sr.outWidth, sr.outHeight, true) }.getOrNull()
+                if (up != null && up !== bmp) {
+                    bmp.recycle()
+                    rendered = up
+                }
+            }
+            if (srFallback == null) {
+                srFallback = sr.reason ?: if (bmp == null) "camera JPEG (not rendered from RAW)" else "super-resolution unavailable"
+            }
+        }
         val lookName = if (rendered != null) ColourPipeline.LOOK_NAME else LOOK_NONE
-        val look = CaptureMath.lookTag(version, lookName, shot.stopLabel, shot.trueEquivalentMm)
+        val detail = when {
+            sr == null || !sr.applies -> null
+            srMerged -> "super-resolution: ${b?.srStats?.frames ?: 0} frames"
+            upscaledFrom != null -> "upscaled from $upscaledFrom ($srFallback)"
+            else -> null
+        }
+        val look = CaptureMath.lookTag(version, lookName, shot.stopLabel, shot.trueEquivalentMm) + (detail?.let { " | $it" } ?: "")
         var jpegSize: Dim? = null
         var error: String? = null
         val encodeStart = nowMs()
@@ -258,7 +326,37 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 it.copy(timeline = shot.timeline?.toMap())
             }
         }
+        val srShot = if (sr != null && sr.applies) {
+            val st = b?.srStats
+            val per = st?.perFrame.orEmpty()
+            SuperResShot(
+                stopMm = shot.stopTargetMm,
+                decision = sr,
+                merged = srMerged && jpegOk,
+                fallbackReason = if (srMerged) null else srFallback,
+                framesMerged = if (srMerged) st?.frames ?: 0 else 0,
+                reference = st?.reference,
+                outWidth = jpegSize?.width ?: 0,
+                outHeight = jpegSize?.height ?: 0,
+                coverage = st?.coverage,
+                sigmaG = st?.sigmaG,
+                meanSubpixPx = per.takeIf { it.isNotEmpty() }?.map { it.meanSubpixPx }?.average(),
+                meanRobustness = per.takeIf { it.isNotEmpty() }?.map { it.meanRobustness }?.average(),
+                rejectedFraction = per.takeIf { it.isNotEmpty() }?.map { it.rejectedFraction }?.average(),
+                modelResolved = per.takeIf { it.isNotEmpty() }?.map { it.modelResolved }?.average(),
+                maxMotionPx = per.filter { it.model }.maxOfOrNull { maxOf(abs(it.motionYPx), abs(it.motionXPx)) },
+                timingsMs = burstShot?.timingsMs.orEmpty().filterKeys { it.startsWith("sr_") || it in SR_TIMINGS } +
+                    linkedMapOf("encode_save" to encodeMs, "total" to total),
+                peakNativeMb = st?.peakNativeMb,
+                outputMb = st?.outputMb,
+                queuedBehind = shot.queuedBehind,
+                stress = shot.stress
+            )
+        } else {
+            null
+        }
         return ShotResult(
+            superRes = srShot,
             ok = jpegOk,
             jpegSize = jpegSize,
             dngSaved = dngOk,
@@ -387,6 +485,9 @@ class StillSaver(context: Context, private val version: String, private val pipe
     companion object {
         private const val TAG = "RedlineSaver"
         const val JPEG_QUALITY = 95
+
+        /** B23: the burst timings copied into the super-resolution record. */
+        private val SR_TIMINGS = setOf("capture", "merge_tail", "shutter_release", "render", "queue_wait")
 
         /** The still came from the camera JPEG (pipeline off or fell back); the tag says so. */
         const val LOOK_NONE = "none (camera JPEG)"

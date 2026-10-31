@@ -45,6 +45,7 @@ import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.ShotResult
+import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.colour.ProfileChoice
@@ -188,6 +189,10 @@ class MainActivity : ComponentActivity() {
     private var gyroRegistered = false
     private var motion = 0.0
     private var burstStressAbort = false
+
+    // B23 super-resolution at 50/70 mm (main thread): the setting and its native self-check.
+    private var superResSetting = true
+    private var superResChecked = false
 
     /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
     private fun useLook(): Boolean = lookSetting && lookReady && lookRuntimeError == null
@@ -388,6 +393,7 @@ class MainActivity : ComponentActivity() {
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         colourSetting = prefs.getBoolean(PREF_COLOUR_PIPELINE, true)
         burstSetting = prefs.getBoolean(PREF_BURST_MERGE, true)
+        superResSetting = prefs.getBoolean(PREF_SUPER_RES, true)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
         lookRenderer = LookPreviewRenderer(lookListener)
@@ -424,7 +430,8 @@ class MainActivity : ComponentActivity() {
             ),
             lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET),
             colourPipeline = ColourPipelineReport(userSetting = colourSetting, lookName = ColourPipeline.LOOK_NAME),
-            burst = BurstReport(userSetting = burstSetting)
+            burst = BurstReport(userSetting = burstSetting),
+            superRes = SuperResReport(userSetting = superResSetting)
         )
         colourWorker.execute {
             val prepared = colourPipeline.prepare()
@@ -441,6 +448,22 @@ class MainActivity : ComponentActivity() {
                     updateBurst { it.copy(selfCheckAligned = c.alignedFraction, selfCheckNoiseRatio = c.noiseRatio, selfCheckMs = c.ms) }
                 }.onFailure { e -> updateBurst { it.copy(selfCheckError = "${e.javaClass.simpleName}: ${e.message}") } }
                 refreshBurstAvailability()
+            }
+            // B23: the native super-resolution merge on a synthetic burst with known sub-pixel shifts (~0.1-0.3 s).
+            val sr = runCatching { RedlineNative.superResSelfCheck(RedlineNative.burstThreads()) }
+            runOnUiThread {
+                superResChecked = true
+                sr.onSuccess { c ->
+                    updateSuperRes {
+                        it.copy(
+                            selfCheckGain = c.gain,
+                            selfCheckFlowErrorPx = c.flowErrorPx,
+                            selfCheckCoverage = c.coverage,
+                            selfCheckMs = c.ms
+                        )
+                    }
+                }.onFailure { e -> updateSuperRes { it.copy(selfCheckError = "${e.javaClass.simpleName}: ${e.message}") } }
+                refreshSuperResAvailability()
             }
         }
 
@@ -652,6 +675,7 @@ class MainActivity : ComponentActivity() {
                 onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
                 onToggleColourPipeline = if (state.value.colourPipeline.available == true) ::toggleColourPipeline else null,
                 onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
+                onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
                     {
                         burstStressPending = true
@@ -944,7 +968,14 @@ class MainActivity : ComponentActivity() {
                     val failed = !result.ok && result.dropped == null
                     burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (failed) 1 else 0)
                 }
-                state.value = state.value.copy(capture = state.value.capture.add(result, b13Stress), colourPipeline = colour, burst = burst)
+                val superRes =
+                    result.superRes?.let { state.value.superRes.record(it, result.shutterToSavedMs, result.ok) } ?: state.value.superRes
+                state.value = state.value.copy(
+                    capture = state.value.capture.add(result, b13Stress),
+                    colourPipeline = colour,
+                    burst = burst,
+                    superRes = superRes
+                )
                 done(result)
             }
         }
@@ -1078,6 +1109,7 @@ class MainActivity : ComponentActivity() {
             if (status.value != null && !selfTestOwnsCamera) status.value = null
             controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable(), colourEnabled())
             controller.setBurst(burstEnabled())
+            controller.setSuperRes(superResEnabled())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
         }
         return CompletableFuture.completedFuture(Unit)
@@ -1177,6 +1209,46 @@ class MainActivity : ComponentActivity() {
         }
         updateBurst { it.copy(available = available, reason = reason) }
         syncBurst()
+        refreshSuperResAvailability()
+    }
+
+    /**
+     * B23: super-resolution is available when its native self-check passed and the RAW colour pipeline is (it renders
+     * the merge); the bursts themselves need burst merge on, otherwise 50/70 mm stills are upscaled with the reason.
+     * On by default only when the self-check passes.
+     */
+    private fun refreshSuperResAvailability() {
+        val r = state.value.superRes
+        val colour = state.value.colourPipeline
+        val (available, reason) = when {
+            superResChecked && (r.selfCheckError != null || !r.selfCheckPassed) -> {
+                val why = r.selfCheckError ?: "gain ${r.selfCheckGain}, flow error ${r.selfCheckFlowErrorPx} px"
+                false to "native self-check failed: $why"
+            }
+            colour.available == false -> false to "needs the RAW colour pipeline (${colour.reason ?: "unavailable"})"
+            !superResChecked || colour.available == null -> null to null
+            !rawAvailable() -> false to "no RAW_SENSOR stream"
+            else -> true to null
+        }
+        updateSuperRes { it.copy(available = available, reason = reason) }
+        syncSuperRes()
+    }
+
+    private fun superResEnabled(): Boolean = state.value.superRes.enabled && colourEnabled()
+
+    private fun syncSuperRes() {
+        if (cameraOpen) controller.setSuperRes(superResEnabled())
+    }
+
+    private fun toggleSuperRes() {
+        superResSetting = !superResSetting
+        prefs.edit { putBoolean(PREF_SUPER_RES, superResSetting) }
+        state.value = state.value.copy(superRes = state.value.superRes.copy(userSetting = superResSetting))
+        syncSuperRes()
+    }
+
+    private fun updateSuperRes(change: (SuperResReport) -> SuperResReport) {
+        update { s -> s.copy(superRes = change(s.superRes)) }
     }
 
     private fun selfCheckSummary(b: BurstReport): String = "aligned ${b.selfCheckAligned}, noise ratio ${b.selfCheckNoiseRatio}"
@@ -1364,6 +1436,7 @@ class MainActivity : ComponentActivity() {
         if (!cameraOpen) return
         controller.setPipeline(colourEnabled())
         controller.setBurst(burstEnabled())
+        controller.setSuperRes(superResEnabled())
         val stab = wantedStabilization()
         if (stab != appliedStabilization) {
             appliedStabilization = stab
@@ -1427,6 +1500,7 @@ class MainActivity : ComponentActivity() {
         private const val PREF_LOOK_STRENGTH = "look_strength"
         private const val PREF_COLOUR_PIPELINE = "colour_pipeline"
         private const val PREF_BURST_MERGE = "burst_merge"
+        private const val PREF_SUPER_RES = "super_resolution"
         private const val GYRO_SMOOTHING = 0.1
         private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
         private const val LOOK_BADGE = "Look preview (approx.)"

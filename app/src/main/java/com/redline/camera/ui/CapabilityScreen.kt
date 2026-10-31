@@ -27,6 +27,7 @@ import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
@@ -48,6 +49,7 @@ fun CapabilityScreen(
     onCycleLookStrength: (() -> Unit)? = null,
     onToggleColourPipeline: (() -> Unit)? = null,
     onToggleBurst: (() -> Unit)? = null,
+    onToggleSuperRes: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
@@ -189,6 +191,9 @@ fun CapabilityScreen(
                 }
                 item {
                     BurstCard(state.burst, onToggleBurst, onRunBurstStress)
+                }
+                item {
+                    SuperResCard(state.superRes, onToggleSuperRes)
                 }
                 item {
                     LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
@@ -361,6 +366,44 @@ private fun BurstCard(r: BurstReport, onToggle: (() -> Unit)?, onRunStress: (() 
                 modifier = Modifier.padding(top = 8.dp).testTag(BURST_STRESS_TAG)
             ) {
                 Text("Run burst stress (${BurstReport.STRESS_SHOTS} rapid shots, files deleted)")
+            }
+        }
+    }
+}
+
+const val SUPER_RES_SECTION_TITLE = "Super-resolution (50/70 mm)"
+const val SUPER_RES_TOGGLE_TAG = "super_res_toggle"
+
+/** B23: super-resolution state, native self-check, the last 50/70 mm shot (merged or upscaled and why), gates. */
+@Composable
+private fun SuperResCard(r: SuperResReport, onToggle: (() -> Unit)?) {
+    SectionCard(SUPER_RES_SECTION_TITLE) {
+        Text(SuperResReport.LABEL, style = MaterialTheme.typography.bodySmall)
+        Text(if (r.enabled) "On: 50/70 mm stills merge 8-12 frames onto a 3000x2000 grid" else "Off: ${r.whyOff()}")
+        val f = { v: Double? -> v?.let { "%.3f".format(it) } ?: "-" }
+        Text(
+            "Self-check: gain ${f(r.selfCheckGain)}x vs one frame, flow error ${f(r.selfCheckFlowErrorPx)} px, " +
+                "coverage ${f(r.selfCheckCoverage)}, ${r.selfCheckMs?.let { Math.round(it) } ?: "-"} ms" +
+                (r.selfCheckError?.let { " ($it)" } ?: ""),
+            style = MaterialTheme.typography.bodySmall
+        )
+        Text("Shots ${r.shots}: merged ${r.mergedShots}, upscaled ${r.upscaledShots}; max shutter-to-saved ${r.maxSaveMs} ms")
+        if (r.upscaleReasons.isNotEmpty()) Text("Upscaled because: ${r.upscaleReasons}", style = MaterialTheme.typography.bodySmall)
+        r.last?.let { l ->
+            Text(
+                "Last: ${l.stopMm} mm, ${if (l.merged) "${l.framesMerged} frames merged" else "upscaled"} " +
+                    "to ${l.outWidth}x${l.outHeight}, " +
+                    "coverage ${f(l.coverage)}, kernel ${f(l.sigmaG)}, sub-pixel ${f(l.meanSubpixPx)} px, " +
+                    "rejected ${f(l.rejectedFraction)}, model ${f(l.modelResolved)}" +
+                    ((l.fallbackReason ?: l.decision.reason)?.let { " · $it" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (l.timingsMs.isNotEmpty()) Text("Stages ${l.timingsMs}", style = MaterialTheme.typography.bodySmall)
+        }
+        Text("Gates: 50/70 mm save < 5 s ${gateWord(r.saveGate)} ${r.gateStops}, resolution gain (self-check) ${f(r.selfCheckGain)}")
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(SUPER_RES_TOGGLE_TAG)) {
+                Text("Turn super-resolution ${if (r.userSetting) "off" else "on"} (default on when its self-check passes)")
             }
         }
     }
