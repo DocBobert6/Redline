@@ -621,7 +621,7 @@ class ViewfinderController(
         }
         val withRaw = sessionWantsRaw() && su?.rawSize != null
         if (withRaw) {
-            val size = su!!.rawSize!!
+            val size = su.rawSize
             // B22: frames are copied into pool buffers on arrival and closed at once; a few spare images absorb a burst.
             val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, RAW_MAX_IMAGES)
             r.setOnImageAvailableListener({ drainRaw() }, handler)
@@ -649,7 +649,7 @@ class ViewfinderController(
                 if (withRaw) {
                     rawWanted = false
                     pipelineWanted = false
-                    listener.onRawUnavailable("session with RAW_SENSOR ${su?.rawSize} could not be configured")
+                    listener.onRawUnavailable("session with RAW_SENSOR ${su.rawSize} could not be configured")
                     createSession(camera, target, gen)
                 } else {
                     listener.onError("preview session configuration failed")

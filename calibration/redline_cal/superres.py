@@ -75,6 +75,9 @@ blended into texture, 8 or 12 frames with random handheld shifts up to 3 RAW px:
 against ~0.55 for one frame demosaicked and upscaled, so about 1.4x linear (the plan's 1.5-2x estimate is not reached
 by this metric without sharpening; the 1 px pixel aperture caps it near 0.8). Error against the true scene on texture:
 1.5-1.75x lower than one frame upscaled.
+On real sensor texture (calibration/tools/superres_quality.py: private DNGs as the scene at 2x, a probe grating,
+real-valued handheld shifts, estimated alignment, 8 frames): 1.14-1.38x at both stops, about 1.26x on average; the
+texture error there is not lower than one frame's (estimated alignment on dense real texture is the limit).
 """
 from __future__ import annotations
 
