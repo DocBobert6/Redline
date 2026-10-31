@@ -57,6 +57,8 @@ class StillShot(
     val queuedBehind: Int = 0,
     /** When the job was queued for saving (SystemClock.elapsedRealtime): capture complete, or a burst's merge done. */
     val queuedAtMs: Long = shutterAtMs,
+    /** B22b: the shot's press-to-file timings (the saver adds its own steps). */
+    val timeline: ShotTimeline? = null,
     /** Returns the shot's pool buffers; called exactly once by the saver when it is done. */
     val release: () -> Unit = {}
 )
@@ -82,7 +84,9 @@ class BurstCapture(
     val captureMs: Long,
     /** Last frame in to merge finished, ms. */
     val mergeTailMs: Long,
-    val streaming: BurstStreaming
+    val streaming: BurstStreaming,
+    /** B22b: press to the shutter being free (all RAW frames in), ms. */
+    val releaseMs: Long? = null
 )
 
 /**
@@ -113,6 +117,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
 
     private fun saveInner(shot: StillShot, nowMs: () -> Long): ShotResult {
         val startMs = nowMs()
+        shot.timeline?.mark(ShotTimeline.SAVE_START, startMs)
         val base = CaptureMath.baseName(System.currentTimeMillis())
         var colour: ColourShot? = null
         var rendered: Bitmap? = null
@@ -128,6 +133,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 "merge_tail" to b.mergeTailMs,
                 "queue_wait" to (startMs - shot.queuedAtMs).coerceAtLeast(0)
             )
+            b.releaseMs?.let { timings["shutter_release"] = it }
             val stats = b.stats
             var fallback: String? = b.fallbackReason
             stats?.let {
@@ -239,12 +245,17 @@ class StillSaver(context: Context, private val version: String, private val pipe
             }
         }
         val dngMs = nowMs() - dngStart
-        val total = nowMs() - shot.shutterAtMs
+        val savedAt = nowMs()
+        val total = savedAt - shot.shutterAtMs
+        shot.timeline?.mark(ShotTimeline.SAVED, savedAt)
         burstShot = burstShot?.let {
             if (it.plan.isBurst) {
-                it.copy(timingsMs = it.timingsMs + linkedMapOf("encode_save" to encodeMs, "dng" to dngMs, "total" to total))
+                it.copy(
+                    timingsMs = it.timingsMs + linkedMapOf("encode_save" to encodeMs, "dng" to dngMs, "total" to total),
+                    timeline = shot.timeline?.toMap()
+                )
             } else {
-                it
+                it.copy(timeline = shot.timeline?.toMap())
             }
         }
         return ShotResult(

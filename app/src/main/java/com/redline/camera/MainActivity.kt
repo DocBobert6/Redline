@@ -43,6 +43,7 @@ import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourPipelineReport
@@ -95,7 +96,12 @@ class MainActivity : ComponentActivity() {
 
     /** B13: save a DNG next to the JPEG. Off by default (PLAN 5: RAW file is a toggle; B21 captures RAW for the look regardless). */
     private val rawOn = mutableStateOf(false)
-    private val shotInFlight = mutableStateOf(false)
+
+    /** B22b: presses sent that are not yet out of the camera (the one capturing plus those waiting), for the shutter's feedback. */
+    private val pressesOutstanding = mutableIntStateOf(0)
+
+    /** B22b: counts accepted presses; each one flashes the frame and ticks the haptic. */
+    private val pressCount = mutableIntStateOf(0)
     private val streaming = mutableStateOf(false)
     private var deviceDegrees = 0
     private var stressPending = false
@@ -591,13 +597,17 @@ class MainActivity : ComponentActivity() {
                 needsPermission = !permissionGranted.value,
                 onRequestPermission = { permissionRequest.launch(Manifest.permission.CAMERA) },
                 onOpenCapability = ::showCapability,
-                onShutter = { shoot(keep = true) {} },
-                // B22: the shutter stays live during a capture (the press waits for the camera, one deep).
+                onShutter = ::pressShutter,
+                // B22: the shutter stays live during a capture (B22b: up to PressPolicy.MAX_WAITING_PRESSES presses wait).
                 shutterEnabled = streaming.value && !state.value.capture.stressRunning && !state.value.burst.stressRunning,
+                shutterBusy = pressesOutstanding.intValue > 0,
+                shutterWaiting = PressPolicy.waiting(pressesOutstanding.intValue),
+                pressCount = pressCount.intValue,
                 rawAvailable = rawAvailable(),
                 rawOn = rawOn.value,
                 onToggleRaw = ::toggleRaw,
                 captureText = listOfNotNull(burstOverlay(), state.value.capture.overlayText()).joinToString(" · ").ifEmpty { null },
+                shutterRefused = shutterRefused.value,
                 manualUi = ManualUi(
                     caps = setup?.manual,
                     settings = manualSettings.value,
@@ -882,6 +892,28 @@ class MainActivity : ComponentActivity() {
         controller.setRaw(rawOn.value)
     }
 
+    /** B22b: the last press that was not taken (queue full), shown briefly over the shutter. */
+    private val shutterRefused = mutableStateOf<String?>(null)
+    private val clearRefused = Runnable { shutterRefused.value = null }
+
+    /**
+     * B22b: a shutter press from the viewfinder. Feedback is immediate (the frame flashes and the haptic ticks, keyed
+     * on [pressCount]; the capture line says Capturing / N queued / Processing N). A press beyond
+     * [PressPolicy.MAX_WAITING_PRESSES] waiting is not taken: it says so, and is recorded as a refused press.
+     */
+    private fun pressShutter() {
+        if (!PressPolicy.accepts(pressesOutstanding.intValue)) {
+            val why = PressPolicy.refusedReason()
+            updateBurstNow { it.press(waitMs = 0, blocked = true, stress = false).drop(why, refused = true) }
+            shutterRefused.value = "Not taken: $why"
+            mainHandler.removeCallbacks(clearRefused)
+            mainHandler.postDelayed(clearRefused, REFUSED_NOTICE_MS)
+            return
+        }
+        pressCount.intValue++
+        shoot(keep = true) {}
+    }
+
     /** One still with the selected stop's framing. [onCaptured] and [done] run on the main thread. */
     private fun shoot(keep: Boolean, stress: Boolean = false, onCaptured: () -> Unit = {}, done: (ShotResult) -> Unit) {
         val stop = setupState.value?.zoomPlan?.stop(selectedStop.intValue)
@@ -894,10 +926,10 @@ class MainActivity : ComponentActivity() {
             keep = keep,
             stress = stress
         )
-        shotInFlight.value = true
+        pressesOutstanding.intValue++
         controller.capture(request, onCaptured = {
             runOnUiThread {
-                shotInFlight.value = false
+                pressesOutstanding.intValue = (pressesOutstanding.intValue - 1).coerceAtLeast(0)
                 onCaptured()
             }
         }) { result ->
@@ -906,9 +938,11 @@ class MainActivity : ComponentActivity() {
                 val colour =
                     result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
                 var burst = state.value.burst.press(result.shutterWaitMs, result.shutterBlocked, stress)
+                result.dropped?.let { burst = burst.drop(it, refused = result.shutterBlocked) }
                 result.burst?.let { burst = burst.record(it, result.shutterToSavedMs, result.ok) }
                 if (stress && result.burst == null) {
-                    burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (result.ok) 0 else 1)
+                    val failed = !result.ok && result.dropped == null
+                    burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (failed) 1 else 0)
                 }
                 state.value = state.value.copy(capture = state.value.capture.add(result, b13Stress), colourPipeline = colour, burst = burst)
                 done(result)
@@ -946,7 +980,8 @@ class MainActivity : ComponentActivity() {
         next()
     }
 
-    private fun burstOverlay(): String? = state.value.burst.overlay()
+    /** B22b: Capturing / N queued / Processing N, so a press never looks ignored. */
+    private fun burstOverlay(): String? = PressPolicy.indicator(pressesOutstanding.intValue, state.value.burst.queueDepth)
 
     /**
      * B13 gate: 500 consecutive captures through the full save path (files written via MediaStore, then
@@ -1346,6 +1381,9 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        /** B22b: how long a "Not taken" notice stays over the shutter. */
+        private const val REFUSED_NOTICE_MS = 1_500L
+
         /** Debug builds: comma-separated self-test keys or combo:<key> to force as failed. */
         const val EXTRA_FORCE_FAIL = "redline.force_fail"
 
