@@ -34,24 +34,36 @@ class BurstPlannerTest {
     )
 
     @Test
-    fun brightSceneTakesEightFramesUnderExposedByShutter() {
+    fun brightSceneTakesFourFramesUnderExposedByShutter() {
         val p = BurstPlanner.plan(inputs())
-        assertEquals(8, p.frames)
+        assertEquals(4, p.frames)
+        assertEquals("bright", p.light)
         assertEquals(100, p.iso)
         assertEquals(Math.round(10_000_000L * 2.0.pow(-0.7)), p.exposureNs)
         assertEquals(0.7, p.underEv, 1e-3)
         assertEquals(33_333_333L, p.frameDurationNs)
-        assertEquals(listOf("target"), p.limits)
+        assertEquals(listOf("light"), p.limits)
+        assertEquals(4, p.residentFrames)
         assertNull(p.singleReason)
     }
 
     @Test
-    fun lowLightTakesMoreFrames() {
+    fun frameCountFollowsTheLight() {
+        assertEquals(6, BurstPlanner.plan(inputs(iso = 200)).frames)
+        assertEquals(8, BurstPlanner.plan(inputs(iso = 320)).frames)
         assertEquals(10, BurstPlanner.plan(inputs(iso = 800)).frames)
         val dark = BurstPlanner.plan(inputs(iso = 3200, exposureNs = 33_000_000L))
         assertEquals(12, dark.frames)
-        assertTrue("light" in dark.limits)
+        assertEquals("dark", dark.light)
         assertTrue(dark.frames <= BurstPlanner.MAX_FRAMES)
+        // At most 6 frames are held in pool buffers; the rest stream through the camera's queue.
+        assertEquals(BurstPlanner.MAX_RESIDENT_FRAMES, dark.residentFrames)
+        assertEquals(
+            listOf("bright", "good", "indoor", "dim", "dark"),
+            listOf(50, 150, 399, 1599, 1600).map {
+                BurstPlanner.lightLevel(it)
+            }
+        )
     }
 
     @Test
@@ -80,7 +92,7 @@ class BurstPlannerTest {
 
     @Test
     fun longExposuresShortenTheBurst() {
-        val p = BurstPlanner.plan(inputs(manualIso = 100, manualExposureNs = 250_000_000L))
+        val p = BurstPlanner.plan(inputs(manualIso = 800, manualExposureNs = 250_000_000L))
         assertEquals(4, p.frames) // 1.2 s / 0.25 s
         assertTrue("duration" in p.limits)
         val single = BurstPlanner.plan(inputs(manualIso = 100, manualExposureNs = 1_000_000_000L))
@@ -94,10 +106,12 @@ class BurstPlannerTest {
         val moving = BurstPlanner.plan(inputs(iso = 3200, motion = 1.2))
         assertEquals(BurstPlanner.FRAMES_HIGH_MOTION, moving.frames)
         assertTrue("motion" in moving.limits)
-        val tight = BurstPlanner.plan(inputs(pool = 6))
-        assertEquals(5, tight.frames) // one buffer is the merge output
+        // Four free buffers: 4 resident + 3 waiting in the camera queue + 2 the merge takes in meanwhile (10 x 33 ms / 120 ms).
+        val tight = BurstPlanner.plan(inputs(iso = 800, pool = 4))
+        assertEquals(9, tight.frames)
+        assertEquals(4, tight.residentFrames)
         assertTrue("memory" in tight.limits)
-        val none = BurstPlanner.plan(inputs(pool = 3))
+        val none = BurstPlanner.plan(inputs(pool = 2))
         assertFalse(none.isBurst)
         assertTrue(none.singleReason!!.contains("memory"))
     }
@@ -107,12 +121,26 @@ class BurstPlannerTest {
         assertEquals("burst merge off", BurstPlanner.plan(inputs(enabled = false)).singleReason)
         assertTrue(BurstPlanner.plan(inputs(queued = 2)).singleReason!!.startsWith("queue full"))
         assertEquals("no metered exposure yet", BurstPlanner.plan(inputs(iso = null)).singleReason)
+        // B22a: a waiting press would sit behind the burst's capture, so the shot is a fast single frame.
+        assertTrue(BurstPlanner.plan(inputs().copy(pressesWaiting = 1)).singleReason!!.startsWith("presses waiting"))
+    }
+
+    @Test
+    fun busyShotsTakeTheCheapestPathNeverARefusal() {
+        assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3))
+        val full = ShotRouter.route(wantsRaw = true, pendingSingles = ShotRouter.MAX_PENDING_SINGLES, poolFree = 3)
+        assertEquals(ShotRouter.Path.CAMERA_JPEG, full.first)
+        assertTrue(full.second!!.contains("queue full"))
+        val noMemory = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 0)
+        assertEquals(ShotRouter.Path.CAMERA_JPEG, noMemory.first)
+        assertTrue(noMemory.second!!.contains("memory"))
+        assertEquals(ShotRouter.Path.CAMERA_JPEG to null, ShotRouter.route(wantsRaw = false, pendingSingles = 0, poolFree = 3))
     }
 
     @Test
     fun captureTimeCoversTheFrames() {
         val p = BurstPlanner.plan(inputs())
-        assertEquals(8 * 33_333_333L / 1_000_000L, p.captureMs)
+        assertEquals(4 * 33_333_333L / 1_000_000L, p.captureMs)
     }
 
     @Test

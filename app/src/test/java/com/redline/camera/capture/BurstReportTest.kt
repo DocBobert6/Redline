@@ -7,7 +7,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BurstReportTest {
-    private val plan8 = BurstPlan(frames = 8, iso = 100, exposureNs = 6_000_000L, frameDurationNs = 33_333_333L, underEv = 0.7)
+    private val plan8 =
+        BurstPlan(
+            frames = 8,
+            iso = 320,
+            exposureNs = 6_000_000L,
+            frameDurationNs = 33_333_333L,
+            underEv = 0.7,
+            light = "indoor",
+            residentFrames = 6
+        )
 
     private fun merged(stop: Int, behind: Int = 0, stress: Boolean = false) = BurstShot(
         plan = plan8,
@@ -70,6 +79,60 @@ class BurstReportTest {
         assertEquals(3, r.maxQueueDepth)
         assertEquals("Processing 1", r.overlay())
         assertNull(r.queue(0).overlay())
+    }
+
+    @Test
+    fun queuedShotsAreRecordedApartFromTheGate() {
+        var r = BurstReport(available = true)
+        r = r.record(merged(24), 1900, true).record(merged(35), 2000, true)
+        r = r.record(merged(24, behind = 2), 4100, true).record(merged(35, behind = 1), 3500, true)
+        assertEquals(true, r.saveGate)
+        assertEquals(2, r.queuedShots)
+        assertEquals(4100L, r.queuedMaxMs)
+        val q = r.toMap()["queued_shots"] as Map<*, *>
+        assertEquals(3800L, q["avg_shutter_to_saved_ms"])
+    }
+
+    @Test
+    fun framesByLightStreamingAndCheapestPath() {
+        val st = BurstStreaming(
+            framesMergedDuringCapture = 3,
+            maxBacklog = 4,
+            maxResidentFrames = 5,
+            threads = 4,
+            mergeTailMs = 500,
+            peakNativeMb = 65.0,
+            peakResidentMb = 180.0
+        )
+        val bright =
+            BurstPlan(frames = 4, iso = 64, exposureNs = 1_000_000L, frameDurationNs = 33_333_333L, light = "bright", residentFrames = 4)
+        var r = BurstReport(available = true)
+        r = r.record(merged(24).copy(streaming = st), 1800, true)
+        r =
+            r.record(
+                merged(35).copy(plan = bright, framesMerged = 4, streaming = st.copy(maxResidentFrames = 4, mergeTailMs = 300)),
+                1300,
+                true
+            )
+        r =
+            r.record(
+                BurstShot(BurstPlan(0, singleReason = "queue full; single-frame queue full"), 24, path = BurstShot.PATH_JPEG),
+                700,
+                true
+            )
+        assertEquals(listOf(1, 8, 8, 8), r.framesByLight["indoor"])
+        assertEquals(listOf(1, 4, 4, 4), r.framesByLight["bright"])
+        assertEquals(1, r.cameraJpegShots)
+        assertEquals(5, r.streamMaxResidentFrames)
+        assertEquals(180.0, r.peakResidentMb, 1e-9)
+        val m = r.toMap()
+        assertEquals(400L, (m["streaming"] as Map<*, *>)["avg_merge_tail_ms"])
+        assertEquals(listOf("bright", "indoor"), (m["frames_by_light"] as Map<*, *>).keys.toList())
+        val recent = m["recent_shots"] as List<*>
+        assertEquals(3, recent.size)
+        assertEquals("camera_jpeg", (recent.last() as Map<*, *>)["path"])
+        assertEquals(4, (recent[1] as Map<*, *>)["frames_planned"])
+        assertEquals("bright", (recent[1] as Map<*, *>)["light"])
     }
 
     @Test

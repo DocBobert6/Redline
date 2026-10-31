@@ -20,6 +20,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.util.Range
@@ -33,13 +34,17 @@ import com.redline.camera.capture.BurstInputs
 import com.redline.camera.capture.BurstPlan
 import com.redline.camera.capture.BurstPlanner
 import com.redline.camera.capture.BurstReport
+import com.redline.camera.capture.BurstShot
+import com.redline.camera.capture.BurstStreaming
 import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.FramePool
 import com.redline.camera.capture.MemoryBudget
 import com.redline.camera.capture.RawCopy
 import com.redline.camera.capture.ShotResult
+import com.redline.camera.capture.ShotRouter
 import com.redline.camera.capture.StillSaver
 import com.redline.camera.capture.StillShot
+import com.redline.camera.capture.StreamingMerge
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
@@ -154,7 +159,12 @@ data class ViewfinderSetup(
  * public call just posts there. Open on resume, close on pause; [close] completes once the device is
  * really closed, so the self-test can take the camera without fighting the viewfinder for it.
  */
-class ViewfinderController(context: Context, private val listener: Listener, version: String = "", colourPipeline: ColourPipeline? = null) {
+class ViewfinderController(
+    context: Context,
+    private val listener: Listener,
+    version: String = "",
+    private val colourPipeline: ColourPipeline? = null
+) {
     interface Listener {
         /** First onCaptureCompleted of a session, as SystemClock.elapsedRealtime(). */
         fun onFirstCapture(elapsedRealtimeMs: Long)
@@ -188,6 +198,9 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
 
         /** B22: the frame-buffer pool was sized (frames it may hold, MB per frame). */
         fun onPool(frames: Int, frameMb: Double) {}
+
+        /** B22a: the merge workers (native threads, their nice value), once at start-up. */
+        fun onMergeWorker(threads: Int, nice: Int) {}
     }
 
     /**
@@ -227,8 +240,22 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     private val executor = Executor { handler.post(it) }
     private val saver = StillSaver(context, version, colourPipeline)
 
-    /** B22: the background processing queue (single worker): merge, render, encode, save. */
-    private val saveExecutor = Executors.newSingleThreadExecutor()
+    /** B22: the background processing queue (single worker): render, encode, save. Mildly lowered priority. */
+    private val saveExecutor = Executors.newSingleThreadExecutor(niceThreads("redline-save"))
+
+    /**
+     * B22a: the streaming merge (single thread; the native pool works under it): frames are merged as they arrive,
+     * so the merge overlaps the capture. Same lowered priority, so preview rendering keeps the CPU it needs.
+     */
+    private val mergeExecutor = Executors.newSingleThreadExecutor(niceThreads("redline-merge"))
+    private val mergeThreads = RedlineNative.burstThreads()
+
+    init {
+        mergeExecutor.execute {
+            RedlineNative.setBurstWorkerNice(WORKER_NICE)
+            listener.onMergeWorker(mergeThreads, WORKER_NICE)
+        }
+    }
     private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
     // Camera-thread state.
@@ -266,10 +293,18 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     private var rawMinFrameNs = 0L
     private var meteredIso: Int? = null
     private var meteredExposureNs: Long? = null
+
+    /** Shots out of the camera and not yet saved (merging or on the save queue): the "Processing N" count. */
     private var jobs = 0
-    private var burstsQueued = 0
-    private var queuedPress: QueuedPress? = null
-    private val trimPool = Runnable { if (jobs == 0 && pending == null) pool?.trimIdle() }
+
+    /** Shots started and not yet saved or failed: a press with any ahead of it is "queued", not unhurried. */
+    private var inFlight = 0
+    private var burstsPending = 0
+    private var singlesPending = 0
+
+    /** B22a: presses that arrived while the camera was busy; they start in order, never refused. */
+    private val waitingPresses = ArrayDeque<QueuedPress>()
+    private val trimPool = Runnable { if (inFlight == 0 && pending == null) pool?.trimIdle() }
 
     @Volatile private var motionRadPerSec: Double? = null
 
@@ -287,8 +322,14 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val done: (ShotResult) -> Unit,
         /** B22: the burst plan (frames > 0: RAW burst after the JPEG frame), or the single-frame record; null = burst off. */
         val plan: BurstPlan?,
-        /** Pool buffers held by this shot: RAW copies first, then (burst) the merge output as the last one. */
-        val buffers: List<ByteBuffer>
+        /** Single-frame path: the pool buffer for its RAW copy (empty for the camera-JPEG path). */
+        val buffers: List<ByteBuffer>,
+        /** B22a: the burst's streaming state, null for a single frame. */
+        val run: BurstRun?,
+        /** B22a: [BurstShot.PATH_SINGLE] or [BurstShot.PATH_JPEG] for a single frame. */
+        val singlePath: String,
+        /** Shots in flight when this one was pressed. */
+        val queuedBehind: Int
     ) {
         var timestamp: Long? = null
         var result: TotalCaptureResult? = null
@@ -297,9 +338,26 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         var finished = false
         val burstResults = HashMap<Int, TotalCaptureResult>()
         val burstLost = HashSet<Int>()
-        val burstRaws = HashMap<Long, RawCopy>()
-        var nextBuffer = 0
-        val isBurst: Boolean get() = plan?.isBurst == true
+    }
+
+    /**
+     * B22a: one burst from its first RAW frame to its merge. Camera-thread state; [merge] runs on the merge thread.
+     * The burst owns at most [BurstPlan.residentFrames] pool buffers for its frames (plus the DNG's merge output);
+     * a buffer the merger hands back is reused for a later frame, or returned to the pool once all frames are in.
+     */
+    private inner class BurstRun(val plan: BurstPlan, slots: List<ByteBuffer>, val dngOut: ByteBuffer?) {
+        val merge = StreamingMerge(mergeThreads)
+        val free = ArrayDeque(slots)
+        val owned = LinkedHashSet<ByteBuffer>(slots).also { set -> dngOut?.let { set += it } }
+        val copies = ArrayList<RawCopy>()
+        val released = HashSet<Int>()
+        val arrivedTs = HashSet<Long>()
+        val waiting = ArrayList<Int>()
+        var started = false
+        var captureDone = false
+        var closed = false
+        var maxBacklog = 0
+        var maxResident = 0
     }
 
     fun open(
@@ -361,10 +419,11 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
 
     /**
      * Takes one still (JPEG, rendered from RAW while the B21 pipeline is on; plus DNG while the DNG toggle is on).
-     * B22: with burst merge on it is a RAW burst merged on the processing queue. [onCaptured] runs (camera thread)
-     * as soon as the frames are out of the camera, so the next shot can start; [done] runs on the processing
-     * thread once the files are written, or with a failure. A press while a capture is in flight waits for it (one
-     * press deep) instead of being dropped; a second waiting press, or a full queue, is refused (counted as blocked).
+     * B22: with burst merge on it is a RAW burst, merged on its own thread while the frames arrive (B22a). [onCaptured]
+     * runs (camera thread) as soon as the frames are out of the camera, so the next shot can start; [done] runs on the
+     * processing thread once the files are written, or with a failure. B22a: a press is never refused: one that
+     * arrives while a capture is in flight waits for it, and a busy queue sends the shot down a cheaper path (single
+     * RAW frame, then the camera JPEG) with the reason recorded.
      */
     fun capture(request: StillRequest, onCaptured: () -> Unit = {}, done: (ShotResult) -> Unit) {
         val at = SystemClock.elapsedRealtime()
@@ -409,6 +468,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
     fun release() {
         close()
         thread.quitSafely()
+        mergeExecutor.shutdown()
         saveExecutor.execute { pool?.trimIdle() }
         saveExecutor.shutdown()
     }
@@ -495,7 +555,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             val size = su!!.rawSize!!
             // B22: frames are copied into pool buffers on arrival and closed at once; a few spare images absorb a burst.
             val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, RAW_MAX_IMAGES)
-            r.setOnImageAvailableListener({ onRaw(it) }, handler)
+            r.setOnImageAvailableListener({ drainRaw() }, handler)
             rawReader = r
             outputs += OutputConfiguration(r.surface)
             ensurePool(size)
@@ -566,22 +626,11 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             return
         }
         if (pending != null) {
-            if (queuedPress == null) {
-                queuedPress = QueuedPress(request, onCaptured, done, pressedAtMs)
-            } else {
-                refuseBlocked(request, done, "busy: a press is already waiting for the camera")
-            }
-            return
-        }
-        if (jobs >= MAX_JOBS) {
-            refuseBlocked(request, done, "busy: $jobs shots waiting to be processed")
+            // B22a: never refused; it starts as soon as the camera is free (and then takes a fast path).
+            waitingPresses.addLast(QueuedPress(request, onCaptured, done, pressedAtMs))
             return
         }
         startShot(request, onCaptured, done, SystemClock.elapsedRealtime() - pressedAtMs)
-    }
-
-    private fun refuseBlocked(request: StillRequest, done: (ShotResult) -> Unit, why: String) {
-        saveExecutor.execute { done(ShotResult(ok = false, error = why, kept = request.keep, shutterBlocked = true)) }
     }
 
     /** The burst plan for the next shot, or null when burst merge is off (the shot is then exactly B21). */
@@ -606,9 +655,10 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                         isoRange = caps.isoRange!!,
                         exposureRangeNs = caps.exposureRangeNs!!,
                         rawMinFrameDurationNs = rawMinFrameNs,
-                        poolFreeFrames = p.available(),
-                        burstsQueued = burstsQueued,
-                        motionRadPerSec = motionRadPerSec
+                        poolFreeFrames = p.available() - if (rawWanted) 1 else 0,
+                        burstsQueued = burstsPending,
+                        motionRadPerSec = motionRadPerSec,
+                        pressesWaiting = waitingPresses.size
                     )
                 )
             }
@@ -625,23 +675,40 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val blocked = waitMs > BurstReport.SHUTTER_BLOCK_MS
         val doneWithWait: (ShotResult) -> Unit = { r -> done(r.copy(shutterWaitMs = waitMs, shutterBlocked = r.shutterBlocked || blocked)) }
         var plan = planShot(su)
-        var buffers: List<ByteBuffer> = emptyList()
+        var run: BurstRun? = null
         if (plan?.isBurst == true) {
-            buffers = pool!!.acquire(plan.frames + 1)
-            if (buffers.size < BurstPlanner.MIN_FRAMES + 1) {
-                pool!!.release(buffers)
-                buffers = emptyList()
-                plan = BurstPlan(frames = 0, singleReason = "not enough memory for ${BurstPlanner.MIN_FRAMES} frames")
-            } else if (buffers.size < plan.frames + 1) {
-                plan = plan.copy(frames = buffers.size - 1, limits = plan.limits + "memory")
+            val dngSlot = if (rawWanted) 1 else 0
+            val slots = pool!!.acquire(plan.residentFrames + dngSlot)
+            if (slots.size < BurstPlanner.MIN_FRAMES + dngSlot) {
+                pool!!.release(slots)
+                plan = BurstPlan(frames = 0, singleReason = "not enough memory for ${BurstPlanner.MIN_FRAMES} frames", light = plan.light)
+            } else {
+                val resident = slots.size - dngSlot
+                if (resident < plan.residentFrames) {
+                    val n = minOf(plan.frames, BurstPlanner.streamCap(resident, plan.frames, plan.frameDurationNs))
+                    plan = plan.copy(frames = n, residentFrames = resident, limits = plan.limits + "memory")
+                }
+                run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null)
             }
         }
-        val burst = plan?.isBurst == true
-        var wantRaw = !burst && sessionHasRaw && rawReader != null
-        if (wantRaw) {
-            buffers = pool?.acquire(1).orEmpty()
-            if (buffers.isEmpty()) wantRaw = false // no memory for a RAW copy: this shot is the camera JPEG
+        val burst = run != null
+        // Not a burst: the B21 single RAW frame, or the camera JPEG when the single-frame queue is full or memory is short.
+        var buffers: List<ByteBuffer> = emptyList()
+        var singlePath = BurstShot.PATH_JPEG
+        if (!burst) {
+            val wantsRaw = sessionHasRaw && rawReader != null
+            var (path, why) = ShotRouter.route(wantsRaw, singlesPending, pool?.available() ?: 0)
+            if (path == ShotRouter.Path.SINGLE_RAW) {
+                buffers = pool?.acquire(1).orEmpty()
+                if (buffers.isEmpty()) {
+                    path = ShotRouter.Path.CAMERA_JPEG
+                    why = "no memory for a RAW copy: camera JPEG"
+                }
+            }
+            if (path == ShotRouter.Path.SINGLE_RAW) singlePath = BurstShot.PATH_SINGLE
+            if (why != null && plan != null) plan = plan.copy(singleReason = listOfNotNull(plan.singleReason, why).joinToString("; "))
         }
+        val wantRaw = buffers.isNotEmpty()
         val orientation = CaptureMath.jpegOrientation(su.sensorOrientation, request.deviceDegrees, su.frontFacing)
         val shot = PendingShot(
             request = request,
@@ -654,8 +721,14 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             onCaptured = onCaptured,
             done = doneWithWait,
             plan = plan,
-            buffers = buffers
+            buffers = buffers,
+            run = run,
+            singlePath = singlePath,
+            queuedBehind = inFlight
         )
+        inFlight++
+        if (burst) burstsPending++
+        if (wantRaw) singlesPending++
         try {
             val first = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(target)
@@ -675,10 +748,9 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
                 applyManual(this, preview = false)
             }.build()
             pending = shot
-            if (burst) {
-                val p = plan!!
+            if (run != null) {
                 val requests = mutableListOf(first)
-                for (i in 1..p.frames) requests += burstRequest(cam, su, p, i)
+                for (i in 1..run.plan.frames) requests += burstRequest(cam, su, run.plan, i)
                 s.captureBurst(requests, stillCallback, handler)
             } else {
                 s.capture(first, stillCallback, handler)
@@ -689,9 +761,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         } catch (e: Exception) {
             Log.w(TAG, "still capture failed", e)
             pending = null
-            pool?.release(buffers)
-            saveExecutor.execute { doneWithWait(ShotResult(ok = false, error = "capture: ${e.javaClass.simpleName}", kept = request.keep)) }
-            afterShot()
+            failShot(shot, "capture: ${e.javaClass.simpleName}")
         }
     }
 
@@ -727,6 +797,7 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             if (tag is BurstTag) {
                 p.burstResults[tag.index] = result
                 if (tag.index == p.plan?.frames) frameStats.breakRun() // the preview paused for the burst
+                p.run?.let { startMerge(p, it) }
             } else {
                 listener.onStillValues(ResultValues.of(result))
                 p.result = result
@@ -774,25 +845,92 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         maybeFinish(p)
     }
 
-    /** B22: every RAW frame is copied into the shot's next pool buffer and its Image closed straight away. */
-    private fun onRaw(reader: ImageReader) {
-        val img = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
-        try {
-            val p = pending ?: return
-            val wanted = p.isBurst || (p.wantRaw && p.raw == null)
-            val rawSlots = if (p.isBurst) p.buffers.size - 1 else p.buffers.size
-            if (!wanted || p.nextBuffer >= rawSlots) return
-            val plane = img.planes.firstOrNull() ?: return
-            if (plane.pixelStride != 2) return
-            val copy = RawCopy.copy(plane.buffer, plane.rowStride, img.width, img.height, p.buffers[p.nextBuffer], img.timestamp)
-            p.nextBuffer++
-            if (p.isBurst) p.burstRaws[img.timestamp] = copy else p.raw = copy
-            maybeFinish(p)
-        } catch (e: Exception) {
-            Log.w(TAG, "RAW copy failed", e)
-        } finally {
-            img.close()
+    /**
+     * B22: every RAW frame is copied into a pool buffer and its Image closed straight away. B22a: a burst frame that
+     * finds none of the burst's buffers free stays in the camera's queue until the merge hands one back (the plan
+     * keeps that wait within [BurstPlanner.CAMERA_QUEUE_SLACK] frames).
+     */
+    private fun drainRaw() {
+        val reader = rawReader ?: return
+        while (true) {
+            val run = pending?.run
+            if (run != null && !run.captureDone && run.free.isEmpty()) return
+            val img = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
+            try {
+                val p = pending ?: continue
+                val plane = img.planes.firstOrNull() ?: continue
+                if (plane.pixelStride != 2) continue
+                val r = p.run
+                if (r != null) {
+                    if (r.captureDone || r.closed) continue
+                    val buf = r.free.removeFirst()
+                    val copy = RawCopy.copy(plane.buffer, plane.rowStride, img.width, img.height, buf, img.timestamp)
+                    val index = r.copies.size
+                    r.copies += copy
+                    r.arrivedTs += img.timestamp
+                    r.maxResident = maxOf(r.maxResident, r.owned.size - r.free.size - if (r.dngOut != null) 1 else 0)
+                    if (r.started) submitFrame(r, index) else r.waiting += index
+                    r.maxBacklog = maxOf(r.maxBacklog, r.copies.size - r.merge.added)
+                    startMerge(p, r)
+                    maybeFinish(p)
+                } else if (p.wantRaw && p.raw == null) {
+                    p.raw = RawCopy.copy(plane.buffer, plane.rowStride, img.width, img.height, p.buffers[0], img.timestamp)
+                    maybeFinish(p)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "RAW copy failed", e)
+            } finally {
+                img.close()
+            }
         }
+    }
+
+    /** B22a: starts the burst's streaming merge once its levels are known (a burst frame's result) and a frame is in. */
+    private fun startMerge(p: PendingShot, run: BurstRun) {
+        if (run.started || run.closed) return
+        val r = p.burstResults.values.firstOrNull() ?: return
+        val ch = characteristics ?: return
+        val first = run.copies.firstOrNull() ?: return
+        run.started = true
+        val levels = colourPipeline?.levels(r, ch)
+        val noise = StillSaver.noiseModel(r)
+        mergeExecutor.execute { run.merge.start(levels, noise, first.width, first.height) }
+        run.waiting.forEach { submitFrame(run, it) }
+        run.waiting.clear()
+    }
+
+    private fun submitFrame(run: BurstRun, index: Int) {
+        val copy = run.copies[index]
+        mergeExecutor.execute {
+            val released = run.merge.add(copy)
+            when {
+                released == null -> handler.post { onMergeFailed(run) }
+                released.isNotEmpty() -> handler.post { onReleased(run, released) }
+            }
+        }
+    }
+
+    /** The merge failed mid-burst: keep the earliest frame (rendered alone instead) and free the rest, so capture goes on. */
+    private fun onMergeFailed(run: BurstRun) {
+        if (run.closed) return
+        val unreleased = run.copies.indices.filter { it !in run.released }
+        if (unreleased.size > 1) onReleased(run, unreleased.drop(1).toIntArray())
+    }
+
+    /** Camera thread: frames the merger no longer needs; their buffers serve the burst's later frames, else the pool. */
+    private fun onReleased(run: BurstRun, indices: IntArray) {
+        if (run.closed) return
+        for (i in indices) {
+            if (!run.released.add(i)) continue
+            val buf = run.copies[i].buffer
+            if (!run.captureDone) {
+                run.free.addLast(buf)
+            } else {
+                run.owned.remove(buf)
+                pool?.release(listOf(buf))
+            }
+        }
+        drainRaw()
     }
 
     private fun maybeFinish(p: PendingShot) {
@@ -800,19 +938,13 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         val result = p.result ?: return
         val jpeg = p.jpeg ?: return
         if (p.wantRaw && p.raw == null) return
-        val plan = p.plan
-        var burst: BurstCapture? = null
-        if (p.isBurst && plan != null) {
-            val indices = (1..plan.frames).filter { it !in p.burstLost }
-            for (i in indices) {
+        val run = p.run
+        if (run != null) {
+            val plan = run.plan
+            for (i in (1..plan.frames).filter { it !in p.burstLost }) {
                 val r = p.burstResults[i] ?: return
                 val ts = r.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
-                if (p.burstRaws[ts] == null) return
-            }
-            val frames = indices.map { p.burstRaws[p.burstResults[it]!!.get(CaptureResult.SENSOR_TIMESTAMP)!!]!! }
-            val results = indices.map { p.burstResults[it]!! }
-            if (frames.isNotEmpty()) {
-                burst = BurstCapture(frames, results, p.buffers.last(), plan, SystemClock.elapsedRealtime() - p.shutterAtMs)
+                if (ts !in run.arrivedTs) return
             }
         }
         val ch = characteristics
@@ -822,20 +954,131 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         }
         p.finished = true
         pending = null
-        val r = p.request
-        val behind = jobs
         jobs++
-        if (burst != null) burstsQueued++
         listener.onQueueDepth(jobs)
-        val buffers = p.buffers
-        val currentPool = pool
-        val singlePlan = when {
-            plan == null -> null
-            plan.isBurst && burst == null -> BurstPlan(frames = 0, singleReason = "every burst frame was lost")
-            plan.isBurst -> null
-            else -> plan
+        p.onCaptured()
+        if (run != null) {
+            finishBurstCapture(p, run, result, jpeg, ch)
+        } else {
+            queueSave(p, buildShot(p, result, jpeg, ch, burst = null, queuedAtMs = SystemClock.elapsedRealtime(), keep = p.buffers))
         }
-        val shot = StillShot(
+        afterShot()
+    }
+
+    /**
+     * B22a: all burst frames are in. Spare buffers go back to the pool, and the merge thread finishes the merge (it
+     * has been merging since the first frames arrived): in place over the reference frame, or into the DNG's output
+     * buffer when the DNG needs the reference untouched.
+     */
+    private fun finishBurstCapture(p: PendingShot, run: BurstRun, result: TotalCaptureResult, jpeg: ByteArray, ch: CameraCharacteristics) {
+        val lastFrameAtMs = SystemClock.elapsedRealtime()
+        run.captureDone = true
+        pool?.release(run.free.toList())
+        run.owned.removeAll(run.free.toSet())
+        run.free.clear()
+        val captureMs = lastFrameAtMs - p.shutterAtMs
+        val mergedAtCapture = run.merge.added
+        if (!run.started) run.merge.fail("merge: no burst frame arrived")
+        val out = run.dngOut
+        mergeExecutor.execute {
+            val first = run.copies.firstOrNull()
+            val stats = if (first != null) run.merge.finish(out, first.rowStrideBytes) else null
+            run.merge.close()
+            val doneAtMs = SystemClock.elapsedRealtime()
+            handler.post { onBurstMerged(p, run, stats, result, jpeg, ch, captureMs, doneAtMs - lastFrameAtMs, mergedAtCapture) }
+        }
+    }
+
+    /** Camera thread: the merge is done (or failed). Keeps the buffers the save needs and queues it. */
+    private fun onBurstMerged(
+        p: PendingShot,
+        run: BurstRun,
+        stats: RedlineNative.MergeStats?,
+        result: TotalCaptureResult,
+        jpeg: ByteArray,
+        ch: CameraCharacteristics,
+        captureMs: Long,
+        tailMs: Long,
+        mergedAtCapture: Int
+    ) {
+        if (run.closed) return
+        run.closed = true
+        fun resultFor(copy: RawCopy): TotalCaptureResult = p.burstResults.values.firstOrNull {
+            it.get(CaptureResult.SENSOR_TIMESTAMP) == copy.timestampNs
+        } ?: p.burstResults.values.firstOrNull() ?: result
+        val keep = ArrayList<ByteBuffer>()
+        var merged: RawCopy? = null
+        var dngRaw: RawCopy? = null
+        var fallbackRaw: RawCopy? = null
+        var refResult = result
+        val ref = stats?.reference?.let { run.copies.getOrNull(it) }
+        if (stats != null && ref != null) {
+            refResult = resultFor(ref)
+            val out = run.dngOut
+            if (out != null) {
+                merged = RawCopy(out, ref.width, ref.height, ref.timestampNs)
+                dngRaw = ref
+                keep += out
+            } else {
+                merged = ref // merged in place
+            }
+            keep += ref.buffer
+        } else {
+            // The merge failed: the earliest frame still held is rendered alone (and is the DNG).
+            val f = run.copies.indices.firstOrNull { it !in run.released }?.let { run.copies[it] }
+            if (f != null) {
+                fallbackRaw = f
+                refResult = resultFor(f)
+                if (p.saveDng) dngRaw = f
+                keep += f.buffer
+            }
+        }
+        val spare = run.owned.filter { b -> keep.none { it === b } }
+        pool?.release(spare)
+        val frameMb = (run.copies.firstOrNull()?.let { it.width.toLong() * it.height * 2 } ?: 0L) / 1_048_576.0
+        val streaming = BurstStreaming(
+            framesMergedDuringCapture = mergedAtCapture,
+            maxBacklog = run.maxBacklog,
+            maxResidentFrames = run.maxResident,
+            maxHeldByMerger = stats?.maxHeldFrames ?: 0,
+            threads = stats?.threads ?: mergeThreads,
+            mergeTailMs = tailMs,
+            peakNativeMb = stats?.peakNativeMb ?: 0.0,
+            peakResidentMb = (run.maxResident + if (run.dngOut != null) 1 else 0) * frameMb + (stats?.peakNativeMb ?: 0.0)
+        )
+        val capture = BurstCapture(
+            plan = run.plan,
+            framesCaptured = run.copies.size,
+            merged = merged,
+            mergedScale = run.merge.scale,
+            stats = stats,
+            referenceResult = refResult,
+            dngRaw = dngRaw,
+            fallbackRaw = fallbackRaw,
+            fallbackResult = fallbackRaw?.let { refResult },
+            fallbackReason = if (stats == null) run.merge.error ?: "merge: no frames merged" else null,
+            noiseModel = run.merge.noiseModel,
+            captureMs = captureMs,
+            mergeTailMs = tailMs,
+            streaming = streaming
+        )
+        queueSave(p, buildShot(p, result, jpeg, ch, capture, SystemClock.elapsedRealtime(), keep))
+    }
+
+    private fun buildShot(
+        p: PendingShot,
+        result: TotalCaptureResult,
+        jpeg: ByteArray,
+        ch: CameraCharacteristics,
+        burst: BurstCapture?,
+        queuedAtMs: Long,
+        keep: List<ByteBuffer>
+    ): StillShot {
+        val r = p.request
+        val plan = p.plan
+        val currentPool = pool
+        val hasRaw = p.raw != null || burst?.merged != null || burst?.fallbackRaw != null
+        return StillShot(
             jpeg = jpeg,
             raw = p.raw,
             result = result,
@@ -847,30 +1090,35 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             stopLongPx = r.stopLongPx,
             shutterAtMs = p.shutterAtMs,
             keep = r.keep,
-            saveDng = p.saveDng && (p.raw != null || burst != null),
-            renderRaw = p.renderRaw && (p.raw != null || burst != null),
+            saveDng = p.saveDng && (p.raw != null || burst?.dngRaw != null),
+            renderRaw = p.renderRaw && hasRaw,
             cameraId = setup?.cameraId ?: "",
             zoomRatio = p.zoomRatio,
             burst = burst,
-            singlePlan = singlePlan,
+            singlePlan = if (plan == null || plan.isBurst) null else plan,
+            singlePath = p.singlePath,
             stress = r.stress,
-            queuedBehind = behind,
-            queuedAtMs = SystemClock.elapsedRealtime(),
-            release = { currentPool?.release(buffers) }
+            queuedBehind = p.queuedBehind,
+            queuedAtMs = queuedAtMs,
+            release = { currentPool?.release(keep) }
         )
-        val wasBurst = burst != null
-        p.onCaptured()
+    }
+
+    private fun queueSave(p: PendingShot, shot: StillShot) {
+        val wasBurst = p.run != null
+        val wasSingle = p.wantRaw
         saveExecutor.execute {
             val out = saver.save(shot) { SystemClock.elapsedRealtime() }
             handler.post {
                 jobs--
-                if (wasBurst) burstsQueued--
+                inFlight--
+                if (wasBurst) burstsPending--
+                if (wasSingle) singlesPending--
                 listener.onQueueDepth(jobs)
-                if (jobs == 0) handler.postDelayed(trimPool, POOL_TRIM_IDLE_MS)
+                if (inFlight == 0) handler.postDelayed(trimPool, POOL_TRIM_IDLE_MS)
             }
             p.done(out)
         }
-        afterShot()
     }
 
     private fun failShot(p: PendingShot, message: String) {
@@ -878,6 +1126,19 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         p.finished = true
         if (pending === p) pending = null
         pool?.release(p.buffers)
+        p.run?.let { run ->
+            // Queued merge work finishes first (it still reads the frames); then every buffer goes back.
+            run.closed = true
+            run.captureDone = true
+            mergeExecutor.execute {
+                run.merge.fail(message)
+                run.merge.close()
+                handler.post { pool?.release(run.owned.toList()) }
+            }
+        }
+        inFlight--
+        if (p.run != null) burstsPending--
+        if (p.wantRaw) singlesPending--
         saveExecutor.execute { p.done(ShotResult(ok = false, error = message, dngWanted = p.saveDng, kept = p.request.keep)) }
         p.onCaptured()
         afterShot()
@@ -891,10 +1152,15 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
             val target = surface
             if (cam != null && target != null) rebuildSession(cam, target)
         }
-        // B22: a press that arrived during the capture starts now (after any rebuild, once the session is back).
-        val q = queuedPress ?: return
-        queuedPress = null
-        handler.post { captureOnThread(q.request, q.onCaptured, q.done, q.atMs) }
+        // A press that arrived during the capture starts now (after any rebuild, once the session is back).
+        val q = waitingPresses.removeFirstOrNull() ?: return
+        handler.post {
+            if (pending != null) {
+                waitingPresses.addFirst(q)
+            } else {
+                captureOnThread(q.request, q.onCaptured, q.done, q.atMs)
+            }
+        }
     }
 
     private fun stabilizationMode(): Int = if (stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1060,8 +1326,19 @@ class ViewfinderController(context: Context, private val listener: Listener, ver
         private const val WARMUP_MS = 2_000L
         private const val SHOT_TIMEOUT_MS = 5_000L
 
-        /** B22: shots on the processing queue before presses are refused (bursts beyond 2 already go single-frame). */
-        private const val MAX_JOBS = 12
+        /**
+         * B22a: nice value of the merge and save threads and the native merge workers: below the default so the
+         * camera, the preview's GL thread and the UI win the CPU, but well short of THREAD_PRIORITY_BACKGROUND (10),
+         * which Android may also confine to the little cores.
+         */
+        const val WORKER_NICE = 5
+
+        private fun niceThreads(name: String) = java.util.concurrent.ThreadFactory { r ->
+            Thread({
+                runCatching { Process.setThreadPriority(WORKER_NICE) }
+                r.run()
+            }, name)
+        }
         private const val RAW_MAX_IMAGES = 4
 
         /** Idle pool buffers are freed once the queue has been empty this long. */

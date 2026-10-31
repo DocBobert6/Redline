@@ -24,7 +24,6 @@ import com.redline.camera.nativebridge.RedlineNative
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.OutputStream
-import java.nio.ByteBuffer
 
 /** Everything one still capture produced, handed from the camera thread to the saver. */
 class StillShot(
@@ -51,23 +50,39 @@ class StillShot(
     val burst: BurstCapture? = null,
     /** B22: the single-frame path's record for the burst report (why no burst), or null when burst merge is off. */
     val singlePlan: BurstPlan? = null,
+    /** B22a: [BurstShot.PATH_SINGLE] (a RAW frame rendered alone) or [BurstShot.PATH_JPEG] (the camera JPEG). */
+    val singlePath: String = BurstShot.PATH_SINGLE,
     val stress: Boolean = false,
-    /** Jobs ahead of this one when it was queued. */
+    /** Shots still in flight (capturing, merging or saving) when this one was pressed. */
     val queuedBehind: Int = 0,
-    /** When the capture was complete and the job queued (SystemClock.elapsedRealtime). */
+    /** When the job was queued for saving (SystemClock.elapsedRealtime): capture complete, or a burst's merge done. */
     val queuedAtMs: Long = shutterAtMs,
     /** Returns the shot's pool buffers; called exactly once by the saver when it is done. */
     val release: () -> Unit = {}
 )
 
-/** B22: the burst frames (frame order) with their results, the pool buffer the merge writes into, and the plan. */
+/**
+ * B22a: a burst after its streaming merge: the merged mosaic (x [mergedScale]) in a pool buffer, the reference
+ * frame's capture result, the untouched reference for the DNG (DNG on), or, when the merge failed, one RAW frame to
+ * render alone (the B21 single-frame path).
+ */
 class BurstCapture(
-    val frames: List<RawCopy>,
-    val results: List<TotalCaptureResult>,
-    val out: ByteBuffer,
     val plan: BurstPlan,
+    val framesCaptured: Int,
+    val merged: RawCopy?,
+    val mergedScale: Float,
+    val stats: RedlineNative.MergeStats?,
+    val referenceResult: TotalCaptureResult,
+    val dngRaw: RawCopy?,
+    val fallbackRaw: RawCopy?,
+    val fallbackResult: TotalCaptureResult?,
+    val fallbackReason: String?,
+    val noiseModel: String?,
     /** Shutter to the last frame in, ms. */
-    val captureMs: Long
+    val captureMs: Long,
+    /** Last frame in to merge finished, ms. */
+    val mergeTailMs: Long,
+    val streaming: BurstStreaming
 )
 
 /**
@@ -78,9 +93,10 @@ class BurstCapture(
  * saved to DCIM/Redline through MediaStore. With the DNG toggle on, the RAW frame is also written as a DNG with
  * DngCreator (full sensor, uncropped, no crop tag).
  *
- * B22: a burst shot is aligned and merged natively first and the merged mosaic rendered the same way; if the merge
- * or its render fails, the burst's reference frame is rendered alone (the B21 single-frame path). The DNG is always
- * the single reference frame (full sensor, uncropped); a DNG of the merge is B25.
+ * B22: a burst shot is aligned and merged natively and the merged mosaic rendered the same way. B22a: the merge
+ * streams on its own thread while the frames arrive (ViewfinderController), so the saver receives the merged mosaic;
+ * if the merge failed, one burst frame is rendered alone (the B21 single-frame path), and if nothing renders, the
+ * camera JPEG is saved. The DNG is always the single reference frame (full sensor, uncropped); a DNG of the merge is B25.
  */
 class StillSaver(context: Context, private val version: String, private val pipeline: ColourPipeline? = null) {
     private val app = context.applicationContext
@@ -102,60 +118,49 @@ class StillSaver(context: Context, private val version: String, private val pipe
         var rendered: Bitmap? = null
         var dngRaw: RawCopy? = shot.raw
         var dngResult: TotalCaptureResult = shot.result
-        var burstShot: BurstShot? = shot.singlePlan?.let { BurstShot(plan = it, stopMm = shot.stopTargetMm, stress = shot.stress) }
+        var burstShot: BurstShot? = shot.singlePlan?.let {
+            BurstShot(plan = it, stopMm = shot.stopTargetMm, stress = shot.stress, queuedBehind = shot.queuedBehind, path = shot.singlePath)
+        }
         val b = shot.burst
         if (b != null) {
-            val timings = linkedMapOf("capture" to b.captureMs, "queue_wait" to (startMs - shot.queuedAtMs).coerceAtLeast(0))
-            var ref = 0
-            var stats: RedlineNative.MergeStats? = null
-            var fallback: String? = null
-            var noiseModel: String? = null
-            var scale = MERGE_SCALE
+            val timings = linkedMapOf(
+                "capture" to b.captureMs,
+                "merge_tail" to b.mergeTailMs,
+                "queue_wait" to (startMs - shot.queuedAtMs).coerceAtLeast(0)
+            )
+            val stats = b.stats
+            var fallback: String? = b.fallbackReason
+            stats?.let {
+                timings["merge_total"] = Math.round(it.pyramidMs + it.referenceMs + it.alignMs + it.mergeMs + it.finishMs)
+                timings["pyramid"] = Math.round(it.pyramidMs)
+                timings["reference"] = Math.round(it.referenceMs)
+                timings["align"] = Math.round(it.alignMs)
+                timings["merge"] = Math.round(it.mergeMs)
+                timings["finish"] = Math.round(it.finishMs)
+            }
+            var mergedOk = false
             if (shot.renderRaw && pipeline != null) {
-                val t = nowMs()
-                try {
-                    val levels = pipeline.levels(b.results[0], shot.characteristics) ?: error("no black/white levels")
-                    val noise = noiseModel(b.results[0])
-                    noiseModel = noise.third
-                    scale = mergeScale(levels.second)
-                    val f0 = b.frames[0]
-                    stats = RedlineNative.mergeBurst(
-                        b.frames.map { it.buffer }, f0.width, f0.height, f0.rowStrideBytes, levels.first, levels.second,
-                        noise.first, noise.second, -1, threads(), b.out, scale
-                    )
-                    ref = stats.reference
-                } catch (e: Exception) {
-                    fallback = "merge: ${e.javaClass.simpleName}: ${e.message}"
-                } catch (e: OutOfMemoryError) {
-                    fallback = "merge: out of memory"
-                }
-                timings["merge_total"] = nowMs() - t
-                stats?.let {
-                    timings["pyramid"] = Math.round(it.pyramidMs)
-                    timings["reference"] = Math.round(it.referenceMs)
-                    timings["align"] = Math.round(it.alignMs)
-                    timings["merge"] = Math.round(it.mergeMs)
-                    timings["finish"] = Math.round(it.finishMs)
-                    val f0 = b.frames[0]
-                    val merged = RawCopy(b.out, f0.width, f0.height, b.frames[ref].timestampNs)
+                val m = b.merged
+                if (m != null && stats != null) {
                     val o = pipeline.render(
-                        merged,
-                        b.results[ref],
+                        m,
+                        b.referenceResult,
                         shot.characteristics,
                         shot.cameraId,
                         shot.jpeg,
                         shot.zoomRatio,
                         shot.stopLongPx,
-                        scale
+                        b.mergedScale
                     )
                     rendered = o.bitmap
                     colour = o.shot
-                    if (rendered == null) fallback = "merged render: ${o.shot.fallbackReason}"
+                    if (rendered == null) fallback = "merged render: ${o.shot.fallbackReason}" else mergedOk = true
                 }
-                if (rendered == null) {
+                val f = b.fallbackRaw
+                if (rendered == null && f != null) {
                     val o = pipeline.render(
-                        b.frames[ref],
-                        b.results[ref],
+                        f,
+                        b.fallbackResult ?: b.referenceResult,
                         shot.characteristics,
                         shot.cameraId,
                         shot.jpeg,
@@ -169,25 +174,26 @@ class StillSaver(context: Context, private val version: String, private val pipe
             } else {
                 fallback = "colour pipeline unavailable"
             }
-            dngRaw = b.frames[ref]
-            dngResult = b.results[ref]
+            dngRaw = b.dngRaw
+            dngResult = b.referenceResult
             val per = stats?.perFrame.orEmpty()
             burstShot = BurstShot(
                 plan = b.plan,
                 stopMm = shot.stopTargetMm,
-                framesCaptured = b.frames.size,
-                framesMerged = if (stats != null && fallback == null) stats.frames else 0,
-                reference = if (stats != null) ref else null,
-                merged = stats != null && fallback == null,
-                fallbackReason = fallback,
-                noiseModel = noiseModel,
+                framesCaptured = b.framesCaptured,
+                framesMerged = if (mergedOk) stats?.frames ?: 0 else 0,
+                reference = stats?.reference,
+                merged = mergedOk,
+                fallbackReason = if (mergedOk) null else fallback ?: "merge unavailable",
+                noiseModel = b.noiseModel,
                 meanDispPx = per.takeIf { it.isNotEmpty() }?.map { it.meanDispPx }?.average(),
                 maxDispPx = per.maxOfOrNull { it.maxDispPx },
                 meanWeight = per.takeIf { it.isNotEmpty() }?.map { it.meanWeight }?.average(),
                 rejectedFraction = per.takeIf { it.isNotEmpty() }?.map { it.rejectedFraction }?.average(),
                 timingsMs = timings,
                 queuedBehind = shot.queuedBehind,
-                stress = shot.stress
+                stress = shot.stress,
+                streaming = b.streaming
             )
         } else if (shot.renderRaw && shot.raw != null && pipeline != null) {
             val o = pipeline.render(shot.raw, shot.result, shot.characteristics, shot.cameraId, shot.jpeg, shot.zoomRatio, shot.stopLongPx)
@@ -254,23 +260,6 @@ class StillSaver(context: Context, private val version: String, private val pipe
             burst = burstShot
         )
     }
-
-    /**
-     * Camera2 SENSOR_NOISE_PROFILE (S, O per CFA channel, normalised signal) averaged over channels; without it a
-     * rough ISO-scaled default (marked in the report).
-     */
-    private fun noiseModel(r: TotalCaptureResult): Triple<Double, Double, String> {
-        val p = runCatching { r.get(CaptureResult.SENSOR_NOISE_PROFILE) }.getOrNull()
-        if (p != null && p.isNotEmpty()) {
-            val s = p.map { it.first }.average()
-            val o = p.map { it.second }.average()
-            if (s.isFinite() && o.isFinite() && s >= 0 && o >= 0) return Triple(s, o, "camera")
-        }
-        val iso = (r.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100).toDouble()
-        return Triple(DEFAULT_NOISE_S_PER_ISO * iso, DEFAULT_NOISE_O_PER_ISO2 * iso * iso, "iso_default")
-    }
-
-    private fun threads(): Int = Runtime.getRuntime().availableProcessors().coerceIn(1, MAX_THREADS)
 
     /** B21: the pipeline's bitmap (sensor orientation) as the JPEG; EXIF orientation comes from the shot. */
     private fun saveRendered(shot: StillShot, bmp: Bitmap, base: String, look: String): Dim {
@@ -396,7 +385,21 @@ class StillSaver(context: Context, private val version: String, private val pipe
 
         /** [MERGE_SCALE], or less for a sensor whose white level would overflow 16 bits. */
         fun mergeScale(white: Float): Float = minOf(MERGE_SCALE, kotlin.math.floor(65535f / white)).coerceAtLeast(1f)
-        private const val MAX_THREADS = 8
+
+        /**
+         * Camera2 SENSOR_NOISE_PROFILE (S, O per CFA channel, normalised signal) averaged over channels; without it a
+         * rough ISO-scaled default (marked in the report).
+         */
+        fun noiseModel(r: TotalCaptureResult): Triple<Double, Double, String> {
+            val p = runCatching { r.get(CaptureResult.SENSOR_NOISE_PROFILE) }.getOrNull()
+            if (p != null && p.isNotEmpty()) {
+                val s = p.map { it.first }.average()
+                val o = p.map { it.second }.average()
+                if (s.isFinite() && o.isFinite() && s >= 0 && o >= 0) return Triple(s, o, "camera")
+            }
+            val iso = (r.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100).toDouble()
+            return Triple(DEFAULT_NOISE_S_PER_ISO * iso, DEFAULT_NOISE_O_PER_ISO2 * iso * iso, "iso_default")
+        }
 
         /** Rough noise model when the result has no SENSOR_NOISE_PROFILE (normalised units). */
         private const val DEFAULT_NOISE_S_PER_ISO = 2e-6

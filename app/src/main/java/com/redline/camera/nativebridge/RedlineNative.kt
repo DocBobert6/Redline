@@ -134,6 +134,10 @@ object RedlineNative {
         val alignMs: Double,
         val mergeMs: Double,
         val finishMs: Double,
+        /** B22a: worker threads used (the caller included), the most frames held at once, the merger's own peak memory. */
+        val threads: Int,
+        val maxHeldFrames: Int,
+        val peakNativeMb: Double,
         val perFrame: List<MergedFrame>
     )
 
@@ -160,6 +164,10 @@ object RedlineNative {
         val r = nativeMergeBurst(
             frames.toTypedArray(), width, height, rowStrideBytes, black, white, noiseS, noiseO, reference, threads, out, outScale
         )
+        return mergeStats(r)
+    }
+
+    private fun mergeStats(r: FloatArray): MergeStats {
         val per = (MERGE_HEADER until r.size step MERGE_PER_FRAME).map { i ->
             MergedFrame(
                 r[i].toInt(),
@@ -173,8 +181,60 @@ object RedlineNative {
         }
         return MergeStats(
             r[0].toInt(), r[1].toInt(), r[2].toInt(), r[3].toInt(), r[4].toDouble(), r[5].toDouble(), r[6].toDouble(),
-            r[7].toDouble(), r[8].toDouble(), per
+            r[7].toDouble(), r[8].toDouble(), r[9].toInt(), r[10].toInt(), r[11].toDouble(), per
         )
+    }
+
+    /**
+     * B22a streaming merge of one burst: [add] each RAW frame as it arrives (in capture order), then [finish]. [add]
+     * returns the indices (0-based, capture order) of frames whose buffers the merger no longer needs; [finish]
+     * releases the rest. Use from one thread; always [close].
+     */
+    class BurstMerger internal constructor(private var handle: Long) : AutoCloseable {
+        fun add(frame: ByteBuffer, rowStrideBytes: Int): IntArray {
+            check(handle != 0L) { "merger closed" }
+            return nativeMergerAdd(handle, frame, rowStrideBytes)
+        }
+
+        /** Writes the merge into [out] (uint16 x [outScale]); null writes it in place over the reference frame's buffer. */
+        fun finish(out: ByteBuffer?, rowStrideBytes: Int, outScale: Float): MergeStats {
+            check(handle != 0L) { "merger closed" }
+            return mergeStats(nativeMergerFinish(handle, out, rowStrideBytes, outScale))
+        }
+
+        override fun close() {
+            if (handle != 0L) {
+                nativeMergerDestroy(handle)
+                handle = 0L
+            }
+        }
+    }
+
+    /** A streaming merger ([reference] -1: the sharpest of the first 3). Throws like [mergeBurst]. */
+    fun burstMerger(
+        width: Int,
+        height: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        reference: Int,
+        threads: Int
+    ): BurstMerger {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        return BurstMerger(nativeMergerCreate(width, height, black, white, noiseS, noiseO, reference, threads))
+    }
+
+    /** Merge worker threads: the CPU's performance cores (not the little ones), 2..8; a guess when not loaded. */
+    fun burstThreads(): Int = if (load().loaded) {
+        nativeBurstThreads()
+    } else {
+        (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 8)
+    }
+
+    /** Nice value of the native merge workers (they inherit nothing from the calling thread once created). */
+    fun setBurstWorkerNice(nice: Int) {
+        if (load().loaded) nativeBurstWorkerNice(nice)
     }
 
     class BurstSelfCheck(val alignedFraction: Double, val noiseRatio: Double, val ms: Double)
@@ -186,7 +246,7 @@ object RedlineNative {
         return BurstSelfCheck(r[0].toDouble(), r[1].toDouble(), r[2].toDouble())
     }
 
-    private const val MERGE_HEADER = 9
+    private const val MERGE_HEADER = 12
     private const val MERGE_PER_FRAME = 7
 
     @JvmStatic
@@ -213,6 +273,33 @@ object RedlineNative {
 
     @JvmStatic
     private external fun nativeBurstSelfCheck(threads: Int): FloatArray
+
+    @JvmStatic
+    private external fun nativeMergerCreate(
+        width: Int,
+        height: Int,
+        black: FloatArray,
+        white: Float,
+        noiseS: Double,
+        noiseO: Double,
+        reference: Int,
+        threads: Int
+    ): Long
+
+    @JvmStatic
+    private external fun nativeMergerAdd(handle: Long, frame: ByteBuffer, rowStrideBytes: Int): IntArray
+
+    @JvmStatic
+    private external fun nativeMergerFinish(handle: Long, out: ByteBuffer?, rowStrideBytes: Int, outScale: Float): FloatArray
+
+    @JvmStatic
+    private external fun nativeMergerDestroy(handle: Long)
+
+    @JvmStatic
+    private external fun nativeBurstThreads(): Int
+
+    @JvmStatic
+    private external fun nativeBurstWorkerNice(nice: Int)
 
     @JvmStatic
     private external fun nativeVersion(): String

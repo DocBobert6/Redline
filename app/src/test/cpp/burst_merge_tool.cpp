@@ -4,7 +4,7 @@
 //   burst_merge_tool <params.txt> <out.f32> <disp.i32>
 //
 // params.txt is whitespace-separated "key value..." records:
-//   width W  height H  black B0 B1 B2 B3  white WL  noise S O  threads T  reference R (-1 = auto)
+//   width W  height H  black B0 B1 B2 B3  white WL  noise S O  threads T (0 = recommended)  reference R (-1 = auto)
 //   frames N PATH1 .. PATHN   (uint16 little-endian, W*H, no padding)
 // Writes the merged frame as float32 W*H, the displacements as int32 (per frame in order, tilesY*tilesX*(dy, dx);
 // zeros for the reference) and prints one JSON line of stats on stdout.
@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
         if (static_cast<std::size_t>(f.gcount()) != count * 2) return fail("short frame " + paths[i]);
         frames.push_back({data[i].data(), p.width});
     }
+    if (p.threads <= 0) p.threads = redline::burstRecommendedThreads();
     std::vector<float> out(count);
     redline::BurstResult r;
     const std::string err = redline::mergeBurstFloat(frames, p, out.data(), static_cast<std::size_t>(p.width), r);
@@ -74,9 +75,11 @@ int main(int argc, char** argv) {
         }
         d.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(nt * sizeof(std::int32_t)));
     }
-    std::printf("{\"reference\": %d, \"tiles_x\": %d, \"tiles_y\": %d, \"pyramid_ms\": %.2f, \"reference_ms\": %.2f, "
+    std::printf("{\"reference\": %d, \"tiles_x\": %d, \"tiles_y\": %d, \"threads\": %d, \"max_held_frames\": %d, "
+                "\"peak_native_mb\": %.1f, \"pyramid_ms\": %.2f, \"reference_ms\": %.2f, "
                 "\"align_ms\": %.2f, \"merge_ms\": %.2f, \"finish_ms\": %.2f, \"frames\": [",
-                r.reference, r.tilesX, r.tilesY, r.pyramidMs, r.referenceMs, r.alignMs, r.mergeMs, r.finishMs);
+                r.reference, r.tilesX, r.tilesY, r.threads, r.maxHeldFrames, r.peakNativeMb, r.pyramidMs, r.referenceMs, r.alignMs,
+                r.mergeMs, r.finishMs);
     for (std::size_t i = 0; i < r.frames.size(); ++i) {
         const auto& s = r.frames[i];
         std::printf("%s{\"index\": %d, \"mean_disp_px\": %.4f, \"max_disp_px\": %.1f, \"mean_weight\": %.6f, "
