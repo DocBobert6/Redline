@@ -52,7 +52,9 @@ data class BurstShot(
     val stress: Boolean = false,
     /** B22a: "burst", "single_raw" (B21 single frame) or "camera_jpeg" (the cheapest path; [plan] says why). */
     val path: String = if (plan.isBurst) PATH_BURST else PATH_SINGLE,
-    val streaming: BurstStreaming? = null
+    val streaming: BurstStreaming? = null,
+    /** B22b: press-to-file timeline ([ShotTimeline.toMap]): per-frame capture, RAW arrival, result, merge and save times. */
+    val timeline: Map<String, Any?>? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "plan" to plan.toMap(),
@@ -73,7 +75,8 @@ data class BurstShot(
         "timings_ms" to timingsMs,
         "queued_behind" to queuedBehind,
         "path" to path,
-        "streaming" to streaming?.toMap()
+        "streaming" to streaming?.toMap(),
+        "timeline" to timeline
     )
 
     /** One line of the report's recent-shots list: frames planned against the light level, and how it went. */
@@ -86,6 +89,9 @@ data class BurstShot(
         "frames_merged" to framesMerged,
         "single_reason" to plan.singleReason,
         "queued_behind" to queuedBehind,
+        "shutter_release_ms" to timingsMs["shutter_release"],
+        "capture_ms" to timingsMs["capture"],
+        "merge_tail_ms" to timingsMs["merge_tail"],
         "total_ms" to totalMs
     )
 
@@ -153,7 +159,14 @@ data class BurstReport(
     val streamTailTotalMs: Long = 0,
     val peakResidentMb: Double = 0.0,
     val peakNativeMb: Double = 0.0,
-    val recent: List<Map<String, Any?>> = emptyList()
+    val recent: List<Map<String, Any?>> = emptyList(),
+    /** B22b: presses not taken because [PressPolicy.MAX_WAITING_PRESSES] were already waiting (counted as blocked too). */
+    val refusedPresses: Int = 0,
+    /** B22b: presses / shots dropped without a capture failure (left the viewfinder, session rebuilt), by reason. */
+    val droppedShots: Int = 0,
+    val dropReasons: Map<String, Int> = emptyMap(),
+    /** B22b: timelines of the latest shots ([ShotTimeline.toMap]), newest last. */
+    val recentTimelines: List<Map<String, Any?>> = emptyList()
 ) {
     val enabled: Boolean get() = userSetting && available == true
 
@@ -173,6 +186,13 @@ data class BurstReport(
         stressBlocked = stressBlocked + if (stress && blocked) 1 else 0
     )
 
+    /** B22b: a press that ended without a shot: refused (queue full) or dropped ([why]); never a capture failure. */
+    fun drop(why: String, refused: Boolean): BurstReport = if (refused) {
+        copy(refusedPresses = refusedPresses + 1)
+    } else {
+        copy(droppedShots = droppedShots + 1, dropReasons = dropReasons + (why to (dropReasons[why] ?: 0) + 1))
+    }
+
     fun queue(depth: Int): BurstReport = copy(
         queueDepth = depth,
         maxQueueDepth = max(maxQueueDepth, depth),
@@ -189,7 +209,17 @@ data class BurstReport(
             last = shot,
             stressDone = stressDone + if (stress) 1 else 0,
             stressFailures = stressFailures + if (stress && !ok) 1 else 0,
-            recent = (recent + shot.brief(shutterToSavedMs)).takeLast(RECENT_SHOTS)
+            recent = (recent + shot.brief(shutterToSavedMs)).takeLast(RECENT_SHOTS),
+            recentTimelines = shot.timeline?.let { t ->
+                (
+                    recentTimelines + (
+                        linkedMapOf<String, Any?>(
+                            "path" to shot.path,
+                            "queued_behind" to shot.queuedBehind
+                        ) + t
+                        )
+                    ).takeLast(RECENT_TIMELINES)
+            } ?: recentTimelines
         )
         if (!shot.plan.isBurst) {
             val why = shot.plan.singleReason ?: "?"
@@ -315,7 +345,12 @@ data class BurstReport(
         "shutter_blocked" to shutterBlocked,
         "shutter_waits" to shutterWaits,
         "max_shutter_wait_ms" to maxShutterWaitMs,
+        "refused_presses_queue_full" to refusedPresses,
+        "dropped_shots" to droppedShots,
+        "drop_reasons" to dropReasons,
+        "max_waiting_presses" to PressPolicy.MAX_WAITING_PRESSES,
         "last" to last?.toMap(),
+        "recent_timelines" to recentTimelines,
         "stress" to linkedMapOf(
             "requested" to stressRequested,
             "done" to stressDone,
@@ -331,8 +366,10 @@ data class BurstReport(
     )
 
     companion object {
-        const val LABEL = "RAW burst merge (B22a): 4-12 under-exposed RAW frames by light, streaming tile align + merge, background queue"
+        const val LABEL =
+            "RAW burst merge (B22b): 4-12 under-exposed RAW frames by light, align + merge streamed from the first frame, background queue"
         const val RECENT_SHOTS = 12
+        const val RECENT_TIMELINES = 4
 
         private fun lightOrder(light: String): Int =
             BurstPlanner.LIGHT_LEVELS.indexOfFirst { it.first == light }.let { if (it < 0) BurstPlanner.LIGHT_LEVELS.size else it }

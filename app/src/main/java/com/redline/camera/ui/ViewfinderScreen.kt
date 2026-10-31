@@ -1,7 +1,12 @@
 package com.redline.camera.ui
 
 import android.content.res.Configuration
+import android.os.Build
+import android.view.HapticFeedbackConstants
 import android.view.TextureView
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +24,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -26,6 +32,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
@@ -34,12 +41,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -51,6 +60,7 @@ import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
 import com.redline.camera.viewfinder.ZoomStop
 import kotlin.math.abs
+import kotlinx.coroutines.launch
 
 const val VIEWFINDER_TAG = "viewfinder"
 const val FRAME_TAG = "viewfinder_frame"
@@ -65,6 +75,17 @@ fun zoomStopTag(mm: Int): String = "zoom_stop_$mm"
 
 private val Accent = Color(0xFFD32F2F)
 private val Scrim = Color(0x99000000)
+
+/** B22b: the shutter while a press is capturing or waiting (a pale red, under the busy ring). */
+private val ShutterBusy = Color(0xFFFFCDD2)
+private const val FLASH_ALPHA = 0.6f
+private const val FLASH_MS = 180
+private const val PULSE_SCALE = 0.86f
+const val SHUTTER_FLASH_TAG = "shutter_flash"
+const val SHUTTER_BUSY_TAG = "shutter_busy"
+const val CAPTURE_TEXT_TAG = "capture_text"
+private val REJECT_HAPTIC =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) HapticFeedbackConstants.REJECT else HapticFeedbackConstants.LONG_PRESS
 
 /**
  * The main screen (B12): a letterboxed 3:2 Camera2 preview (2:3 when held upright), a zoom ring with
@@ -91,6 +112,14 @@ fun ViewfinderScreen(
     rawOn: Boolean = false,
     onToggleRaw: () -> Unit = {},
     captureText: String? = null,
+    /** B22b: a press is capturing (or waiting): the shutter shows a busy ring. */
+    shutterBusy: Boolean = false,
+    /** B22b: presses waiting behind the one capturing (shown on the shutter as +N). */
+    shutterWaiting: Int = 0,
+    /** B22b: accepted presses so far; each new one flashes the frame, pulses the shutter and ticks the haptic. */
+    pressCount: Int = 0,
+    /** B22b: a press that was not taken (queue full), shown over the shutter. */
+    shutterRefused: String? = null,
     manualUi: ManualUi = ManualUi(),
     manualActions: ManualActions = ManualActions(),
     onPreviewView: (TextureView) -> Unit = {},
@@ -98,6 +127,21 @@ fun ViewfinderScreen(
     lookBadge: String? = null
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
+    val view = LocalView.current
+    val flash = remember { Animatable(0f) }
+    val pulse = remember { Animatable(1f) }
+    LaunchedEffect(pressCount) {
+        if (pressCount > 0) {
+            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            flash.snapTo(FLASH_ALPHA)
+            pulse.snapTo(PULSE_SCALE)
+            launch { pulse.animateTo(1f, spring()) }
+            flash.animateTo(0f, tween(FLASH_MS))
+        }
+    }
+    LaunchedEffect(shutterRefused) {
+        if (shutterRefused != null) view.performHapticFeedback(REJECT_HAPTIC)
+    }
     MaterialTheme(colorScheme = darkColorScheme(primary = Accent)) {
         CompositionLocalProvider(LocalContentColor provides Color.White) {
             Box(modifier = Modifier.fillMaxSize().background(Color.Black).testTag(VIEWFINDER_TAG)) {
@@ -119,6 +163,9 @@ fun ViewfinderScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                     FrameOverlays(manualUi)
+                    if (flash.value > 0f) {
+                        Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = flash.value)).testTag(SHUTTER_FLASH_TAG))
+                    }
                     if (lookBadge != null) {
                         Text(
                             lookBadge,
@@ -155,7 +202,14 @@ fun ViewfinderScreen(
                 }
                 Column(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding()) {
                     captureText?.let {
-                        Text(it, fontSize = 11.sp, modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp))
+                        Text(
+                            it,
+                            fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp).testTag(CAPTURE_TEXT_TAG)
+                        )
+                    }
+                    shutterRefused?.let {
+                        Text(it, fontSize = 12.sp, color = Accent, modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp))
                     }
                     ManualBar(manualUi, manualActions, modifier = Modifier.fillMaxWidth())
                     Row(
@@ -173,12 +227,31 @@ fun ViewfinderScreen(
                         Box(
                             modifier = Modifier
                                 .size(72.dp)
+                                .scale(pulse.value)
                                 .clip(CircleShape)
-                                .background(if (shutterEnabled) Color.White else Color.Gray)
+                                .background(
+                                    when {
+                                        !shutterEnabled -> Color.Gray
+                                        shutterBusy -> ShutterBusy
+                                        else -> Color.White
+                                    }
+                                )
                                 .border(4.dp, Accent, CircleShape)
                                 .clickable(enabled = shutterEnabled, onClick = onShutter)
-                                .testTag(SHUTTER_TAG)
-                        )
+                                .testTag(SHUTTER_TAG),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (shutterBusy) {
+                                CircularProgressIndicator(
+                                    color = Accent,
+                                    strokeWidth = 3.dp,
+                                    modifier = Modifier.size(64.dp).testTag(SHUTTER_BUSY_TAG)
+                                )
+                            }
+                            if (shutterWaiting > 0) {
+                                Text("+$shutterWaiting", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                            }
+                        }
                         Spacer(modifier = Modifier.size(width = 88.dp, height = 1.dp))
                     }
                     if (plan != null) {

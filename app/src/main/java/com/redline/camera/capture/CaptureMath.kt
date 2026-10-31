@@ -106,9 +106,16 @@ data class ShotResult(
     /** B22: how long the press waited for the previous capture to leave the camera (0 = started at once). */
     val shutterWaitMs: Long? = null,
     /** B22: the press was refused, or held longer than BurstReport.SHUTTER_BLOCK_MS. */
-    val shutterBlocked: Boolean = false
+    val shutterBlocked: Boolean = false,
+    /**
+     * B22b: the press or shot ended without a photo for a reason that is not a capture failure: the user left the
+     * viewfinder, the session was rebuilt under it, or (with [shutterBlocked]) the waiting queue was full.
+     */
+    val dropped: String? = null
 ) {
     fun summary(): String = when {
+        dropped != null && shutterBlocked -> "Not taken: $dropped"
+        dropped != null -> "Shot dropped: $dropped"
         !ok -> "Capture failed: ${error ?: "unknown"}"
         else -> buildString {
             append(if (kept) "Saved " else "Captured ")
@@ -140,9 +147,20 @@ data class CaptureStats(
     val stressDone: Int = 0,
     val stressFailures: Int = 0,
     val stressRaw: Boolean = false,
-    val stressRunning: Boolean = false
+    val stressRunning: Boolean = false,
+    /** B22b: presses / shots that ended without a photo but not by a capture failure ([ShotResult.dropped]). */
+    val dropped: Int = 0,
+    val lastDropped: String? = null
 ) {
     fun add(r: ShotResult, stress: Boolean): CaptureStats {
+        if (r.dropped != null) {
+            return copy(
+                dropped = dropped + 1,
+                lastDropped = r.dropped,
+                last = r.summary(),
+                stressDone = stressDone + if (stress) 1 else 0
+            )
+        }
         val dngFailed = r.dngWanted && !r.dngSaved
         val failed = !r.ok || dngFailed
         val ms = r.shutterToSavedMs ?: 0
@@ -180,6 +198,8 @@ data class CaptureStats(
         "max_shutter_to_saved_ms" to if (shots == 0) null else maxSaveMs,
         "last" to last,
         "last_error" to lastError,
+        "dropped" to dropped,
+        "last_dropped" to lastDropped,
         "stress" to linkedMapOf(
             "requested" to stressRequested,
             "done" to stressDone,
