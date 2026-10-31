@@ -184,21 +184,49 @@ object BurstPlanner {
 }
 
 /**
- * B22a: where a shot goes when it is not a burst. The B21 single-frame RAW path holds one pool buffer until its
- * render, so at most [MAX_PENDING_SINGLES] wait; beyond that (or with no buffer free) the shot is the camera JPEG,
- * which needs no pool memory. The shutter is never refused.
+ * B22a: where a shot goes when it is not a burst. B23b: a busy shot (bursts pending, presses waiting) is a single RAW
+ * frame rendered through our pipeline, held in a bounded RAW holding queue (one pool buffer each) sized by the memory
+ * budget ([RawHoldingQueue.capacity]). The camera JPEG is the last resort only: no RAW stream, no pool buffer free,
+ * the system reports low memory, or the holding queue is at its memory-sized bound; the reason is always recorded.
+ * The shutter is never refused.
  */
 object ShotRouter {
-    const val MAX_PENDING_SINGLES = 2
-
     enum class Path { SINGLE_RAW, CAMERA_JPEG }
 
-    /** [wantsRaw]: the session has RAW and the pipeline or the DNG toggle wants it. Returns the path and why it is the JPEG. */
-    fun route(wantsRaw: Boolean, pendingSingles: Int, poolFree: Int): Pair<Path, String?> = when {
-        !wantsRaw -> Path.CAMERA_JPEG to null
-        pendingSingles >= MAX_PENDING_SINGLES -> Path.CAMERA_JPEG to "single-frame queue full ($MAX_PENDING_SINGLES waiting): camera JPEG"
-        poolFree < 1 -> Path.CAMERA_JPEG to "no memory for a RAW copy: camera JPEG"
-        else -> Path.SINGLE_RAW to null
+    const val WHY_NO_BUFFER = "no memory for a RAW copy: camera JPEG"
+    const val WHY_LOW_MEMORY = "system low on memory: camera JPEG"
+
+    fun whyQueueFull(capacity: Int) = "RAW holding queue full ($capacity waiting, memory budget): camera JPEG"
+
+    /**
+     * [wantsRaw]: the session has RAW and the pipeline or the DNG toggle wants it. [pendingSingles]: single RAW frames
+     * held and not yet saved; [capacity]: the holding queue's bound ([RawHoldingQueue.capacity]); [poolFree]: buffers
+     * free right now. Returns the path and why it is the JPEG (null when it is not, or when RAW is simply not wanted).
+     */
+    fun route(wantsRaw: Boolean, pendingSingles: Int, poolFree: Int, capacity: Int, lowMemory: Boolean = false): Pair<Path, String?> =
+        when {
+            !wantsRaw -> Path.CAMERA_JPEG to null
+            lowMemory -> Path.CAMERA_JPEG to WHY_LOW_MEMORY
+            poolFree < 1 -> Path.CAMERA_JPEG to WHY_NO_BUFFER
+            pendingSingles >= capacity -> Path.CAMERA_JPEG to whyQueueFull(capacity)
+            else -> Path.SINGLE_RAW to null
+        }
+}
+
+/**
+ * B23b: the RAW holding queue for busy single shots. Each held shot owns one pool buffer until it is saved, so the
+ * bound comes from the pool the memory budget allowed ([MemoryBudget.poolFrames]): every buffer except those the
+ * bursts already pending may hold ([BurstPlanner.MAX_RESIDENT_FRAMES] + a DNG slot each), at least
+ * [MIN_SINGLES] while the pool has buffers, and never more than [MAX_SINGLES] (each also costs a render later).
+ */
+object RawHoldingQueue {
+    const val MAX_SINGLES = 16
+    const val MIN_SINGLES = 2
+
+    fun capacity(poolFrames: Int, burstsPending: Int): Int {
+        if (poolFrames <= 0) return 0
+        val forBursts = burstsPending.coerceAtLeast(0) * (BurstPlanner.MAX_RESIDENT_FRAMES + 1)
+        return (poolFrames - forBursts).coerceIn(min(MIN_SINGLES, poolFrames), MAX_SINGLES)
     }
 }
 
