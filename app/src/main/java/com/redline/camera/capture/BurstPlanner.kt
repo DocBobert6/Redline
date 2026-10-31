@@ -113,7 +113,10 @@ object BurstPlanner {
     const val ASSUMED_MERGE_NS_PER_FRAME = 120_000_000L
 
     /** Most frames a burst of [n] frames, [frameNs] apart, can take with [resident] pool buffers without stalling the camera. */
-    fun streamCap(resident: Int, n: Int, frameNs: Long): Int = resident + CAMERA_QUEUE_SLACK + (n * frameNs / ASSUMED_MERGE_NS_PER_FRAME).toInt()
+    fun streamCap(resident: Int, n: Int, frameNs: Long): Int {
+        val drained = (n * frameNs / ASSUMED_MERGE_NS_PER_FRAME).toInt()
+        return resident + CAMERA_QUEUE_SLACK + drained
+    }
 
     fun lightLevel(iso: Int): String = LIGHT_LEVELS.firstOrNull { iso <= it.second }?.first ?: LIGHT_DARK
 
