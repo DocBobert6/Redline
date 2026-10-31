@@ -41,7 +41,9 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | [x] B21 | `v0.2.1-alpha.1` | RAW color pipeline: phone matrices -> XYZ -> Standard LUT, tone curve, highlight shoulder, Canon-style AWB warmth | Phone DNG -> XYZ -> Standard matches the reference (Python) pipeline within dE2000 1.0 on the same frames; neutrals stay neutral. Passed on the baseline device profile: on-device self-check mean dE2000 0.0009, max 0.87, grey chroma 1.31; 11/11 shots rendered, 0 fallbacks; shutter-to-saved avg 861 ms |
 | [x] B22 | `v0.2.2-alpha.3` | RAW burst capture (4-12 frames by light, under-exposed), tile align + merge streamed during capture (B22a: frames released as they merge, NEON, big-core worker pool; B22b: merge starts on the first frame, shutter free once the RAW frames are in, press feedback and queued presses), background processing queue; the shutter is never refused (busy shots take the single-frame or camera-JPEG path) | 24/35mm save < 3 s; no shutter blocking |
 | [ ] B23 | `v0.2.3-alpha.1` | Handheld multi-frame super-resolution at 50/70mm; per-stop output sizes | 50/70mm save < 5 s; resolution chart gain measured |
-| [ ] B24 | `v0.2.4-alpha.1` | Vignetting (in-camera residual), distortion (off by default, RAW-feel toggle), sharpening, grain; full Picture Style set | Visual sign-off on shoot list |
+| [ ] B23b | `v0.2.3-alpha.2` | Rapid-fire path: busy shots go through our RAW pipeline (single RAW frame) instead of the phone's own JPEG; parallel save lane; background work throttled so the preview holds 30 fps | No camera-JPEG fallbacks in a 15-tap burst; preview fps min >= 29.5 and LUT p95 <= 8 ms while the queue drains |
+| [ ] B23c | `v0.2.3-alpha.3` | Metering and tone re-fit from the R5 II dataset: exposure target fitted to R5 II Standard output (not the phone JPEG's median), re-check shoulder, toe, black point and specular desaturation against the CR3 hold-out | Mid-tone, black-point and highlight-shoulder error vs hold-out within the B03 gate on matched scenes |
+| [ ] B24 | `v0.2.4-alpha.1` | Vignetting (in-camera residual), distortion (off by default, RAW-feel toggle), sharpening, grain; full Picture Style set | Visual sign-off on shoot list; fine-detail frequency response (micro-contrast) measured against R5 II files at matched scale |
 | [ ] B25 | `v0.2.5-alpha.1` | Ultra HDR JPEG (libultrahdr gainmap), HEIF, optional DNG of merge; Save-formats setting: JPEG only, DNG only, or both (DNG always full-sensor, uncropped; the B13 DefaultCrop tag was removed in B14 because Google Photos showed a blank thumbnail and had no way to uncrop) | Ultra HDR files validate and render on HDR displays |
 
 ## Phase 3: Simulated depth of field (`v0.3.x`)
@@ -50,7 +52,7 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 | --- | --- | --- | --- |
 | [ ] B30 | `v0.3.0-alpha.1` | Monocular depth (LiteRT GPU) + person segmentation; depth stored with capture | Depth in < 400 ms on baseline |
 | [ ] B31 | `v0.3.1-alpha.1` | Thin-lens CoC model, 9-blade rounded kernel, linear-light bokeh rendering, aperture dial f/2.8-f/22 | Blur sizes match PLAN 19.5 table |
-| [ ] B32 | `v0.3.2-alpha.1` | Guided-filter edges, confidence gating, cat's-eye toward corners, 70mm bokeh fringing, re-edit after capture | < 5% of 200-image test set needs manual fix |
+| [ ] B32 | `v0.3.2-alpha.1` | Guided-filter edges, confidence gating, cat's-eye toward corners, 70mm bokeh fringing, re-edit after capture; later, corner softness / field curvature only if public lens data supports it (Canon sagittal/meridional MTF, published lab tests) | < 5% of 200-image test set needs manual fix |
 
 ## Phase 4: Video (`v0.4.x`)
 
