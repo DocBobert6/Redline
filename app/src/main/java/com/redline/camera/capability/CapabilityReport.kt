@@ -2,6 +2,7 @@ package com.redline.camera.capability
 
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
@@ -38,7 +39,9 @@ data class CapabilityState(
     /** B21 RAW colour pipeline: availability, profile, on-device self-check (parity, neutrals), per-shot timings. */
     val colourPipeline: ColourPipelineReport = ColourPipelineReport(),
     /** B22 RAW burst merge: availability, self-check, frames, alignment, stage timings, queue, shutter blocking, gates. */
-    val burst: BurstReport = BurstReport()
+    val burst: BurstReport = BurstReport(),
+    /** B23 super-resolution at 50/70 mm: availability, self-check, per-shot coverage and timings, gates. */
+    val superRes: SuperResReport = SuperResReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -49,7 +52,10 @@ data class CapabilityState(
 }
 
 object CapabilityReport {
-    /** The B10 profile plus the B11 sections, B12 viewfinder, B13 capture, B14 manual controls, B20 look preview, B21 colour pipeline and B22 burst merge. */
+    /**
+     * The B10 profile plus the B11 sections, B12 viewfinder, B13 capture, B14 manual controls, B20 look preview, B21 colour
+     * pipeline, B22 burst merge and B23 super-resolution.
+     */
     fun toMap(profile: DeviceProfile?, state: CapabilityState): Map<String, Any?> {
         val policy = state.policy(profile)
         val out = LinkedHashMap<String, Any?>(profile?.toMap().orEmpty())
@@ -70,6 +76,7 @@ object CapabilityReport {
         out["look_preview"] = state.lookPreview.toMap()
         out["colour_pipeline"] = state.colourPipeline.toMap()
         out["burst"] = state.burst.toMap()
+        out["superres"] = state.superRes.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }
