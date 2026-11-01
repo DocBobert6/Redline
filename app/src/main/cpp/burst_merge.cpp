@@ -226,13 +226,15 @@ void parallelFor(int n, int threads, const std::function<void(int, int)>& body) 
     for (int a = 0; a < n; a += step) todo.push_back(a);
     while (!todo.empty()) {
         waitForFrameWork();
+        // The wait is bounded: an add still in progress after it does not hold the tail any longer (as in B23b.1).
+        const bool force = gFrameWorkActive.load() > 0;
         std::mutex deferMu;
         std::vector<int> deferred;
         const std::vector<int> run = std::move(todo);
         WorkPool::get().run(static_cast<int>(run.size()), threads, [&](int i0, int i1) {
             for (int i = i0; i < i1; ++i) {
                 const int a = run[static_cast<std::size_t>(i)];
-                if (gFrameWorkActive.load(std::memory_order_relaxed) > 0) {
+                if (!force && gFrameWorkActive.load(std::memory_order_relaxed) > 0) {
                     std::lock_guard<std::mutex> lk(deferMu);
                     deferred.push_back(a);
                     continue;
