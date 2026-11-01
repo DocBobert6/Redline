@@ -1,6 +1,7 @@
 package com.redline.camera
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
@@ -27,6 +28,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import com.redline.camera.capability.CameraFacts
 import com.redline.camera.capability.CapabilityProbe
@@ -40,6 +42,7 @@ import com.redline.camera.capability.Dim
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.QuirksRepository
+import com.redline.camera.capability.ReportFile
 import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.BurstReport
@@ -668,11 +671,8 @@ class MainActivity : ComponentActivity() {
                 calibrations = calibrations.value,
                 onShareCalibration = { cal -> share("redline_camera2_${cal.cameraId}.json", cal.toJson(), "Share calibration") },
                 profile = profile,
-                onShareReport = {
-                    val json = profile?.let { CapabilityReport.toJson(it, state.value) }
-                        ?: runCatching { DeviceProfileProbe(this).cachedJson() }.getOrDefault("{}")
-                    share("redline_capability_report.json", json, "Share capability report")
-                },
+                onShareReport = { share("redline_capability_report.json", reportJson(profile), "Share capability report") },
+                onShareReportFile = { shareReportFile(reportJson(profile)) },
                 state = state.value,
                 onRunSelfTest = { runChecks(force = true) },
                 onRepeatSelfTest = { repeatSelfTest(REPEAT_RUNS) },
@@ -1473,6 +1473,26 @@ class MainActivity : ComponentActivity() {
             appliedStabilization = stab
             controller.setStabilization(stab)
         }
+    }
+
+    private fun reportJson(profile: DeviceProfile?): String = profile?.let { CapabilityReport.toJson(it, state.value) }
+        ?: runCatching { DeviceProfileProbe(this).cachedJson() }.getOrDefault("{}")
+
+    /** B23c report export: the whole report as a .txt file, so chat paste limits never truncate it. */
+    private fun shareReportFile(json: String) {
+        val file = runCatching { ReportFile.write(cacheDir, json, System.currentTimeMillis()) }.getOrElse {
+            share("redline_capability_report.json", json, "Share capability report")
+            return
+        }
+        val uri = FileProvider.getUriForFile(this, "$packageName.reports", file)
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = ReportFile.MIME
+            putExtra(Intent.EXTRA_SUBJECT, file.name)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri(file.name, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(send, "Share report (.txt)"))
     }
 
     private fun share(name: String, json: String, title: String) {

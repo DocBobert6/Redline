@@ -40,6 +40,7 @@ fun CapabilityScreen(
     onShareCalibration: (FactoryCalibration) -> Unit = {},
     profile: DeviceProfile? = null,
     onShareReport: () -> Unit = {},
+    onShareReportFile: (() -> Unit)? = null,
     state: CapabilityState = CapabilityState(),
     onRunSelfTest: () -> Unit = {},
     onRepeatSelfTest: (() -> Unit)? = null,
@@ -71,6 +72,11 @@ fun CapabilityScreen(
                         Text("Encoders: HEVC Main10 ${e.hevcMain10}, AV1 ${e.av1}, APV ${e.apv}")
                         OutlinedButton(onClick = onShareReport, modifier = Modifier.padding(top = 8.dp)) {
                             Text("Share capability report")
+                        }
+                        if (onShareReportFile != null) {
+                            OutlinedButton(onClick = onShareReportFile, modifier = Modifier.testTag(SHARE_FILE_TAG)) {
+                                Text("Share report (.txt)")
+                            }
                         }
                     }
                     val d = policy.defaults
@@ -235,6 +241,7 @@ fun CapabilityScreen(
 
 const val LIST_TAG = "capability_list"
 const val BACK_TAG = "back_to_viewfinder"
+const val SHARE_FILE_TAG = "share_report_file"
 const val LOOK_SECTION_TITLE = "Look preview"
 const val LOOK_TOGGLE_TAG = "look_preview_toggle"
 const val LOOK_STRENGTH_TAG = "look_preview_strength"
