@@ -3,9 +3,17 @@
 #include "raw_pipeline.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace redline {
 
@@ -18,6 +26,30 @@ constexpr int kMaxThreads = 16;
 // B23b: render rows between voluntary yields (one tile band; about 1-2 ms of work on a performance core).
 constexpr int kYieldRows = 32;
 constexpr int kMaxSide = 1 << 15;
+
+// B23b.1: render threads take the spawning thread's nice explicitly (the app's governed render lane) instead of relying
+// on inheritance, and report what they read back.
+constexpr int kNiceUnset = -1000;
+std::atomic<int> gRenderNiceSeen{kNiceUnset};
+
+int threadNice() {
+#if defined(__linux__)
+    errno = 0;
+    const int v = getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+    return errno == 0 ? v : kNiceUnset;
+#else
+    return kNiceUnset;
+#endif
+}
+
+void takeNice(int nice) {
+#if defined(__linux__)
+    if (nice != kNiceUnset) setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), nice);
+#else
+    (void)nice;
+#endif
+    gRenderNiceSeen.store(threadNice());
+}
 
 // Mirror (reflect-101) index, the border mode of scipy.ndimage "mirror": -1 -> 1, n -> n - 2. Keeps the CFA phase.
 inline int mirror(int i, int n) {
@@ -411,12 +443,16 @@ void renderAll(const RawInput& in, const RenderSpec& spec, const Writer& out) {
         renderBlock(in, spec, ty, tx, resample, 0, spec.outHeight, out);
         return;
     }
+    const int nice = threadNice();
     std::vector<std::thread> pool;
     pool.reserve(threads);
     for (int t = 0; t < threads; ++t) {
         const int o0 = static_cast<int>(static_cast<long long>(spec.outHeight) * t / threads);
         const int o1 = static_cast<int>(static_cast<long long>(spec.outHeight) * (t + 1) / threads);
-        pool.emplace_back([&, o0, o1] { renderBlock(in, spec, ty, tx, resample, o0, o1, out); });
+        pool.emplace_back([&, o0, o1, nice] {
+            takeNice(nice);
+            renderBlock(in, spec, ty, tx, resample, o0, o1, out);
+        });
     }
     for (auto& th : pool) th.join();
 }
@@ -559,12 +595,16 @@ void renderLinearAll(const LinearRgb& in, const RenderSpec& spec, const Writer& 
         renderLinearRows(in, spec, 0, in.height, out);
         return;
     }
+    const int nice = threadNice();
     std::vector<std::thread> pool;
     pool.reserve(threads);
     for (int t = 0; t < threads; ++t) {
         const int a = static_cast<int>(static_cast<long long>(in.height) * t / threads);
         const int b = static_cast<int>(static_cast<long long>(in.height) * (t + 1) / threads);
-        pool.emplace_back([&, a, b] { renderLinearRows(in, spec, a, b, out); });
+        pool.emplace_back([&, a, b, nice] {
+            takeNice(nice);
+            renderLinearRows(in, spec, a, b, out);
+        });
     }
     for (auto& th : pool) th.join();
 }
@@ -625,5 +665,7 @@ std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step,
     out.cells = static_cast<int>(n);
     return "";
 }
+
+int renderThreadNiceSeen() { return gRenderNiceSeen.load(); }
 
 }  // namespace redline

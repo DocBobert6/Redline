@@ -93,4 +93,7 @@ std::string renderLinearFloat(const LinearRgb& in, const RenderSpec& spec, float
 // B23: rawStats for linear camera RGB: every `step`-th pixel in each direction from (0, 0).
 std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step, RawStats& out);
 
+// B23b.1: the nice value the last render worker thread read back after taking its spawning thread's (-1000: none yet).
+int renderThreadNiceSeen();
+
 }  // namespace redline
