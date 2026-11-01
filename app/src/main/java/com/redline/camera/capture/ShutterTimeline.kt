@@ -171,6 +171,16 @@ object BurstRelease {
  * (24 MB each): a HashSet of them hashes every byte and treats two frames with equal contents (two fresh zeroed
  * buffers) as one. B22b: every collection of frame buffers is identity-based.
  */
+/**
+ * Which capture result belongs to a RAW frame: the result whose sensor timestamp matches the frame's, else the first
+ * result, else [fallback]. The DNG's metadata comes from its own frame this way (B23 fix: a super-resolution DNG is
+ * frame 0, while the render's reference may be another frame).
+ */
+object FrameResults {
+    fun <R> forFrame(timestampNs: Long, results: Collection<R>, timestampOf: (R) -> Long?, fallback: R): R =
+        results.firstOrNull { timestampOf(it) == timestampNs } ?: results.firstOrNull() ?: fallback
+}
+
 fun <T> identitySet(): MutableSet<T> = Collections.newSetFromMap(IdentityHashMap())
 
 private fun r1(v: Double): Double = Math.round(v * 10.0) / 10.0

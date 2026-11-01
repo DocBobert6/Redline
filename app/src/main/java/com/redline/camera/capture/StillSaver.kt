@@ -93,7 +93,9 @@ class BurstCapture(
     /** B23: the finished super-resolution merge (the saver renders and closes it), its stats, or why it failed. */
     val srImage: RedlineNative.SuperResMerger? = null,
     val srStats: RedlineNative.SrStats? = null,
-    val srError: String? = null
+    val srError: String? = null,
+    /** The capture result of [dngRaw]'s own frame (its metadata must match its pixels); null = [referenceResult]. */
+    val dngResult: TotalCaptureResult? = null
 )
 
 /**
@@ -170,7 +172,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     )
                 },
                 dngRaw = shot.raw ?: shot.burst?.dngRaw,
-                dngResult = shot.burst?.referenceResult ?: shot.result,
+                dngResult = shot.burst?.let { it.dngResult ?: it.referenceResult } ?: shot.result,
                 srMerged = false,
                 srFallback = null,
                 lookName = LOOK_NONE,
@@ -285,7 +287,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 fallback = "colour pipeline unavailable"
             }
             dngRaw = b.dngRaw
-            dngResult = b.referenceResult
+            dngResult = b.dngResult ?: b.referenceResult
             if (srMerged) mergedOk = true
             val per = stats?.perFrame.orEmpty()
             burstShot = BurstShot(

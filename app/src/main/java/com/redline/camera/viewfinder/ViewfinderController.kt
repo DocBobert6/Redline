@@ -41,6 +41,7 @@ import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.DropReason
 import com.redline.camera.capture.EarlyNoise
 import com.redline.camera.capture.FramePool
+import com.redline.camera.capture.FrameResults
 import com.redline.camera.capture.MemoryBudget
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
@@ -1372,9 +1373,8 @@ class ViewfinderController(
         if (run.closed) return
         run.closed = true
         val stats = run.mergeStats
-        fun resultFor(copy: RawCopy): TotalCaptureResult = p.burstResults.values.firstOrNull {
-            it.get(CaptureResult.SENSOR_TIMESTAMP) == copy.timestampNs
-        } ?: p.burstResults.values.firstOrNull() ?: result
+        fun resultFor(copy: RawCopy): TotalCaptureResult =
+            FrameResults.forFrame(copy.timestampNs, p.burstResults.values, { it.get(CaptureResult.SENSOR_TIMESTAMP) }, result)
         val keep = ArrayList<ByteBuffer>()
         var merged: RawCopy? = null
         var dngRaw: RawCopy? = null
@@ -1438,6 +1438,8 @@ class ViewfinderController(
             stats = stats,
             referenceResult = refResult,
             dngRaw = dngRaw,
+            // The DNG's metadata is its own frame's result (super-resolution: frame 0, not the SR reference frame).
+            dngResult = dngRaw?.let { resultFor(it) },
             fallbackRaw = fallbackRaw,
             fallbackResult = fallbackRaw?.let { f -> if (run.merge.superRes != null) resultFor(f) else refResult },
             fallbackReason = when {
