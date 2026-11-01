@@ -36,6 +36,7 @@ import com.redline.camera.capability.CombinationChecker
 import com.redline.camera.capability.DebugOverrides
 import com.redline.camera.capability.DeviceProfile
 import com.redline.camera.capability.DeviceProfileProbe
+import com.redline.camera.capability.Dim
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.QuirksRepository
@@ -63,6 +64,7 @@ import com.redline.camera.ui.CapabilityScreen
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
 import com.redline.camera.ui.ViewfinderScreen
+import com.redline.camera.viewfinder.LookRenderSize
 import com.redline.camera.viewfinder.PreviewLoadReading
 import com.redline.camera.viewfinder.ViewfinderController
 import com.redline.camera.viewfinder.ViewfinderMetrics
@@ -232,7 +234,8 @@ class MainActivity : ComponentActivity() {
                         lutSize = caps.lutSize,
                         lutFormat = caps.lutFormat,
                         timerMethod = caps.timerMethod,
-                        selfCheckMaxErrorSteps = caps.selfCheckMaxErrorSteps
+                        selfCheckMaxErrorSteps = caps.selfCheckMaxErrorSteps,
+                        lutFormatsTried = caps.lutFormatsTried
                     )
                 }
                 syncCamera()
@@ -245,7 +248,10 @@ class MainActivity : ComponentActivity() {
                     timing = stats.timing,
                     timerMethod = stats.timerMethod,
                     displayFrames = stats.displayFrames,
-                    displayDropped = stats.displayDropped
+                    displayDropped = stats.displayDropped,
+                    timerOverheadP50Ms = stats.timerOverheadP50Ms,
+                    renderSize = stats.renderSize?.toString(),
+                    glThreadNice = stats.glThreadNice
                 )
             }
         }
@@ -1140,7 +1146,8 @@ class MainActivity : ComponentActivity() {
         lookAttach = Attach.ATTACHING
         attachedTo = display
         val token = ++attachToken
-        lookRenderer.attach(display, setup.previewSize, setup.aeFpsRange?.second ?: LOOK_DEFAULT_FPS) { cam, error ->
+        val out = lookRenderSize(setup)
+        lookRenderer.attach(display, setup.previewSize, setup.aeFpsRange?.second ?: LOOK_DEFAULT_FPS, out) { cam, error ->
             runOnUiThread {
                 // Superseded (surface destroyed or look turned off meanwhile): its detach is already queued behind it.
                 if (token != attachToken) return@runOnUiThread
@@ -1154,6 +1161,18 @@ class MainActivity : ComponentActivity() {
                 syncCamera()
             }
         }
+    }
+
+    /** B23b.1: the LUT pass's size: the preview view's size on screen (centre crop), at most the camera buffer. */
+    private fun lookRenderSize(setup: ViewfinderSetup): Dim {
+        val v = previewView ?: return setup.previewSize
+        val rotation = when (v.display?.rotation ?: Surface.ROTATION_0) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return LookRenderSize.choose(setup.previewSize, v.width, v.height, setup.sensorOrientation, rotation)
     }
 
     private fun forgetAttachment() {

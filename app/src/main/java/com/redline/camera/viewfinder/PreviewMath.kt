@@ -97,6 +97,27 @@ data class PreviewTransform(
     }
 }
 
+/**
+ * B23b.1: the size the look preview's LUT pass renders at. The TextureView shows the camera buffer centre-cropped and
+ * scaled by s = the fill scale of [PreviewTransform]; rendering at buffer x s (when s < 1) gives one output pixel per
+ * screen pixel with the same aspect, so the view's transform is unchanged and no detail is lost. Never larger than the
+ * buffer, never below [MIN_SIDE] on the short side; even dimensions.
+ */
+object LookRenderSize {
+    const val MIN_SIDE = 480
+
+    fun choose(buffer: Dim, viewW: Int, viewH: Int, sensorOrientation: Int, displayRotation: Int): Dim {
+        if (viewW <= 0 || viewH <= 0 || buffer.width <= 0 || buffer.height <= 0) return buffer
+        val upright = PreviewTransform.uprightSize(buffer, sensorOrientation, displayRotation)
+        val s = maxOf(viewW.toDouble() / upright.width, viewH.toDouble() / upright.height)
+        if (s >= 1.0) return buffer
+        val short = minOf(buffer.width, buffer.height)
+        val scale = maxOf(s, minOf(1.0, MIN_SIDE.toDouble() / short))
+        fun even(v: Double): Int = (Math.round(v / 2.0) * 2).toInt().coerceAtLeast(2)
+        return Dim(even(buffer.width * scale).coerceAtMost(buffer.width), even(buffer.height * scale).coerceAtMost(buffer.height))
+    }
+}
+
 /** Frames per second over a sliding window of sensor timestamps (ns). */
 class RollingFps(private val windowNs: Long = 1_000_000_000L) {
     private val stamps = ArrayDeque<Long>()

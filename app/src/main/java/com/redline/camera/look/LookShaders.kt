@@ -5,7 +5,8 @@ package com.redline.camera.look
  * texture for the live preview, and a plain 2D texture for the start-up self-check against [LutMath].
  *
  * Chain: encoded preview value -> 33^3 LUT (GL_TEXTURE_3D, hardware trilinear, half-texel scale/offset) ->
- * sRGB decode of input and LUT result -> mix by strength in linear light -> sRGB encode.
+ * sRGB decode of input and LUT result -> mix by strength in linear light -> sRGB encode. B23b.1: at strength 1 the
+ * output is the LUT result and at strength 0 the input (the decode/encode pair cancels), without the pow() calls.
  */
 object LookShaders {
     const val VERTEX = """#version 300 es
@@ -43,8 +44,17 @@ vec3 srgbEncode(vec3 l) {
 
 void main() {
     vec3 e = clamp(texture(uInput, vTexCoord).rgb, 0.0, 1.0);
+    // B23b.1: strength 0 and 1 (the default) skip the linear-light mix: decode then encode is the identity there.
+    if (uStrength <= 0.0) {
+        fragColor = vec4(e, 1.0);
+        return;
+    }
     vec3 idx = clamp((e - uDomainMin) * uDomainScale, 0.0, 1.0);
     vec3 looked = texture(uLut, idx * uLutScale + uLutOffset).rgb;
+    if (uStrength >= 1.0) {
+        fragColor = vec4(clamp(looked, 0.0, 1.0), 1.0);
+        return;
+    }
     vec3 lin = mix(srgbDecode(e), srgbDecode(looked), uStrength);
     fragColor = vec4(clamp(srgbEncode(lin), 0.0, 1.0), 1.0);
 }

@@ -75,7 +75,12 @@ data class LookPreviewReport(
     val timing: TimingSnapshot = TimingSnapshot(0, null, null, null),
     val displayFrames: Int? = null,
     val displayDropped: Int? = null,
-    val strength: Float = 1f
+    val strength: Float = 1f,
+    /** B23b.1: the fence round trip measured with each CPU-side sample (median), the LUT pass size, GL thread nice. */
+    val timerOverheadP50Ms: Double? = null,
+    val renderSize: String? = null,
+    val glThreadNice: Int? = null,
+    val lutFormatsTried: String? = null
 ) {
     /** On, available and not failed at runtime: what the viewfinder renders through when the camera is open. */
     val enabled: Boolean get() = userSetting && available == true && runtimeError == null
@@ -116,6 +121,7 @@ data class LookPreviewReport(
         "lut_name" to lutName,
         "lut_size" to lutSize,
         "lut_format" to lutFormat,
+        "lut_formats_tried" to lutFormatsTried,
         "native_version" to nativeVersion,
         "native_error" to nativeError,
         "self_check_max_error_8bit" to selfCheckMaxErrorSteps,
@@ -125,6 +131,9 @@ data class LookPreviewReport(
         "lut_ms_p50" to timing.p50Ms?.let { round3(it) },
         "lut_ms_p95" to timing.p95Ms?.let { round3(it) },
         "lut_ms_max" to timing.maxMs?.let { round3(it) },
+        "timer_overhead_ms_p50" to timerOverheadP50Ms?.let { round3(it) },
+        "render_size" to renderSize,
+        "gl_thread_nice" to glThreadNice,
         "display_frames" to displayFrames,
         "display_dropped" to displayDropped,
         "gate" to linkedMapOf("lut_le_8_ms" to gateLutLe8Ms)
