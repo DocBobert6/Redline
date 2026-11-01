@@ -177,10 +177,11 @@ void streamingTests() {
         double tailErr = 0;
         for (std::size_t i = 0; i < tail.size(); ++i) tailErr = std::fmax(tailErr, std::fabs(tail[i] - want[i]));
         expect(err.empty() && tailErr == 0.0, "merge tail in slices equals the one-shot merge");
-        // B23c: whether this tail splits depends on timing (only an add that starts mid-job splits it); the split path
-        // is checked deterministically below. Here only the result matters.
-        (void)before;
-        (void)after;
+        // B23c: the add in progress makes the tail wait (a yield). Whether it also splits depends on timing (only an
+        // add that starts mid-job splits it); the split path is checked deterministically below.
+        expect(after.tailYields > before.tailYields, "merge tail waited for the frame add");
+        std::printf("tail: %d splits, %d yields (%d ms)\n", after.tailSlices - before.tailSlices, after.tailYields - before.tailYields,
+                    after.tailYieldMs - before.tailYieldMs);
     }
 
     // B23c: a tail job is split only when a frame add starts while it runs; every row still runs exactly once.
@@ -224,9 +225,6 @@ void streamingTests() {
         redline::burstSetLane(-1000, false);
         const redline::WorkerStats after = redline::burstWorkerStats();
         expect(rows.load() == n && after.tailSlices == before.tailSlices, "tail without a waiting add is not split");
-        expect(after.tailYields > before.tailYields, "merge tail waited for the frame add");
-        std::printf("tail: %d slices, %d yields (%d ms)\n", after.tailSlices - before.tailSlices, after.tailYields - before.tailYields,
-                    after.tailYieldMs - before.tailYieldMs);
     }
 
     const int t = redline::burstRecommendedThreads();
