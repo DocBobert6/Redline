@@ -289,16 +289,15 @@ class ViewfinderController(
     /** B23b.1: loaded from a backlog of two until the queue is empty (see [GovernorLatch]). */
     private val governorLatch = GovernorLatch()
 
-    private fun budget(maxThreads: Int): WorkerBudget =
-        WorkerGovernor.budget(
-            viewfinderActive,
-            loadProcessing,
-            loadCapturing,
-            maxThreads,
-            governorLatch.latched,
-            loadBurstCapturing,
-            loadHoldingFill
-        )
+    private fun budget(maxThreads: Int): WorkerBudget = WorkerGovernor.budget(
+        viewfinderActive,
+        loadProcessing,
+        loadCapturing,
+        maxThreads,
+        governorLatch.latched,
+        loadBurstCapturing,
+        loadHoldingFill
+    )
 
     /**
      * B22a: the streaming merge (single thread; the native pool works under it): frames are merged as they arrive,
