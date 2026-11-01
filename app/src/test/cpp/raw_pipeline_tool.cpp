@@ -3,7 +3,7 @@
 //
 //   raw_pipeline_tool render <params.txt> <out.rgb>   writes outWidth x outHeight RGB8, row-major, no padding
 //   raw_pipeline_tool renderf <params.txt> <out.f32>  the same render as float32 RGB (parity before 8-bit rounding)
-//   raw_pipeline_tool stats  <params.txt>             prints "median_y clipped_fraction cells"
+//   raw_pipeline_tool stats  <params.txt>             prints "median_y clipped_fraction cells p98_y"
 //   raw_pipeline_tool linearf <params.txt> <out.f32>  B23: stages 4-8 on planar linear camera RGB (key "linear")
 //   raw_pipeline_tool linearstats <params.txt>        B23: the statistics of that linear image
 //
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
         redline::RawStats st;
         const std::string err = redline::linearStats(lin, spec.colour, step, st);
         if (!err.empty()) return fail(err);
-        std::printf("%.9g %.9g %d\n", st.medianY, st.clippedFraction, st.cells);
+        std::printf("%.9g %.9g %d %.9g\n", st.medianY, st.clippedFraction, st.cells, st.p98Y);
         return 0;
     }
     in.rowStride = in.width;
@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         redline::RawStats st;
         const std::string err = redline::rawStats(in, spec.crop, spec.colour, step, st);
         if (!err.empty()) return fail(err);
-        std::printf("%.9g %.9g %d\n", st.medianY, st.clippedFraction, st.cells);
+        std::printf("%.9g %.9g %d %.9g\n", st.medianY, st.clippedFraction, st.cells, st.p98Y);
         return 0;
     }
     if ((mode != "render" && mode != "renderf" && mode != "linearf") || argc < 4) return fail("render needs an output path");

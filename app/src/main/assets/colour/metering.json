@@ -1,0 +1,21 @@
+{
+ "model": "r5ii_metering v1",
+ "description": "B23c: mid-tone target (EV on the Standard tone curve's input axis) = coef[0] + coef[1] * clamp(log2(p98_y / median_y), hi_range). Fitted from R5 II RAW + camera JPEG pairs (redline_cal.metering); exposure compensation of auto-exposure shots taken out.",
+ "coef": [
+  -2.71186,
+  -0.473763
+ ],
+ "hi_range": [
+  0.3704,
+  5.3278
+ ],
+ "fallback_target_ev": -3.908289,
+ "fit": {
+  "pairs_train": 71,
+  "pairs_holdout": 17,
+  "loo_mae_ev_train": 0.3543,
+  "holdout_mae_ev": 0.43,
+  "holdout_median_abs_ev": 0.298,
+  "holdout_mae_ev_default_target": 0.734
+ }
+}

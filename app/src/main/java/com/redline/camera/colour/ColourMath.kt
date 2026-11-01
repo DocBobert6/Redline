@@ -384,6 +384,45 @@ object ColourMath {
         return Exposure(ev.coerceIn(EXPOSURE_MIN_EV, EXPOSURE_MAX_EV), method)
     }
 
+    const val METERING_METHOD = "r5ii_metering_fit"
+    const val METERING_CONSTANT_METHOD = "r5ii_metering_constant"
+
+    /**
+     * B23c metering fitted from R5 II RAW + camera JPEG pairs (asset colour/metering.json, reference
+     * ``raw_pipeline.Metering``): the mid-tone target (EV on the tone curve's input axis) is
+     * coef[0] + coef[1] * clamp(log2(p98 / median), hiRange), so high-contrast scenes sit lower, as on the R5 II.
+     */
+    class Metering(val coef: DoubleArray, val hiRange: DoubleArray, val fallbackTargetEv: Double, val holdoutMaeEv: Double? = null) {
+        fun target(medianY: Double, p98Y: Double): Exposure {
+            if (!(p98Y.isFinite() && p98Y > 0 && medianY > 0)) return Exposure(fallbackTargetEv, METERING_CONSTANT_METHOD)
+            val hi = log2(max(p98Y, medianY) / medianY).coerceIn(hiRange[0], hiRange[1])
+            return Exposure(coef[0] + coef[1] * hi, METERING_METHOD)
+        }
+
+        companion object {
+            const val MODEL = "r5ii_metering v1"
+
+            fun parse(m: Map<*, *>): Metering {
+                require(m["model"] == MODEL) { "unexpected metering model" }
+                fun nums(k: String) = (m[k] as List<*>).map { (it as Number).toDouble() }.toDoubleArray()
+                val coef = nums("coef")
+                val range = nums("hi_range")
+                require(coef.size == 2 && range.size == 2 && range[0] < range[1]) { "bad metering model" }
+                val mae = ((m["fit"] as? Map<*, *>)?.get("holdout_mae_ev") as? Number)?.toDouble()
+                return Metering(coef, range, (m["fallback_target_ev"] as Number).toDouble(), mae)
+            }
+        }
+    }
+
+    /** B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee). */
+    fun solveExposureMetered(tone: DoubleArray, medianY: Double, p98Y: Double, metering: Metering): Exposure {
+        if (!(medianY > 1e-6 && medianY.isFinite())) return Exposure(0.0, "no_signal")
+        val t = metering.target(medianY, p98Y)
+        val yKnee = interpUniform(KNEE_EV, EV_MIN, EV_MAX, tone)
+        val target = min(t.ev, invertFitted(tone, yKnee - 1e-3))
+        return Exposure((target - log2(medianY)).coerceIn(EXPOSURE_MIN_EV, EXPOSURE_MAX_EV), t.method)
+    }
+
     /** Median luma of sRGB-encoded pixels (0..255 per channel, RGB triples), encoded. */
     fun jpegMedianEncoded(rgb: IntArray): Double {
         val n = rgb.size / 3

@@ -60,6 +60,7 @@ struct RawStats {
     float medianY = 0.0f;
     float clippedFraction = 0.0f;
     int cells = 0;
+    float p98Y = 0.0f;  // B23c: order statistic at floor(0.98 * (n - 1)), for the R5 II metering fit
 };
 
 // Renders the crop to outWidth x outHeight RGBA8 (alpha 255) into `rgba` (row stride in bytes).

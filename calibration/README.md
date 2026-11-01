@@ -61,6 +61,20 @@ Outputs: `standard_look.json` (tone curve + model) and `standard_residual.cube`.
 
 The Adobe DCP cross-check (PLAN 9.2) stays a local, internal step and is not part of this repo.
 
+## B23c: metering and tone re-check from the R5 II pairs
+
+```bash
+cd calibration
+exiftool -j -n -CanonExposureMode -ExposureCompensation -@ raws.txt > out/exif.json   # one RAW path per line
+python -m redline_cal.metering out/manifest.jsonl --exif out/exif.json \
+  --tone ../app/src/main/assets/colour/standard_tone.json --lut ../app/src/main/assets/luts/redline_standard_preview_33.cube \
+  --cache out/metering_cache --out out/metering --asset ../app/src/main/assets/colour/metering.json
+```
+
+Before B23c the app placed a still's mid-tone where the phone's own camera JPEG put its median (`camera_jpeg_median`), inheriting the phone's metering. `redline_cal.metering` fits the target from the R5 II pairs instead: per pair, the camera JPEG's median luma inverted through the shipped tone curve gives the mid-tone target (EV on the tone curve's input axis; exposure compensation of Av/Tv/P shots taken out), and the RAW frame gives scale-free scene features. Candidates (constant; linear in `log2(p98/median)`; plus `log2(median/p5)`) are chosen by leave-one-out error on the train split and scored once on the hold-out. The app reads the result from `colour/metering.json` (`raw_pipeline.Metering`, Kotlin `ColourMath.Metering`); its stats pass returns the frame's p98 luminance for it. The spread is clamped to the training range (no extrapolation).
+
+The same run re-checks the shipped tone curve on the hold-out on matched scenes (each pair at its own exposure, aligned on the central mid-tones as in B03 `--align-exposure`): median |dL\*| for the black point (JPEG L\* < 15), mid-tones (L\* 30-70) and the highlight shoulder (gained input above the -1.5 EV knee), and chroma of near-white blocks (specular desaturation). `--extract-only --shard i/n` extracts pairs in parallel; extraction caches per pair.
+
 ## Tests
 
 ```bash

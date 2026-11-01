@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <cstddef>
 #include <thread>
 #include <vector>
 
@@ -480,6 +481,14 @@ std::string renderRawFloat(const RawInput& in, const RenderSpec& spec, float* rg
     return "";
 }
 
+// B23c: the order statistic at floor(0.98 * (n - 1)) (= reference upper_quantile); reorders `v`.
+static float upperQuantile(std::vector<float>& v) {
+    if (v.empty()) return 0.0f;
+    const std::size_t k = static_cast<std::size_t>(std::floor(0.98 * static_cast<double>(v.size() - 1)));
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+    return v[k];
+}
+
 std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec& colour, int step, RawStats& out) {
     std::string err = validate(in);
     if (!err.empty()) return err;
@@ -532,6 +541,7 @@ std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec&
     }
     if (ys.empty()) return "crop too small for statistics";
     const std::size_t n = ys.size();
+    out.p98Y = upperQuantile(ys);
     std::nth_element(ys.begin(), ys.begin() + n / 2, ys.end());
     float med = ys[n / 2];
     if (n % 2 == 0) {
@@ -654,6 +664,7 @@ std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step,
         }
     }
     const std::size_t n = ys.size();
+    out.p98Y = upperQuantile(ys);
     std::nth_element(ys.begin(), ys.begin() + n / 2, ys.end());
     float med = ys[n / 2];
     if (n % 2 == 0) {

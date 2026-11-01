@@ -45,8 +45,8 @@ class RapidFireTest {
     fun governorThrottlesOnlyWhenTheViewfinderIsBusy() {
         val loaded = WorkerGovernor.budget(viewfinderActive = true, processing = 1, capturing = 1, maxThreads = 8)
         assertEquals(WorkerBudget(WorkerGovernor.LOADED_THREADS, WorkerGovernor.LOADED_NICE, loaded = true), loaded)
-        assertEquals(WorkerBudget(2, 10, true), WorkerGovernor.budget(true, processing = 2, capturing = 0, maxThreads = 8))
-        assertEquals(WorkerBudget(2, 10, true), WorkerGovernor.budget(true, processing = 0, capturing = 2, maxThreads = 8))
+        assertEquals(WorkerBudget(3, 5, true), WorkerGovernor.budget(true, processing = 2, capturing = 0, maxThreads = 8))
+        assertEquals(WorkerBudget(3, 5, true), WorkerGovernor.budget(true, processing = 0, capturing = 2, maxThreads = 8))
         // A lone shot: every thread at the idle nice (the unhurried save time does not change).
         assertEquals(WorkerBudget(8, WorkerGovernor.IDLE_NICE, loaded = false), WorkerGovernor.budget(true, 1, 0, 8))
         assertEquals(WorkerBudget(8, 5, false), WorkerGovernor.budget(true, 0, 0, 8))
@@ -59,7 +59,7 @@ class RapidFireTest {
         assertEquals(1, WorkerGovernor.budget(true, 3, 3, maxThreads = 1).threads)
         assertEquals(1, WorkerGovernor.budget(false, 0, 0, maxThreads = 0).threads)
         assertEquals(1, WorkerGovernor.budget(true, 5, 0, maxThreads = -2).threads)
-        assertTrue(WorkerGovernor.LOADED_NICE > WorkerGovernor.IDLE_NICE)
+        assertTrue(WorkerGovernor.LOADED_NICE >= WorkerGovernor.IDLE_NICE)
         assertTrue(WorkerGovernor.IDLE_NICE > 0) // workers always yield to the default-priority camera thread
     }
 
@@ -213,6 +213,32 @@ class RapidFireTest {
         assertTrue(b.toMap().containsKey("rapid_fire"))
     }
 
+    // ---------------------------------------------------------------- B23c
+
+    @Test
+    fun throttleOnlyWhileABurstCapturesAndTheHoldingQueueHasRoom() {
+        // alpha.3 measured a slow drain at 2 threads / nice 10: under load it is now 3 threads at nice 5.
+        assertEquals(3, WorkerGovernor.LOADED_THREADS)
+        assertEquals(5, WorkerGovernor.LOADED_NICE)
+        val loaded = WorkerGovernor.budget(true, 2, 1, 8, latched = true, burstCapturing = true, holdingFill = 0.25)
+        assertEquals(WorkerBudget(3, 5, true), loaded)
+        // No burst capture in flight: released, every thread.
+        assertEquals(WorkerBudget(8, 5, false), WorkerGovernor.budget(true, 2, 1, 8, latched = true, burstCapturing = false))
+        // Holding queue more than half full: released so it drains before it overflows into camera JPEGs.
+        assertTrue(WorkerGovernor.budget(true, 2, 1, 8, true, burstCapturing = true, holdingFill = 0.5).loaded)
+        assertFalse(WorkerGovernor.budget(true, 2, 1, 8, true, burstCapturing = true, holdingFill = 0.51).loaded)
+        // A lone shot is still never throttled.
+        assertFalse(WorkerGovernor.budget(true, 1, 0, 8, latched = false, burstCapturing = true).loaded)
+    }
+
+    @Test
+    fun holdingFillIsOccupancyOfTheQueue() {
+        assertEquals(0.5, WorkerGovernor.holdingFill(4, 8), 1e-9)
+        assertEquals(0.0, WorkerGovernor.holdingFill(0, 8), 1e-9)
+        assertEquals(0.0, WorkerGovernor.holdingFill(3, 0), 1e-9)
+        assertEquals(1.0, WorkerGovernor.holdingFill(16, RawHoldingQueue.capacity(poolFrames = 16, burstsPending = 0)), 1e-9)
+    }
+
     // ---------------------------------------------------------------- B23b.1
 
     @Test
@@ -224,7 +250,7 @@ class RapidFireTest {
         // A rapid-fire run: latched at two, stays loaded down to one, released at zero.
         assertTrue(latch.update(true, 3))
         assertTrue(latch.update(true, 1))
-        assertEquals(WorkerBudget(2, WorkerGovernor.LOADED_NICE, true), WorkerGovernor.budget(true, 1, 0, 8, latch.latched))
+        assertEquals(WorkerBudget(3, WorkerGovernor.LOADED_NICE, true), WorkerGovernor.budget(true, 1, 0, 8, latch.latched))
         assertFalse(latch.update(true, 0))
         assertFalse(latch.update(true, 1))
         // Leaving the viewfinder releases it, and the budget is idle without the viewfinder anyway.
@@ -278,7 +304,7 @@ class RapidFireTest {
         assertEquals(13, m["pool_last_job_nice"])
         assertEquals(4, m["tail_yields"])
         assertEquals(120, m["tail_yield_ms"])
-        assertEquals(32, m["tail_slices"])
+        assertEquals(32, m["tail_splits_for_adds"])
         assertEquals(10, m["render_thread_nice_seen"])
         assertEquals(m, BurstReport().nativeWorkers(intArrayOf(10, 13, 4, 120, 32, 10)).rapidFire.nativeWorkers)
     }

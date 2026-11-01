@@ -15,8 +15,17 @@ data class WorkerBudget(val threads: Int, val nice: Int, val loaded: Boolean)
  */
 object WorkerGovernor {
     const val IDLE_NICE = 5
-    const val LOADED_NICE = 10
-    const val LOADED_THREADS = 2
+
+    /**
+     * B23c: the alpha.3 throttle (2 threads at nice 10, latched from a backlog of two) slowed the drain (avg save
+     * 2.4-3.3 s vs 1.6 s, queue wait 655-1025 ms vs 122 ms) and filled the RAW holding queue (1-2 camera JPEGs per
+     * run). Under load work now keeps 3 threads at nice 5, and only while a burst capture is in flight.
+     */
+    const val LOADED_NICE = 5
+    const val LOADED_THREADS = 3
+
+    /** B23c: the throttle lets go when the RAW holding queue is more than this full, so it drains before it overflows. */
+    const val RELEASE_HOLDING_FILL = 0.5
 
     /** B23b.1: the merge tail (finish / gather) runs this much nicer than the frame adds, so a queued burst's adds win. */
     const val TAIL_NICE_STEP = 3
@@ -29,16 +38,31 @@ object WorkerGovernor {
      * [processing]: shots out of the camera and not yet saved; [capturing]: presses waiting plus the shot capturing.
      * B23b.1: [latched] (see [GovernorLatch]) keeps the budget loaded down to a backlog of one, so the last shots of a
      * rapid-fire run drain at the loaded budget too; a lone shot never latches.
+     * B23c: loaded only while [burstCapturing] (a burst's RAW frames are arriving; the preview fps is measured outside
+     * those capture pauses anyway) and while the RAW holding queue is at most [RELEASE_HOLDING_FILL] full
+     * ([holdingFill], 0..1).
      */
-    fun budget(viewfinderActive: Boolean, processing: Int, capturing: Int, maxThreads: Int, latched: Boolean = false): WorkerBudget {
+    fun budget(
+        viewfinderActive: Boolean,
+        processing: Int,
+        capturing: Int,
+        maxThreads: Int,
+        latched: Boolean = false,
+        burstCapturing: Boolean = true,
+        holdingFill: Double = 0.0
+    ): WorkerBudget {
         val all = max(1, maxThreads)
         val backlog = processing + capturing
-        return if (viewfinderActive && (backlog >= 2 || (latched && backlog >= 1))) {
+        val busy = backlog >= 2 || (latched && backlog >= 1)
+        return if (viewfinderActive && busy && burstCapturing && holdingFill <= RELEASE_HOLDING_FILL) {
             WorkerBudget(min(all, LOADED_THREADS), LOADED_NICE, loaded = true)
         } else {
             WorkerBudget(all, IDLE_NICE, loaded = false)
         }
     }
+
+    /** B23c: how full the RAW holding queue is (0..1); 0 when it has no room at all (the router then uses the JPEG). */
+    fun holdingFill(singlesHeld: Int, capacity: Int): Double = if (capacity <= 0) 0.0 else singlesHeld.toDouble() / capacity
 
     /** B23b.1: the merge tail's nice for a budget. */
     fun tailNice(b: WorkerBudget): Int = min(MAX_NICE, b.nice + TAIL_NICE_STEP)
@@ -288,7 +312,10 @@ data class RapidFire(
                 "threads" to workerThreadsLoaded,
                 "nice" to workerNiceLoaded,
                 "tail_nice_step" to WorkerGovernor.TAIL_NICE_STEP,
-                "store_nice_step" to WorkerGovernor.STORE_NICE_STEP
+                "store_nice_step" to WorkerGovernor.STORE_NICE_STEP,
+                "only_while_burst_capturing" to true,
+                "release_holding_fill_above" to WorkerGovernor.RELEASE_HOLDING_FILL,
+                "tail_sliced_only_when_add_waiting" to true
             ),
             "native_workers" to nativeWorkers,
             "holding_queue_max" to RawHoldingQueue.MAX_SINGLES,
@@ -312,7 +339,7 @@ data class RapidFire(
                 "pool_last_job_nice" to v[1],
                 "tail_yields" to v[2],
                 "tail_yield_ms" to v[3],
-                "tail_slices" to v[4],
+                "tail_splits_for_adds" to v[4],
                 "render_thread_nice_seen" to v[5]
             )
         }

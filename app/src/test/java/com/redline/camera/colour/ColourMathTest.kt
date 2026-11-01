@@ -120,6 +120,20 @@ class ColourMathTest {
     }
 
     @Test
+    fun meteredExposureMatchesTheReference() {
+        val tone = tone()
+        val met = ColourMath.Metering.parse(cases["metering_model"] as Map<*, *>)
+        assertTrue(met.coef[1] < 0)
+        list("metering").forEach { c ->
+            c as Map<*, *>
+            val p98 = (c["p98_y"] as? Number)?.toDouble() ?: Double.NaN
+            val e = ColourMath.solveExposureMetered(tone, d(c["median_y"]), p98, met)
+            close("metered ${c["median_y"]} ${c["p98_y"]}", d(c["ev"]), e.ev, rel = 1e-7, abs = 1e-9)
+            assertEquals(c["method"], e.method)
+        }
+    }
+
+    @Test
     fun jpegMedianMatchesTheReference() {
         list("jpeg_median").forEach { c ->
             c as Map<*, *>

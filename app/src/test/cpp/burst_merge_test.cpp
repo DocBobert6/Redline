@@ -1,6 +1,7 @@
 // B22/B22a burst merge invariants on the host (CTest), including the streaming merger's buffer hand-back. Pixel parity with the Python reference is in
 // calibration/tests/test_burst_merge.py (through burst_merge_tool).
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "burst_merge.h"
+#include "burst_internal.h"
 
 namespace {
 
@@ -175,10 +177,54 @@ void streamingTests() {
         double tailErr = 0;
         for (std::size_t i = 0; i < tail.size(); ++i) tailErr = std::fmax(tailErr, std::fabs(tail[i] - want[i]));
         expect(err.empty() && tailErr == 0.0, "merge tail in slices equals the one-shot merge");
-        expect(after.tailSlices > before.tailSlices, "merge tail ran in slices");
+        // B23c: the add in progress makes the tail wait (a yield). Whether it also splits depends on timing (only an
+        // add that starts mid-job splits it); the split path is checked deterministically below.
         expect(after.tailYields > before.tailYields, "merge tail waited for the frame add");
-        std::printf("tail: %d slices, %d yields (%d ms)\n", after.tailSlices - before.tailSlices, after.tailYields - before.tailYields,
+        std::printf("tail: %d splits, %d yields (%d ms)\n", after.tailSlices - before.tailSlices, after.tailYields - before.tailYields,
                     after.tailYieldMs - before.tailYieldMs);
+    }
+
+    // B23c: a tail job is split only when a frame add starts while it runs; every row still runs exactly once.
+    {
+        const int n = 64;
+        std::vector<std::atomic<int>> hits(n);
+        for (auto& h : hits) h.store(0);
+        std::atomic<bool> started{false};
+        std::atomic<bool> addActive{false};
+        std::thread adder;
+        const redline::WorkerStats before = redline::burstWorkerStats();
+        redline::burstSetLane(-1000, true);
+        redline::detail::runParallel(n, 2, [&](int y0, int y1) {
+            if (!started.exchange(true)) {
+                adder = std::thread([&addActive] {
+                    const redline::FrameWorkScope busy;
+                    addActive.store(true);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                });
+                while (!addActive.load()) std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));  // slow rows, so the add starts mid-job
+            }
+            for (int y = y0; y < y1; ++y) hits[static_cast<std::size_t>(y)].fetch_add(1);
+        });
+        redline::burstSetLane(-1000, false);
+        adder.join();
+        const redline::WorkerStats after = redline::burstWorkerStats();
+        bool once = true;
+        for (auto& h : hits) once = once && h.load() == 1;
+        expect(once, "split tail covers every row exactly once");
+        expect(after.tailSlices > before.tailSlices, "tail split for a frame add that started mid-job");
+    }
+    {
+        // No add at all: one pool job, no split.
+        const int n = 64;
+        std::atomic<int> rows{0};
+        const redline::WorkerStats before = redline::burstWorkerStats();
+        redline::burstSetLane(-1000, true);
+        redline::detail::runParallel(n, 2, [&](int y0, int y1) { rows.fetch_add(y1 - y0); });
+        redline::burstSetLane(-1000, false);
+        const redline::WorkerStats after = redline::burstWorkerStats();
+        expect(rows.load() == n && after.tailSlices == before.tailSlices, "tail without a waiting add is not split");
     }
 
     const int t = redline::burstRecommendedThreads();
