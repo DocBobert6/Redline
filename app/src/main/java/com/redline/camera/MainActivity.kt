@@ -308,14 +308,25 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onPreviewFps(fps: Double, warm: Boolean) {
-            updateViewfinder { m ->
+            // B23b: rapid fire counts warm readings while the processing queue drains (one state change for both).
+            update { s ->
+                val m = s.viewfinder ?: ViewfinderMetrics()
                 val min = if (warm) minOf(m.previewFpsMin ?: fps, fps) else m.previewFpsMin
-                m.copy(previewFps = fps, previewFpsMin = min)
+                s.copy(
+                    viewfinder = m.copy(previewFps = fps, previewFpsMin = min),
+                    burst = if (warm) s.burst.preview(fps, null) else s.burst
+                )
             }
         }
 
         override fun onFrameStats(intervals: Int, dropped: Int, worstIntervalMs: Double) {
-            updateViewfinder { m -> m.copy(framesCounted = intervals, droppedFrames = dropped, worstFrameIntervalMs = worstIntervalMs) }
+            update { s ->
+                val m = s.viewfinder ?: ViewfinderMetrics()
+                s.copy(
+                    viewfinder = m.copy(framesCounted = intervals, droppedFrames = dropped, worstFrameIntervalMs = worstIntervalMs),
+                    burst = s.burst.preview(null, dropped)
+                )
+            }
         }
 
         override fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean) {

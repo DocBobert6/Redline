@@ -14,6 +14,7 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.JsonParse
 import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.RawCopy
+import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.look.CubeLut
 import com.redline.camera.nativebridge.RedlineNative
 
@@ -313,7 +314,13 @@ class ColourPipeline(context: Context) {
 
     private fun asset(name: String): String = app.assets.open(name).use { it.readBytes().toString(Charsets.UTF_8) }
 
-    private fun threads(): Int = Runtime.getRuntime().availableProcessors().coerceIn(1, MAX_THREADS)
+    /**
+     * B23b: the most render threads the pipeline may use (the worker governor lowers it while the viewfinder is busy);
+     * null = every core up to [MAX_THREADS]. Read at the start of each render.
+     */
+    @Volatile var threadLimit: Int? = null
+
+    private fun threads(): Int = WorkerGovernor.cappedThreads(Runtime.getRuntime().availableProcessors(), MAX_THREADS, threadLimit)
 
     companion object {
         const val LOOK_NAME = "Redline Standard"

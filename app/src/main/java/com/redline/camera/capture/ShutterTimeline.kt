@@ -81,6 +81,10 @@ class ShotTimeline(val pressMs: Long) {
                 "press_to_release" to rel(marks[RELEASED]),
                 "release_to_jpeg" to marks[RELEASED]?.let { r -> marks[JPEG]?.let { it - r } },
                 "merge_start_after_first_raw" to if (firstRaw != null) marks[MERGE_START]?.let { it - firstRaw } else null,
+                "save_queue_wait" to marks[SAVE_QUEUED]?.let { q -> marks[SAVE_START]?.let { it - q } },
+                "render" to marks[SAVE_START]?.let { r -> marks[RENDER_DONE]?.let { it - r } },
+                "store_wait" to marks[RENDER_DONE]?.let { r -> marks[STORE_START]?.let { it - r } },
+                "store" to marks[STORE_START]?.let { r -> marks[SAVED]?.let { it - r } },
                 "press_to_saved" to rel(marks[SAVED])
             )
         )
@@ -97,6 +101,10 @@ class ShotTimeline(val pressMs: Long) {
         const val MERGE_DONE = "merge_done"
         const val SAVE_QUEUED = "save_queued"
         const val SAVE_START = "save_start"
+
+        /** B23b: the render lane finished the shot; the store lane started on it. */
+        const val RENDER_DONE = "render_done"
+        const val STORE_START = "store_start"
         const val SAVED = "saved"
     }
 }

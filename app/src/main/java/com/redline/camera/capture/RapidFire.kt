@@ -28,6 +28,12 @@ object WorkerGovernor {
             WorkerBudget(all, IDLE_NICE, loaded = false)
         }
     }
+
+    /** Threads a pool of [cores] may use: at most [cap], and at most [limit] when the governor set one; never below 1. */
+    fun cappedThreads(cores: Int, cap: Int, limit: Int?): Int {
+        val n = cores.coerceIn(1, max(1, cap))
+        return if (limit == null) n else n.coerceAtMost(max(1, limit))
+    }
 }
 
 /**
@@ -127,7 +133,14 @@ data class RapidFire(
             val delta = if (prev == null || droppedTotal < prev) 0 else droppedTotal - prev
             next = next.copy(lastDroppedSeen = droppedTotal)
             if (busy && delta > 0) {
-                next = next.copy(droppedUnderLoad = next.droppedUnderLoad + delta, current = next.current.copy(droppedFrames = next.current.droppedFrames + delta))
+                next =
+                    next.copy(
+                        droppedUnderLoad = next.droppedUnderLoad + delta,
+                        current = next.current.copy(
+                            droppedFrames =
+                            next.current.droppedFrames + delta
+                        )
+                    )
             }
         }
         if (busy && fps != null) {

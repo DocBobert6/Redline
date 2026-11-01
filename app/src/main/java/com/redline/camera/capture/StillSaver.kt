@@ -97,6 +97,27 @@ class BurstCapture(
 )
 
 /**
+ * B23b: a shot between the render lane and the store lane ([StillSaver.render] -> [StillSaver.store]): the rendered
+ * bitmap (null = save the camera JPEG), the report pieces the render filled in, and the DNG source. Holds the shot's
+ * pool buffers until the store releases them.
+ */
+class StagedShot(
+    val shot: StillShot,
+    val base: String,
+    val renderStartMs: Long,
+    val renderDoneMs: Long,
+    @Volatile var rendered: Bitmap?,
+    val colour: ColourShot?,
+    val burstShot: BurstShot?,
+    val dngRaw: RawCopy?,
+    val dngResult: TotalCaptureResult,
+    val srMerged: Boolean,
+    val srFallback: String?,
+    val lookName: String,
+    val look: String
+)
+
+/**
  * Still saving (PLAN 6 step 9). B21: with the colour pipeline on, the RAW_SENSOR frame is rendered through it
  * (3:2 crop at the zoom stop, the stop's honest output size, Standard look) and that is the JPEG; if it cannot
  * render, the B13 path is used: the HAL JPEG is cropped to the viewfinder's 3:2, scaled to the stop's output size
@@ -113,20 +134,66 @@ class StillSaver(context: Context, private val version: String, private val pipe
     private val app = context.applicationContext
     private val resolver = app.contentResolver
 
-    /** Runs on the saver (processing queue) thread. Never throws; always calls [StillShot.release]. */
-    fun save(shot: StillShot, nowMs: () -> Long): ShotResult {
-        try {
-            return saveInner(shot, nowMs)
-        } finally {
-            runCatching { shot.burst?.srImage?.close() }
-            runCatching { shot.release() }
-        }
-    }
+    /** Render then store on the calling thread (the two lanes in one). Never throws; always calls [StillShot.release]. */
+    fun save(shot: StillShot, nowMs: () -> Long): ShotResult = store(render(shot, nowMs), nowMs)
 
-    private fun saveInner(shot: StillShot, nowMs: () -> Long): ShotResult {
+    /**
+     * B23b, render lane: the colour pipeline (merged, super-resolution or single frame) into a bitmap, ready for
+     * [store]. Never throws: a render that fails leaves no bitmap and the store saves the camera JPEG. The shot's pool
+     * buffers stay held (the DNG still reads its RAW frame); [store] returns them.
+     */
+    fun render(shot: StillShot, nowMs: () -> Long): StagedShot {
         val startMs = nowMs()
         shot.timeline?.mark(ShotTimeline.SAVE_START, startMs)
         val base = CaptureMath.baseName(System.currentTimeMillis())
+        return try {
+            renderInner(shot, nowMs, startMs, base)
+        } catch (e: Throwable) {
+            Log.w(TAG, "render failed", e)
+            runCatching { shot.burst?.srImage?.close() }
+            val doneMs = nowMs()
+            shot.timeline?.mark(ShotTimeline.RENDER_DONE, doneMs)
+            StagedShot(
+                shot = shot,
+                base = base,
+                renderStartMs = startMs,
+                renderDoneMs = doneMs,
+                rendered = null,
+                colour = if (shot.renderRaw) ColourShot(rendered = false, fallbackReason = "render: ${e.javaClass.simpleName}") else null,
+                burstShot = shot.singlePlan?.let {
+                    BurstShot(
+                        plan = it,
+                        stopMm = shot.stopTargetMm,
+                        stress = shot.stress,
+                        queuedBehind = shot.queuedBehind,
+                        path = shot.singlePath
+                    )
+                },
+                dngRaw = shot.raw ?: shot.burst?.dngRaw,
+                dngResult = shot.burst?.referenceResult ?: shot.result,
+                srMerged = false,
+                srFallback = null,
+                lookName = LOOK_NONE,
+                look = CaptureMath.lookTag(version, LOOK_NONE, shot.stopLabel, shot.trueEquivalentMm)
+            )
+        }
+    }
+
+    /**
+     * B23b, store lane: encode, EXIF, MediaStore insert, DNG. Never throws; always closes the super-resolution image,
+     * recycles the bitmap and calls [StillShot.release] exactly once.
+     */
+    fun store(staged: StagedShot, nowMs: () -> Long): ShotResult {
+        try {
+            return storeInner(staged, nowMs)
+        } finally {
+            runCatching { staged.rendered?.recycle() }
+            runCatching { staged.shot.burst?.srImage?.close() }
+            runCatching { staged.shot.release() }
+        }
+    }
+
+    private fun renderInner(shot: StillShot, nowMs: () -> Long, startMs: Long, base: String): StagedShot {
         var colour: ColourShot? = null
         var rendered: Bitmap? = null
         var dngRaw: RawCopy? = shot.raw
@@ -279,11 +346,44 @@ class StillSaver(context: Context, private val version: String, private val pipe
             else -> null
         }
         val look = CaptureMath.lookTag(version, lookName, shot.stopLabel, shot.trueEquivalentMm) + (detail?.let { " | $it" } ?: "")
+        val doneMs = nowMs()
+        shot.timeline?.mark(ShotTimeline.RENDER_DONE, doneMs)
+        return StagedShot(
+            shot = shot,
+            base = base,
+            renderStartMs = startMs,
+            renderDoneMs = doneMs,
+            rendered = rendered,
+            colour = colour,
+            burstShot = burstShot,
+            dngRaw = dngRaw,
+            dngResult = dngResult,
+            srMerged = srMerged,
+            srFallback = srFallback,
+            lookName = lookName,
+            look = look
+        )
+    }
+
+    private fun storeInner(staged: StagedShot, nowMs: () -> Long): ShotResult {
+        val shot = staged.shot
+        val storeStart = nowMs()
+        shot.timeline?.mark(ShotTimeline.STORE_START, storeStart)
+        val saveWaitMs = (staged.renderStartMs - shot.queuedAtMs).coerceAtLeast(0) + (storeStart - staged.renderDoneMs).coerceAtLeast(0)
+        val base = staged.base
+        val look = staged.look
+        val lookName = staged.lookName
+        var colour = staged.colour
+        var burstShot = staged.burstShot
+        val srMerged = staged.srMerged
+        val srFallback = staged.srFallback
+        val sr = shot.superRes
+        val b = shot.burst
         var jpegSize: Dim? = null
         var error: String? = null
         val encodeStart = nowMs()
         val jpegOk = try {
-            val bmp = rendered
+            val bmp = staged.rendered
             if (bmp != null) {
                 jpegSize = saveRendered(shot, bmp, base, look)
                 colour = colour?.let { it.copy(timingsMs = it.timingsMs + ("encode_save" to (nowMs() - encodeStart))) }
@@ -296,16 +396,17 @@ class StillSaver(context: Context, private val version: String, private val pipe
             error = "JPEG: ${e.javaClass.simpleName}: ${e.message}"
             false
         } finally {
-            rendered?.recycle()
+            staged.rendered?.recycle()
+            staged.rendered = null
         }
         val encodeMs = nowMs() - encodeStart
         var dngOk = false
-        val dngSource = dngRaw
+        val dngSource = staged.dngRaw
         val wantDng = dngSource != null && shot.saveDng
         val dngStart = nowMs()
         if (dngSource != null && wantDng) {
             try {
-                saveDng(shot, dngSource, dngResult, base, look)
+                saveDng(shot, dngSource, staged.dngResult, base, look)
                 dngOk = true
             } catch (e: Throwable) {
                 Log.w(TAG, "DNG save failed", e)
@@ -320,10 +421,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
             if (it.plan.isBurst) {
                 it.copy(
                     timingsMs = it.timingsMs + linkedMapOf("encode_save" to encodeMs, "dng" to dngMs, "total" to total),
-                    timeline = shot.timeline?.toMap()
+                    timeline = shot.timeline?.toMap(),
+                    saveWaitMs = saveWaitMs
                 )
             } else {
-                it.copy(timeline = shot.timeline?.toMap())
+                it.copy(timeline = shot.timeline?.toMap(), saveWaitMs = saveWaitMs)
             }
         }
         val srShot = if (sr != null && sr.applies) {

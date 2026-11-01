@@ -44,6 +44,7 @@ import com.redline.camera.capture.FramePool
 import com.redline.camera.capture.MemoryBudget
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
+import com.redline.camera.capture.RawHoldingQueue
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.ShotRouter
 import com.redline.camera.capture.ShotTimeline
@@ -54,6 +55,8 @@ import com.redline.camera.capture.SuperResDecision
 import com.redline.camera.capture.SuperResInputs
 import com.redline.camera.capture.SuperResPlanner
 import com.redline.camera.capture.SuperResSetup
+import com.redline.camera.capture.WorkerBudget
+import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.capture.identitySet
 import com.redline.camera.colour.ColourMath
 import com.redline.camera.colour.ColourPipeline
@@ -64,6 +67,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 
 /**
  * Everything the viewfinder needs to open the default camera, read once from the cached profile plus a
@@ -250,26 +254,66 @@ class ViewfinderController(
     data class BurstTag(val shot: Int, val index: Int, val manual: ManualApplied?)
 
     private val manager = context.applicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    private val thread = HandlerThread("redline-viewfinder").apply { start() }
+
+    /**
+     * The camera thread: every camera callback, RAW copy and image listener runs here. B23b: it stays at the default
+     * priority and is never governed, so background work (nice >= [WorkerGovernor.IDLE_NICE]) cannot hold off a RAW
+     * arrival or a preview result.
+     */
+    private val thread = HandlerThread("redline-viewfinder", Process.THREAD_PRIORITY_DEFAULT).apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
     private val saver = StillSaver(context, version, colourPipeline)
 
-    /** B22: the background processing queue (single worker): render, encode, save. Mildly lowered priority. */
-    private val saveExecutor = Executors.newSingleThreadExecutor(niceThreads("redline-save"))
+    private val mergeThreads = RedlineNative.burstThreads()
+    private val renderThreads = Runtime.getRuntime().availableProcessors()
+
+    // B23b: what the worker governor reads (written on the camera thread, read by the lanes).
+    @Volatile private var viewfinderActive = false
+
+    @Volatile private var loadProcessing = 0
+
+    @Volatile private var loadCapturing = 0
+
+    private fun budget(maxThreads: Int): WorkerBudget = WorkerGovernor.budget(viewfinderActive, loadProcessing, loadCapturing, maxThreads)
 
     /**
      * B22a: the streaming merge (single thread; the native pool works under it): frames are merged as they arrive,
-     * so the merge overlaps the capture. Same lowered priority, so preview rendering keeps the CPU it needs.
+     * so the merge overlaps the capture. B23b: governed (nice for this thread and the native workers).
      */
-    private val mergeExecutor = Executors.newSingleThreadExecutor(niceThreads("redline-merge"))
-    private val mergeThreads = RedlineNative.burstThreads()
+    private val mergeLane = GovernedLane("redline-merge", { budget(mergeThreads) }) { RedlineNative.setBurstWorkerNice(it.nice) }
+
+    /**
+     * B23b: a burst's merge finish runs on its own lane, so the next burst's start and frames (on [mergeLane]) are not
+     * queued behind a whole finish: the native pool interleaves their jobs, and the camera gets its buffers back.
+     */
+    private val mergeTailLane = GovernedLane("redline-merge-tail", { budget(mergeThreads) }) { RedlineNative.setBurstWorkerNice(it.nice) }
+
+    /**
+     * B23b: saving is two lanes, one thread each, FIFO: render (colour pipeline; governed thread count) hands each shot
+     * to store (encode, EXIF, MediaStore insert, DNG) through [stagedSlots], so a render overlaps the previous store
+     * and at most [STAGED_MAX] shots are between render start and store end. MediaStore inserts keep the save order.
+     */
+    private val renderLane = GovernedLane("redline-render", { budget(renderThreads) }) {
+        colourPipeline?.threadLimit = if (it.loaded) it.threads else null
+    }
+    private val storeLane = GovernedLane("redline-store", { budget(1) })
+    private val stagedSlots = Semaphore(STAGED_MAX)
 
     init {
-        mergeExecutor.execute {
-            RedlineNative.setBurstWorkerNice(WORKER_NICE)
-            listener.onMergeWorker(mergeThreads, WORKER_NICE)
+        mergeLane.execute {
+            RedlineNative.setBurstWorkerNice(WorkerGovernor.IDLE_NICE)
+            listener.onMergeWorker(mergeThreads, WorkerGovernor.IDLE_NICE)
         }
+    }
+
+    /** Runs [task] on the merge tail lane once every task queued so far on the streaming merge lane has run. */
+    private fun afterStreaming(task: () -> Unit) = mergeLane.execute { mergeTailLane.execute(task) }
+
+    /** B23b: refreshes what the governor reads; call after jobs, the capturing shot or the waiting presses change. */
+    private fun syncLoad() {
+        loadProcessing = jobs
+        loadCapturing = waitingPresses.size + if (pending != null) 1 else 0
     }
     private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
@@ -390,8 +434,15 @@ class ViewfinderController(
      * The burst owns at most [BurstPlan.residentFrames] pool buffers for its frames (plus the DNG's merge output);
      * a buffer the merger hands back is reused for a later frame, or returned to the pool once all frames are in.
      */
-    private inner class BurstRun(val plan: BurstPlan, slots: List<ByteBuffer>, val dngOut: ByteBuffer?, superRes: SuperResSetup? = null) {
-        val merge = StreamingMerge(mergeThreads, superRes)
+    private inner class BurstRun(
+        val plan: BurstPlan,
+        slots: List<ByteBuffer>,
+        val dngOut: ByteBuffer?,
+        superRes: SuperResSetup? = null,
+        threads: Int = mergeThreads
+    ) {
+        /** B23b: the merge's native threads, the governor's budget from the backlog ahead of this burst. */
+        val merge = StreamingMerge(threads, superRes)
 
         /** B23: the finished super-resolution merge (handed to the saver) and its stats. */
         var srImage: RedlineNative.SuperResMerger? = null
@@ -535,9 +586,14 @@ class ViewfinderController(
     fun release() {
         close()
         thread.quitSafely()
-        mergeExecutor.shutdown()
-        saveExecutor.execute { pool?.trimIdle() }
-        saveExecutor.shutdown()
+        mergeLane.execute { mergeTailLane.shutdown() }
+        mergeLane.shutdown()
+        // The store lane closes after the last render has handed it its shot.
+        renderLane.execute {
+            storeLane.execute { pool?.trimIdle() }
+            storeLane.shutdown()
+        }
+        renderLane.shutdown()
     }
 
     @SuppressLint("MissingPermission")
@@ -636,6 +692,7 @@ class ViewfinderController(
                     return
                 }
                 session = s
+                viewfinderActive = true
                 sessionHasRaw = withRaw
                 streamStartMs = SystemClock.elapsedRealtime()
                 frameStats.breakRun()
@@ -706,6 +763,7 @@ class ViewfinderController(
             return
         }
         waitingPresses.addLast(q)
+        syncLoad()
     }
 
     /** The camera can take a new shot now: a configured session, nothing capturing, no session rebuild wanted. */
@@ -720,7 +778,7 @@ class ViewfinderController(
     private fun startPress(q: QueuedPress) {
         if (jpegReader == null) {
             q.onCaptured()
-            saveExecutor.execute { q.done(ShotResult(ok = false, error = "no JPEG stream", kept = q.request.keep)) }
+            storeLane.execute { q.done(ShotResult(ok = false, error = "no JPEG stream", kept = q.request.keep)) }
             return
         }
         startShot(q)
@@ -730,7 +788,7 @@ class ViewfinderController(
     private fun dropPress(q: QueuedPress, why: String, refused: Boolean = false) {
         val waited = SystemClock.elapsedRealtime() - q.atMs
         q.onCaptured()
-        saveExecutor.execute {
+        storeLane.execute {
             q.done(
                 ShotResult(
                     ok = false,
@@ -749,6 +807,7 @@ class ViewfinderController(
         if (!canStartNow()) return
         val q = waitingPresses.removeFirstOrNull() ?: return
         startPress(q)
+        syncLoad()
     }
 
     /** The burst plan for the next shot, or null when burst merge is off (the shot is then exactly B21). */
@@ -840,7 +899,9 @@ class ViewfinderController(
                 } else {
                     null
                 }
-                run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup)
+                // B23b: thread budget from the work ahead of this burst (this shot is not counted yet).
+                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads).threads
+                run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup, threads)
             }
         }
         val burst = run != null
@@ -848,17 +909,20 @@ class ViewfinderController(
             val why = plan?.singleReason ?: "memory"
             srDecision = srDecision.copy(active = false, frames = 0, reason = "no burst ($why): one frame upscaled")
         }
-        // Not a burst: the B21 single RAW frame, or the camera JPEG when the single-frame queue is full or memory is short.
+        // Not a burst: B23b a single RAW frame (held in the RAW holding queue), or the camera JPEG only as the last resort:
+        // no pool buffer, the system low on memory, or the holding queue at its memory-sized bound (reason recorded).
         var buffers: List<ByteBuffer> = emptyList()
         var singlePath = BurstShot.PATH_JPEG
         if (!burst) {
             val wantsRaw = sessionHasRaw && rawReader != null
-            var (path, why) = ShotRouter.route(wantsRaw, singlesPending, pool?.available() ?: 0)
+            val lowMemory = wantsRaw && ActivityManager.MemoryInfo().also { runCatching { activityManager.getMemoryInfo(it) } }.lowMemory
+            val capacity = RawHoldingQueue.capacity(pool?.capacity ?: 0, burstsPending)
+            var (path, why) = ShotRouter.route(wantsRaw, singlesPending, pool?.available() ?: 0, capacity, lowMemory)
             if (path == ShotRouter.Path.SINGLE_RAW) {
                 buffers = pool?.acquire(1).orEmpty()
                 if (buffers.isEmpty()) {
                     path = ShotRouter.Path.CAMERA_JPEG
-                    why = "no memory for a RAW copy: camera JPEG"
+                    why = ShotRouter.WHY_NO_BUFFER
                 }
             }
             if (path == ShotRouter.Path.SINGLE_RAW) singlePath = BurstShot.PATH_SINGLE
@@ -915,6 +979,7 @@ class ViewfinderController(
             }.build()
             pending = shot
             active += shot
+            syncLoad()
             if (run != null) {
                 val requests = mutableListOf<CaptureRequest>()
                 for (i in 1..run.plan.frames) requests += burstRequest(cam, su, run.plan, shot.id, i)
@@ -1125,7 +1190,7 @@ class ViewfinderController(
             ?: return
         run.started = true
         val (levels, noise) = start
-        mergeExecutor.execute {
+        mergeLane.execute {
             p.timeline.mark(ShotTimeline.MERGE_START, SystemClock.elapsedRealtime())
             run.merge.start(levels, noise, first.width, first.height)
         }
@@ -1136,7 +1201,7 @@ class ViewfinderController(
 
     private fun submitFrame(p: PendingShot, run: BurstRun, index: Int) {
         val copy = run.copies[index]
-        mergeExecutor.execute {
+        mergeLane.execute {
             val released = run.merge.add(copy)
             if (released != null) p.timeline.mergeAdded(SystemClock.elapsedRealtime())
             when {
@@ -1216,6 +1281,7 @@ class ViewfinderController(
         p.released = true
         if (pending === p) pending = null
         jobs++
+        syncLoad()
         listener.onQueueDepth(jobs)
         val now = SystemClock.elapsedRealtime()
         p.timeline.mark(ShotTimeline.RELEASED, now)
@@ -1270,7 +1336,7 @@ class ViewfinderController(
         val lastFrameAtMs = run.lastFrameAtMs
         val first = run.copies.firstOrNull()
         val sh = shading
-        mergeExecutor.execute {
+        afterStreaming {
             p.timeline.mark(ShotTimeline.MERGE_FINISH, SystemClock.elapsedRealtime())
             var srStats: RedlineNative.SrStats? = null
             var srImage: RedlineNative.SuperResMerger? = null
@@ -1429,24 +1495,40 @@ class ViewfinderController(
             queuedAtMs = queuedAtMs,
             timeline = p.timeline,
             superRes = p.superRes,
-            release = { currentPool?.release(keep) }
+            release = {
+                currentPool?.release(keep)
+                // B23b: a single RAW frame leaves the holding queue when its buffer goes back.
+                if (p.wantRaw) handler.post { singlesPending-- }
+            }
         )
     }
 
+    /**
+     * B23b: render lane, then store lane. The render waits for a [stagedSlots] permit (so rendered bitmaps never pile up
+     * behind a slow store), and the store gives it back. Both lanes are FIFO, so files are inserted in queue order.
+     */
     private fun queueSave(p: PendingShot, shot: StillShot) {
         val wasBurst = p.run != null
-        val wasSingle = p.wantRaw
-        saveExecutor.execute {
-            val out = saver.save(shot) { SystemClock.elapsedRealtime() }
-            handler.post {
-                jobs--
-                inFlight--
-                if (wasBurst) burstsPending--
-                if (wasSingle) singlesPending--
-                listener.onQueueDepth(jobs)
-                if (inFlight == 0) handler.postDelayed(trimPool, POOL_TRIM_IDLE_MS)
+        val now = { SystemClock.elapsedRealtime() }
+        renderLane.execute {
+            stagedSlots.acquireUninterruptibly()
+            val staged = saver.render(shot, now)
+            storeLane.execute {
+                val out = try {
+                    saver.store(staged, now)
+                } finally {
+                    stagedSlots.release()
+                }
+                handler.post {
+                    jobs--
+                    inFlight--
+                    if (wasBurst) burstsPending--
+                    syncLoad()
+                    listener.onQueueDepth(jobs)
+                    if (inFlight == 0) handler.postDelayed(trimPool, POOL_TRIM_IDLE_MS)
+                }
+                p.done(out)
             }
-            p.done(out)
         }
     }
 
@@ -1468,7 +1550,8 @@ class ViewfinderController(
             run.srImage = null
             val owned = run.owned.toList()
             run.owned.clear()
-            mergeExecutor.execute {
+            // After any merge work already queued (streaming adds, then a finish on the tail lane).
+            afterStreaming {
                 run.merge.fail(message)
                 run.merge.close()
                 handler.post { pool?.release(owned) }
@@ -1481,9 +1564,10 @@ class ViewfinderController(
             jobs--
             listener.onQueueDepth(jobs)
         }
+        syncLoad()
         if (inFlight == 0) handler.postDelayed(trimPool, POOL_TRIM_IDLE_MS)
         val error = if (dropped != null) "dropped: $message" else message
-        saveExecutor.execute {
+        storeLane.execute {
             p.done(ShotResult(ok = false, error = error, dropped = dropped, dngWanted = p.saveDng, kept = p.request.keep))
         }
         if (!p.released) {
@@ -1533,7 +1617,10 @@ class ViewfinderController(
 
     /** B22b: presses still waiting when the camera closes are dropped with [reason] (not capture failures). */
     private fun dropWaitingPresses(reason: String) {
-        while (true) dropPress(waitingPresses.removeFirstOrNull() ?: return, reason)
+        while (true) {
+            dropPress(waitingPresses.removeFirstOrNull() ?: break, reason)
+        }
+        syncLoad()
     }
 
     private fun closeRetiredIfIdle() {
@@ -1660,6 +1747,7 @@ class ViewfinderController(
         val cam = device
         runCatching { session?.close() }
         session = null
+        viewfinderActive = false
         closedReason = DropReason.LEFT_VIEWFINDER
         closeReaders(DropReason.LEFT_VIEWFINDER)
         dropWaitingPresses(DropReason.LEFT_VIEWFINDER)
@@ -1694,7 +1782,10 @@ class ViewfinderController(
          * camera, the preview's GL thread and the UI win the CPU, but well short of THREAD_PRIORITY_BACKGROUND (10),
          * which Android may also confine to the little cores.
          */
-        const val WORKER_NICE = 5
+        const val WORKER_NICE = WorkerGovernor.IDLE_NICE
+
+        /** B23b: shots between render start and store end (one rendering or staged, one storing). */
+        const val STAGED_MAX = 2
 
         private fun niceThreads(name: String) = java.util.concurrent.ThreadFactory { r ->
             Thread({
@@ -1703,6 +1794,25 @@ class ViewfinderController(
             }, name)
         }
         private const val RAW_MAX_IMAGES = 4
+
+        /**
+         * B23b: one worker thread; every task first takes the governor's budget: the thread's nice value, then [apply]
+         * (the native merge workers' nice, the colour pipeline's thread limit). A rendered thread inherits the nice.
+         */
+        private class GovernedLane(name: String, private val budget: () -> WorkerBudget, private val apply: (WorkerBudget) -> Unit = {}) {
+            private val exec = Executors.newSingleThreadExecutor(niceThreads(name))
+
+            fun execute(task: () -> Unit) {
+                exec.execute {
+                    val b = budget()
+                    runCatching { Process.setThreadPriority(b.nice) }
+                    runCatching { apply(b) }
+                    task()
+                }
+            }
+
+            fun shutdown() = exec.shutdown()
+        }
 
         /** Idle pool buffers are freed once the queue has been empty this long. */
         private const val POOL_TRIM_IDLE_MS = 15_000L

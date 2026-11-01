@@ -54,7 +54,9 @@ data class BurstShot(
     val path: String = if (plan.isBurst) PATH_BURST else PATH_SINGLE,
     val streaming: BurstStreaming? = null,
     /** B22b: press-to-file timeline ([ShotTimeline.toMap]): per-frame capture, RAW arrival, result, merge and save times. */
-    val timeline: Map<String, Any?>? = null
+    val timeline: Map<String, Any?>? = null,
+    /** B23b: time the shot waited for the render lane plus for the store lane (queued, not working), ms. */
+    val saveWaitMs: Long? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "plan" to plan.toMap(),
@@ -76,6 +78,7 @@ data class BurstShot(
         "queued_behind" to queuedBehind,
         "path" to path,
         "streaming" to streaming?.toMap(),
+        "save_wait_ms" to saveWaitMs,
         "timeline" to timeline
     )
 
@@ -92,6 +95,7 @@ data class BurstShot(
         "shutter_release_ms" to timingsMs["shutter_release"],
         "capture_ms" to timingsMs["capture"],
         "merge_tail_ms" to timingsMs["merge_tail"],
+        "save_wait_ms" to saveWaitMs,
         "total_ms" to totalMs
     )
 
@@ -166,7 +170,9 @@ data class BurstReport(
     val droppedShots: Int = 0,
     val dropReasons: Map<String, Int> = emptyMap(),
     /** B22b: timelines of the latest shots ([ShotTimeline.toMap]), newest last. */
-    val recentTimelines: List<Map<String, Any?>> = emptyList()
+    val recentTimelines: List<Map<String, Any?>> = emptyList(),
+    /** B23b: rapid-fire runs (camera-JPEG fallbacks, RAW singles, save waits, preview fps while the queue drains). */
+    val rapidFire: RapidFire = RapidFire()
 ) {
     val enabled: Boolean get() = userSetting && available == true
 
@@ -194,6 +200,7 @@ data class BurstReport(
     }
 
     fun queue(depth: Int): BurstReport = copy(
+        rapidFire = rapidFire.queue(depth),
         queueDepth = depth,
         maxQueueDepth = max(maxQueueDepth, depth),
         stressMaxQueue = if (stressRunning) max(stressMaxQueue, depth) else stressMaxQueue
@@ -203,6 +210,7 @@ data class BurstReport(
         val ms = shutterToSavedMs ?: 0
         val stress = shot.stress
         var next = copy(
+            rapidFire = rapidFire.shot(shot.path, jpegReason(shot), shot.saveWaitMs),
             framesRequested = framesRequested + shot.plan.frames,
             framesCaptured = framesCaptured + shot.framesCaptured,
             framesMerged = framesMerged + shot.framesMerged,
@@ -274,6 +282,16 @@ data class BurstReport(
             next = next.copy(queuedShots = queuedShots + 1, queuedTotalMs = queuedTotalMs + ms, queuedMaxMs = max(queuedMaxMs, ms))
         }
         return next
+    }
+
+    /** B23b: a warm preview reading ([fps] rolling rate, [droppedTotal] the viewfinder's cumulative dropped frames). */
+    fun preview(fps: Double?, droppedTotal: Int?): BurstReport = copy(rapidFire = rapidFire.preview(fps, droppedTotal))
+
+    /** B23b: why a shot was the camera JPEG: the router's reason (the last "...: camera JPEG" part of the plan's reason). */
+    private fun jpegReason(shot: BurstShot): String? {
+        if (shot.path != BurstShot.PATH_JPEG) return null
+        val why = shot.plan.singleReason ?: return null
+        return why.split("; ").lastOrNull { it.endsWith("camera JPEG") } ?: why
     }
 
     /** B22 gate: every gate-eligible merged shot at 24 and at 35 mm saved in under 3 s; null until both stops have one. */
@@ -351,6 +369,7 @@ data class BurstReport(
         "max_waiting_presses" to PressPolicy.MAX_WAITING_PRESSES,
         "last" to last?.toMap(),
         "recent_timelines" to recentTimelines,
+        "rapid_fire" to rapidFire.toMap(),
         "stress" to linkedMapOf(
             "requested" to stressRequested,
             "done" to stressDone,
@@ -361,7 +380,9 @@ data class BurstReport(
         ),
         "gate" to linkedMapOf(
             "save_lt_3000_ms_24_35" to saveGate,
-            "no_shutter_blocking" to shutterGate
+            "no_shutter_blocking" to shutterGate,
+            "no_camera_jpeg_in_15_taps" to rapidFire.noCameraJpegGate,
+            "preview_fps_min_ge_29_5_under_load" to rapidFire.previewFpsGate
         )
     )
 

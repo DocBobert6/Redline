@@ -15,6 +15,8 @@ namespace {
 constexpr int kCfaLayouts[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
 constexpr float kLuma[3] = {0.2126729f, 0.7151522f, 0.0721750f};
 constexpr int kMaxThreads = 16;
+// B23b: render rows between voluntary yields (one tile band; about 1-2 ms of work on a performance core).
+constexpr int kYieldRows = 32;
 constexpr int kMaxSide = 1 << 15;
 
 // Mirror (reflect-101) index, the border mode of scipy.ndimage "mirror": -1 -> 1, n -> n - 2. Keeps the CFA phase.
@@ -342,6 +344,8 @@ void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty,
     std::vector<float> line(static_cast<std::size_t>(cw) * 3);
     std::vector<float> acc(static_cast<std::size_t>(ow) * 3);
     for (int oy = o0; oy < o1; ++oy) {
+        // B23b: give the CPU back between row tiles so the camera, GL and UI threads are never held off for a whole band.
+        if (oy != o0 && (oy - o0) % kYieldRows == 0) std::this_thread::yield();
         const float* lin;
         if (resample) {
             std::fill(acc.begin(), acc.end(), 0.0f);
@@ -532,6 +536,7 @@ void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y
     const float* m = spec.colour.matrix;
     const float inv[3] = {1.0f / spec.colour.neutral[0], 1.0f / spec.colour.neutral[1], 1.0f / spec.colour.neutral[2]};
     for (int y = y0; y < y1; ++y) {
+        if (y != y0 && (y - y0) % kYieldRows == 0) std::this_thread::yield();  // B23b, as in renderBlock
         const float* r = in.data + static_cast<std::size_t>(y) * in.rowStride;
         const float* g = r + in.planeStride;
         const float* b = g + in.planeStride;
