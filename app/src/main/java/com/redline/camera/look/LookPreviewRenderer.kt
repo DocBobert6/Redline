@@ -520,7 +520,8 @@ class LookPreviewRenderer(private val listener: Listener) {
             if (now - lastStatsMs >= STATS_PERIOD_MS) {
                 lastStatsMs = now
                 val oh = if (gpuTimer) null else overhead.snapshot().p50Ms
-                listener.onStats(Stats(timing.snapshot(), timerMethod, displayStats.intervals, displayStats.dropped, oh, renderSize, glNice))
+                val st = Stats(timing.snapshot(), timerMethod, displayStats.intervals, displayStats.dropped, oh, renderSize, glNice)
+                listener.onStats(st)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "look preview frame failed", t)
@@ -687,6 +688,7 @@ class LookPreviewRenderer(private val listener: Listener) {
         private const val CPU_SAMPLE_EVERY = 15L
         private const val QUERY_RING = 4
         private const val GPU_GRACE_FRAMES = 90L
+
         // B23b.1: the compact 4-byte formats first (accepted only within [LutMath.COMPACT_TOLERANCE]), then half floats.
         private val LUT_FORMATS = listOf("RGB10A2", "RGBA8", "RGBA16F", "RGB16F")
         private val COMPACT_FORMATS = setOf("RGB10A2", "RGBA8")

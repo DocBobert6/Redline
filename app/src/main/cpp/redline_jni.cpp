@@ -385,7 +385,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNa
 // B23b.1: [pool worker nice read back, last job nice, tail yields, tail yield ms, tail slices, render thread nice read back].
 extern "C" JNIEXPORT jintArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeWorkerStats(JNIEnv* env, jclass) {
     const redline::WorkerStats w = redline::burstWorkerStats();
-    const std::vector<int> v = {w.workerNiceSeen, w.jobNiceLast, w.tailYields, w.tailYieldMs, w.tailSlices, redline::renderThreadNiceSeen()};
+    const std::vector<int> v = {w.workerNiceSeen, w.jobNiceLast, w.tailYields,
+                                w.tailYieldMs,    w.tailSlices,  redline::renderThreadNiceSeen()};
     return intArray(env, v);
 }
 

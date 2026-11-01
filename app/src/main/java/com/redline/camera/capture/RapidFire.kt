@@ -221,7 +221,12 @@ data class RapidFire(
         val dp = delta(lastPausesSeen, pausesTotal)
         val dms = lastPauseMsSeen.let { if (it == null || pauseMsTotal < it) 0.0 else pauseMsTotal - it }
         val dw = delta(lastWarmupSeen, warmupTotal)
-        next = next.copy(lastPausesSeen = pausesTotal, lastPauseMsSeen = pauseMsTotal, lastWarmupSeen = warmupTotal, recentResumes = resumes)
+        next = next.copy(
+            lastPausesSeen = pausesTotal,
+            lastPauseMsSeen = pauseMsTotal,
+            lastWarmupSeen = warmupTotal,
+            recentResumes = resumes
+        )
         if (busy) {
             next = next.copy(
                 pausesUnderLoad = next.pausesUnderLoad + dp,

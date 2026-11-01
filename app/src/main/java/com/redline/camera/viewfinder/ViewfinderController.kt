@@ -42,6 +42,7 @@ import com.redline.camera.capture.DropReason
 import com.redline.camera.capture.EarlyNoise
 import com.redline.camera.capture.FramePool
 import com.redline.camera.capture.FrameResults
+import com.redline.camera.capture.GovernorLatch
 import com.redline.camera.capture.MemoryBudget
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
@@ -57,7 +58,6 @@ import com.redline.camera.capture.SuperResInputs
 import com.redline.camera.capture.SuperResPlanner
 import com.redline.camera.capture.SuperResSetup
 import com.redline.camera.capture.WorkerBudget
-import com.redline.camera.capture.GovernorLatch
 import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.capture.identitySet
 import com.redline.camera.colour.ColourMath
@@ -923,7 +923,8 @@ class ViewfinderController(
                     null
                 }
                 // B23b: thread budget from the work ahead of this burst (this shot is not counted yet).
-                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads, governorLatch.latched).threads
+                val latched = governorLatch.latched
+                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads, latched).threads
                 run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup, threads)
             }
         }

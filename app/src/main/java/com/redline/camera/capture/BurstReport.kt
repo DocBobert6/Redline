@@ -294,7 +294,8 @@ data class BurstReport(
     )
 
     /** B23b.1: the native worker read-back for the report. */
-    fun nativeWorkers(v: IntArray?): BurstReport = RapidFire.nativeWorkerMap(v)?.let { copy(rapidFire = rapidFire.copy(nativeWorkers = it)) } ?: this
+    fun nativeWorkers(v: IntArray?): BurstReport =
+        RapidFire.nativeWorkerMap(v)?.let { copy(rapidFire = rapidFire.copy(nativeWorkers = it)) } ?: this
 
     /** B23b: why a shot was the camera JPEG: the router's reason (the last "...: camera JPEG" part of the plan's reason). */
     private fun jpegReason(shot: BurstShot): String? {

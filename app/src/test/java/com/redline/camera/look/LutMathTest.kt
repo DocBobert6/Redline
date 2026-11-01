@@ -117,6 +117,28 @@ class LutMathTest {
     }
 
     @Test
+    fun rgb10a2PacksRedLowThenGreenBlueAndAlpha() {
+        val lut = CubeLut(2, floatArrayOf(0f, 0f, 0f), floatArrayOf(1f, 1f, 1f), FloatArray(24) { if (it == 0) 1.2f else 0.5f })
+        val words = LutMath.toRgb10a2(lut)
+        assertEquals(8, words.size)
+        val w = words[0]
+        assertEquals(1023, w and 0x3FF) // red clamped to 1
+        assertEquals(512, (w ushr 10) and 0x3FF) // 0.5 * 1023 = 511.5 -> 512
+        assertEquals(512, (w ushr 20) and 0x3FF)
+        assertEquals(3, w ushr 30)
+        // Four times the precision of RGBA8: the quantisation error is at most half a 10-bit step.
+        val id = CubeLut.identity(33)
+        val packed = LutMath.toRgb10a2(id)
+        for (i in packed.indices) {
+            for (c in 0..2) {
+                val v = ((packed[i] ushr (10 * c)) and 0x3FF) / 1023f
+                assertEquals(id.data[i * 3 + c], v, 0.5f / 1023f + 1e-6f)
+            }
+        }
+        assertTrue(LutMath.COMPACT_TOLERANCE <= 1)
+    }
+
+    @Test
     fun selfCheckErrorMeasuresAgainstTheReference() {
         val lut = CubeLut.identity(17)
         val inputs = LutMath.SELF_CHECK_COLOURS

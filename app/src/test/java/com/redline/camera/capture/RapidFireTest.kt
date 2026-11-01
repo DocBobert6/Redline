@@ -212,4 +212,74 @@ class RapidFireTest {
         assertEquals(true, gate["preview_fps_min_ge_29_5_under_load"])
         assertTrue(b.toMap().containsKey("rapid_fire"))
     }
+
+    // ---------------------------------------------------------------- B23b.1
+
+    @Test
+    fun latchKeepsTheWholeDrainLoadedButNotALoneShot() {
+        val latch = GovernorLatch()
+        // A lone shot: backlog one, never two: not latched, every thread.
+        assertFalse(latch.update(viewfinderActive = true, backlog = 1))
+        assertFalse(WorkerGovernor.budget(true, 1, 0, 8, latch.latched).loaded)
+        // A rapid-fire run: latched at two, stays loaded down to one, released at zero.
+        assertTrue(latch.update(true, 3))
+        assertTrue(latch.update(true, 1))
+        assertEquals(WorkerBudget(2, WorkerGovernor.LOADED_NICE, true), WorkerGovernor.budget(true, 1, 0, 8, latch.latched))
+        assertFalse(latch.update(true, 0))
+        assertFalse(latch.update(true, 1))
+        // Leaving the viewfinder releases it, and the budget is idle without the viewfinder anyway.
+        assertTrue(latch.update(true, 2))
+        assertFalse(latch.update(false, 2))
+        assertFalse(WorkerGovernor.budget(false, 1, 0, 8, latched = true).loaded)
+    }
+
+    @Test
+    fun tailRunsNicerThanAddsAndStoreOnlyUnderLoad() {
+        val idle = WorkerGovernor.budget(true, 0, 0, 8)
+        val loaded = WorkerGovernor.budget(true, 2, 1, 8)
+        assertEquals(WorkerGovernor.IDLE_NICE + WorkerGovernor.TAIL_NICE_STEP, WorkerGovernor.tailNice(idle))
+        assertEquals(WorkerGovernor.LOADED_NICE + WorkerGovernor.TAIL_NICE_STEP, WorkerGovernor.tailNice(loaded))
+        assertTrue(WorkerGovernor.tailNice(loaded) > loaded.nice)
+        assertEquals(idle.nice, WorkerGovernor.storeNice(idle))
+        assertEquals(WorkerGovernor.LOADED_NICE + WorkerGovernor.STORE_NICE_STEP, WorkerGovernor.storeNice(loaded))
+        assertEquals(WorkerGovernor.MAX_NICE, WorkerGovernor.tailNice(WorkerBudget(2, 18, true)))
+    }
+
+    @Test
+    fun loadReadingsCountPausesApartFromFps() {
+        var r = RapidFire().load(fps = null, droppedTotal = 0, pausesTotal = 2, pauseMsTotal = 500.0, warmupTotal = 3)
+        assertEquals(0, r.pausesUnderLoad) // idle pauses are not load pauses
+        r = r.queue(2).load(29.9, 0, 4, 1100.0, 7)
+        assertEquals(2, r.pausesUnderLoad)
+        assertEquals(600.0, r.pauseMsUnderLoad, 1e-9)
+        assertEquals(4, r.warmupFramesUnderLoad)
+        assertEquals(29.9, r.fpsMinUnderLoad!!, 1e-9)
+        assertEquals(2, r.current.pauses)
+        // A null fps (window too short after a pause) is not a reading; a real drop still counts.
+        r = r.load(null, 1, 5, 1400.0, 8)
+        assertEquals(29.9, r.fpsMinUnderLoad!!, 1e-9)
+        assertEquals(1, r.droppedUnderLoad)
+        assertEquals(3, r.pausesUnderLoad)
+        // A meter restart (lower totals) adds nothing.
+        r = r.load(30.0, 0, 0, 0.0, 0)
+        assertEquals(3, r.pausesUnderLoad)
+        val m = r.toMap()
+        assertEquals(3, m["preview_pauses_under_load"])
+        assertEquals(900L, m["preview_pause_ms_under_load"])
+        assertEquals(RapidFire.FPS_METHOD, m["preview_fps_method"])
+    }
+
+    @Test
+    fun nativeWorkerReadBackMapsByPosition() {
+        assertNull(RapidFire.nativeWorkerMap(null))
+        assertNull(RapidFire.nativeWorkerMap(intArrayOf(1, 2)))
+        val m = RapidFire.nativeWorkerMap(intArrayOf(10, 13, 4, 120, 32, 10))!!
+        assertEquals(10, m["pool_worker_nice_seen"])
+        assertEquals(13, m["pool_last_job_nice"])
+        assertEquals(4, m["tail_yields"])
+        assertEquals(120, m["tail_yield_ms"])
+        assertEquals(32, m["tail_slices"])
+        assertEquals(10, m["render_thread_nice_seen"])
+        assertEquals(m, BurstReport().nativeWorkers(intArrayOf(10, 13, 4, 120, 32, 10)).rapidFire.nativeWorkers)
+    }
 }

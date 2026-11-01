@@ -979,7 +979,9 @@ class MainActivity : ComponentActivity() {
                     result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
                 var burst = state.value.burst.press(result.shutterWaitMs, result.shutterBlocked, stress)
                 result.dropped?.let { burst = burst.drop(it, refused = result.shutterBlocked) }
-                result.burst?.let { burst = burst.record(it, result.shutterToSavedMs, result.ok).nativeWorkers(RedlineNative.workerStats()) }
+                result.burst?.let {
+                    burst = burst.record(it, result.shutterToSavedMs, result.ok).nativeWorkers(RedlineNative.workerStats())
+                }
                 if (stress && result.burst == null) {
                     val failed = !result.ok && result.dropped == null
                     burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (failed) 1 else 0)
