@@ -1729,7 +1729,8 @@ class ViewfinderController(
             listener.onStreaming(su, stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
         } catch (e: Exception) {
             Log.w(TAG, "setRepeatingRequest failed", e)
-            listener.onError("preview request failed: ${e.javaClass.simpleName}")
+            // B23b.1: the re-issue after a burst is an optimisation; the running repeating request carries on without it.
+            if (!afterBurst) listener.onError("preview request failed: ${e.javaClass.simpleName}")
         }
     }
 
