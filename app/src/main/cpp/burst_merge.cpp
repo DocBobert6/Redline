@@ -14,6 +14,7 @@
 #include "burst_internal.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -56,6 +57,8 @@ constexpr int kReferenceCandidates = 3;
 constexpr double kTileC = 2.0;
 constexpr double kPixK = 3.0;
 constexpr int kMaxThreads = 16;
+constexpr int kTailSlices = 16;      // B23b.1: slices per merge-tail job
+constexpr int kTailMaxWaitMs = 400;  // B23b.1: longest a tail slice waits for frame adds
 constexpr double kPi = 3.14159265358979323846;
 
 using Clock = std::chrono::steady_clock;
@@ -74,6 +77,29 @@ inline int floorMod(int a, int b) { return a - floorDiv(a, b) * b; }
 
 std::atomic<int> gWorkerNice{0};
 
+// B23b.1: per-lane settings of the thread that calls into the pool (the app's merge / merge-tail lane threads).
+constexpr int kNiceUnset = -1000;
+thread_local int tLaneNice = kNiceUnset;
+thread_local bool tLaneTail = false;
+
+// B23b.1: what the workers actually run at (read back with getpriority after setpriority), and how often the merge
+// tail stepped aside for a frame add.
+std::atomic<int> gWorkerNiceSeen{kNiceUnset};
+std::atomic<int> gJobNiceLast{kNiceUnset};
+std::atomic<int> gTailYields{0};
+std::atomic<int> gTailYieldMs{0};
+std::atomic<int> gTailSlices{0};
+
+int currentNice() {
+#if defined(__linux__)
+    errno = 0;
+    const int v = getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+    return errno == 0 ? v : kNiceUnset;
+#else
+    return kNiceUnset;
+#endif
+}
+
 void applyNice(int nice) {
 #if defined(__linux__)
     // Linux: the nice value is per thread (PRIO_PROCESS with a thread id).
@@ -83,7 +109,24 @@ void applyNice(int nice) {
 #endif
 }
 
-// Persistent workers; one job at a time (callers queue on jobMu_). The caller takes chunks too.
+// B23b.1: frame adds in progress (any burst). The merge tail runs its jobs in slices and waits between slices while
+// one is in progress, so a burst queued behind another gets the pool (and its RAW buffers back) at once.
+std::mutex gPrioMu;
+std::condition_variable gPrioCv;
+int gFrameWork = 0;
+
+void waitForFrameWork() {
+    std::unique_lock<std::mutex> lk(gPrioMu);
+    if (gFrameWork == 0) return;
+    const auto t0 = Clock::now();
+    // Bounded: a tail never starves for longer than a burst's frame adds plausibly take.
+    gPrioCv.wait_for(lk, std::chrono::milliseconds(kTailMaxWaitMs), [] { return gFrameWork == 0; });
+    gTailYields.fetch_add(1);
+    gTailYieldMs.fetch_add(static_cast<int>(msSince(t0)));
+}
+
+// Persistent workers; one job at a time (callers queue on jobMu_). The caller takes chunks too. B23b.1: every job
+// carries its caller's lane nice, which the workers apply before taking chunks.
 class WorkPool {
 public:
     static WorkPool& get() {
@@ -97,6 +140,7 @@ public:
             if (n > 0) body(0, n);
             return;
         }
+        const int nice = tLaneNice != kNiceUnset ? tLaneNice : gWorkerNice.load();
         std::lock_guard<std::mutex> job(jobMu_);
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -110,8 +154,10 @@ public:
             next_.store(0);
             want_ = threads - 1;
             running_ = threads - 1;
+            nice_ = nice;
             ++gen_;
         }
+        gJobNiceLast.store(nice);
         cv_.notify_all();
         drain();
         std::unique_lock<std::mutex> lk(mu_);
@@ -136,11 +182,12 @@ private:
             cv_.wait(lk, [&] { return gen_ != seen; });
             seen = gen_;
             if (id >= want_) continue;
+            const int nice = nice_;
             lk.unlock();
-            const int nice = gWorkerNice.load();
             if (nice != applied) {
                 applyNice(nice);
                 applied = nice;
+                gWorkerNiceSeen.store(currentNice());
             }
             drain();
             lk.lock();
@@ -158,11 +205,25 @@ private:
     int chunk_ = 1;
     int want_ = 0;
     int running_ = 0;
+    int nice_ = 0;
     std::uint64_t gen_ = 0;
     std::atomic<int> next_{0};
 };
 
-void parallelFor(int n, int threads, const std::function<void(int, int)>& body) { WorkPool::get().run(n, threads, body); }
+// B23b.1: a merge-tail job (finish / gather) runs in [kTailSlices] slices and steps aside between them for frame adds.
+void parallelFor(int n, int threads, const std::function<void(int, int)>& body) {
+    if (!tLaneTail || n < kTailSlices * 2) {
+        WorkPool::get().run(n, threads, body);
+        return;
+    }
+    const int step = (n + kTailSlices - 1) / kTailSlices;
+    for (int a = 0; a < n; a += step) {
+        waitForFrameWork();
+        const int b = std::min(n, a + step);
+        WorkPool::get().run(b - a, threads, [&body, a](int x, int y) { body(a + x, a + y); });
+        gTailSlices.fetch_add(1);
+    }
+}
 
 // ------------------------------------------------------------------------------------------------ images
 
@@ -1114,6 +1175,34 @@ int burstRecommendedThreads() {
 }
 
 void burstSetWorkerNice(int nice) { gWorkerNice.store(nice); }
+
+void burstSetLane(int nice, bool tail) {
+    tLaneNice = nice;
+    tLaneTail = tail;
+}
+
+FrameWorkScope::FrameWorkScope() {
+    std::lock_guard<std::mutex> lk(gPrioMu);
+    ++gFrameWork;
+}
+
+FrameWorkScope::~FrameWorkScope() {
+    {
+        std::lock_guard<std::mutex> lk(gPrioMu);
+        --gFrameWork;
+    }
+    gPrioCv.notify_all();
+}
+
+WorkerStats burstWorkerStats() {
+    WorkerStats s;
+    s.workerNiceSeen = gWorkerNiceSeen.load();
+    s.jobNiceLast = gJobNiceLast.load();
+    s.tailYields = gTailYields.load();
+    s.tailYieldMs = gTailYieldMs.load();
+    s.tailSlices = gTailSlices.load();
+    return s;
+}
 
 // ------------------------------------------------------------------------------------------------ self-check
 

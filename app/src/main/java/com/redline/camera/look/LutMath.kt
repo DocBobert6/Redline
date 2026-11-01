@@ -109,6 +109,21 @@ object LutMath {
         return out
     }
 
+    /**
+     * B23b.1: RGB10_A2 copy of the LUT data, one packed GL_UNSIGNED_INT_2_10_10_10_REV word per node (red in the low
+     * 10 bits, then green, blue, and alpha 3 in the top 2 bits): 4 bytes per node like RGBA8, with 4x its precision.
+     */
+    fun toRgb10a2(lut: CubeLut): IntArray {
+        val count = lut.size * lut.size * lut.size
+        val out = IntArray(count)
+        for (i in 0 until count) {
+            var w = 3 shl 30
+            for (c in 0..2) w = w or ((lut.data[i * 3 + c].coerceIn(0f, 1f) * 1023f).roundToInt() shl (10 * c))
+            out[i] = w
+        }
+        return out
+    }
+
     /** Max per-channel difference, in 8-bit steps, between GPU RGBA8 [pixels] and the reference for [inputs] (RGB bytes). */
     fun maxErrorSteps(lut: CubeLut, inputs: IntArray, pixels: ByteArray, strength: Float): Int {
         var worst = 0
@@ -134,4 +149,10 @@ object LutMath {
 
     /** GPU-vs-reference tolerance in 8-bit steps: half-float LUT storage plus filtering-weight precision plus rounding. */
     const val SELF_CHECK_TOLERANCE = 3
+
+    /**
+     * B23b.1: a compact 4-byte LUT format (RGB10_A2, RGBA8; half the texture bandwidth of RGBA16F) is used only when its
+     * self-check error is at most this many 8-bit steps; otherwise the half-float formats are tried as before.
+     */
+    const val COMPACT_TOLERANCE = 1
 }

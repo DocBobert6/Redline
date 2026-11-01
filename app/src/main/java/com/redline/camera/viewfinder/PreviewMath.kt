@@ -13,6 +13,13 @@ import kotlin.math.abs
 object PreviewFps {
     const val TARGET = 30
 
+    /**
+     * B23b.1: the frame duration to request with a fixed AE range ([n, n]): 1/n s. Null for a variable range, which
+     * leaves the frame duration to AE. (With AE on the HAL may ignore it; it is a hint that matches the range.)
+     */
+    fun fixedFrameDurationNs(range: Pair<Int, Int>?): Long? =
+        range?.takeIf { it.first == it.second && it.first > 0 }?.let { 1_000_000_000L / it.first }
+
     fun choose(ranges: List<Pair<Int, Int>>): Pair<Int, Int>? {
         if ((TARGET to TARGET) in ranges) return TARGET to TARGET
         if ((24 to TARGET) in ranges) return 24 to TARGET
@@ -87,6 +94,27 @@ data class PreviewTransform(
             val rotation = ((360 - displayRotation % 360) % 360).toFloat()
             return PreviewTransform(preW / viewW, preH / viewH, rotation, w, h)
         }
+    }
+}
+
+/**
+ * B23b.1: the size the look preview's LUT pass renders at. The TextureView shows the camera buffer centre-cropped and
+ * scaled by s = the fill scale of [PreviewTransform]; rendering at buffer x s (when s < 1) gives one output pixel per
+ * screen pixel with the same aspect, so the view's transform is unchanged and no detail is lost. Never larger than the
+ * buffer, never below [MIN_SIDE] on the short side; even dimensions.
+ */
+object LookRenderSize {
+    const val MIN_SIDE = 480
+
+    fun choose(buffer: Dim, viewW: Int, viewH: Int, sensorOrientation: Int, displayRotation: Int): Dim {
+        if (viewW <= 0 || viewH <= 0 || buffer.width <= 0 || buffer.height <= 0) return buffer
+        val upright = PreviewTransform.uprightSize(buffer, sensorOrientation, displayRotation)
+        val s = maxOf(viewW.toDouble() / upright.width, viewH.toDouble() / upright.height)
+        if (s >= 1.0) return buffer
+        val short = minOf(buffer.width, buffer.height)
+        val scale = maxOf(s, minOf(1.0, MIN_SIDE.toDouble() / short))
+        fun even(v: Double): Int = (Math.round(v / 2.0) * 2).toInt().coerceAtLeast(2)
+        return Dim(even(buffer.width * scale).coerceAtMost(buffer.width), even(buffer.height * scale).coerceAtMost(buffer.height))
     }
 }
 

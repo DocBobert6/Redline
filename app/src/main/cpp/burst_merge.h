@@ -117,4 +117,27 @@ int burstRecommendedThreads();
 // wins the CPU). Applied to existing and new workers before their next job.
 void burstSetWorkerNice(int nice);
 
+// B23b.1: settings of the calling lane thread for the pool jobs it starts: the workers' nice for its jobs, and whether
+// it is the merge tail (finish / gather), whose jobs run in slices and step aside while a frame add is in progress.
+void burstSetLane(int nice, bool tail);
+
+// B23b.1: marks a frame add (streaming or super-resolution) in progress for as long as it lives.
+struct FrameWorkScope {
+    FrameWorkScope();
+    ~FrameWorkScope();
+    FrameWorkScope(const FrameWorkScope&) = delete;
+    FrameWorkScope& operator=(const FrameWorkScope&) = delete;
+};
+
+// B23b.1: the pool workers' nice as read back after setting it (-1000: none yet), the nice of the last job, and how
+// often / how long merge-tail slices waited for frame adds.
+struct WorkerStats {
+    int workerNiceSeen = -1000;
+    int jobNiceLast = -1000;
+    int tailYields = 0;
+    int tailYieldMs = 0;
+    int tailSlices = 0;
+};
+WorkerStats burstWorkerStats();
+
 }  // namespace redline

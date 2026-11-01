@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "burst_merge.h"
@@ -146,6 +148,38 @@ void streamingTests() {
     hp.white = 16383.0f;
     err = redline::mergeBurstFloat({{hot.data(), W}, {hot.data(), W}}, hp, got.data(), W, r);
     expect(err.empty() && std::fabs(got[100] - 16383.0f) < 1e-2f, "saturated grey merges to itself");
+
+    // B23b.1: the merge tail (finish in slices, stepping aside while a frame add is in progress) gives the same result.
+    {
+        copies = frames;
+        redline::BurstMerger mt;
+        mt.begin(p);
+        for (auto& c : copies) {
+            std::vector<int> ignoredT;
+            mt.add({c.data(), W}, ignoredT);
+        }
+        const redline::WorkerStats before = redline::burstWorkerStats();
+        std::thread adder([] {
+            const redline::FrameWorkScope busy;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        redline::burstSetLane(-1000, true);  // -1000: keep the pool's nice; tail slicing on
+        std::vector<float> tail(static_cast<std::size_t>(W) * H);
+        std::vector<int> relT;
+        redline::BurstResult rt;
+        err = mt.finishFloat(tail.data(), W, rt, relT);
+        redline::burstSetLane(-1000, false);
+        adder.join();
+        const redline::WorkerStats after = redline::burstWorkerStats();
+        double tailErr = 0;
+        for (std::size_t i = 0; i < tail.size(); ++i) tailErr = std::fmax(tailErr, std::fabs(tail[i] - want[i]));
+        expect(err.empty() && tailErr == 0.0, "merge tail in slices equals the one-shot merge");
+        expect(after.tailSlices > before.tailSlices, "merge tail ran in slices");
+        expect(after.tailYields > before.tailYields, "merge tail waited for the frame add");
+        std::printf("tail: %d slices, %d yields (%d ms)\n", after.tailSlices - before.tailSlices, after.tailYields - before.tailYields,
+                    after.tailYieldMs - before.tailYieldMs);
+    }
 
     const int t = redline::burstRecommendedThreads();
     std::printf("recommended threads %d\n", t);

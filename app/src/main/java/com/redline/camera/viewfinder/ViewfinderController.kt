@@ -42,6 +42,7 @@ import com.redline.camera.capture.DropReason
 import com.redline.camera.capture.EarlyNoise
 import com.redline.camera.capture.FramePool
 import com.redline.camera.capture.FrameResults
+import com.redline.camera.capture.GovernorLatch
 import com.redline.camera.capture.MemoryBudget
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
@@ -191,6 +192,9 @@ class ViewfinderController(
         /** Warm-up-excluded frame-interval statistics, reported alongside [onPreviewFps]. */
         fun onFrameStats(intervals: Int, dropped: Int, worstIntervalMs: Double)
 
+        /** B23b.1: the under-load meter (burst pauses and the warm-up after them excluded), alongside [onPreviewFps]. */
+        fun onPreviewLoad(reading: PreviewLoadReading) {}
+
         /** The repeating request is running with these settings. */
         fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean)
 
@@ -276,29 +280,42 @@ class ViewfinderController(
 
     @Volatile private var loadCapturing = 0
 
-    private fun budget(maxThreads: Int): WorkerBudget = WorkerGovernor.budget(viewfinderActive, loadProcessing, loadCapturing, maxThreads)
+    /** B23b.1: loaded from a backlog of two until the queue is empty (see [GovernorLatch]). */
+    private val governorLatch = GovernorLatch()
+
+    private fun budget(maxThreads: Int): WorkerBudget =
+        WorkerGovernor.budget(viewfinderActive, loadProcessing, loadCapturing, maxThreads, governorLatch.latched)
 
     /**
      * B22a: the streaming merge (single thread; the native pool works under it): frames are merged as they arrive,
      * so the merge overlaps the capture. B23b: governed (nice for this thread and the native workers).
      */
-    private val mergeLane = GovernedLane("redline-merge", { budget(mergeThreads) }) { RedlineNative.setBurstWorkerNice(it.nice) }
+    private val mergeLane = GovernedLane("redline-merge", { budget(mergeThreads) }) { b, nice ->
+        RedlineNative.setBurstWorkerNice(b.nice)
+        RedlineNative.setBurstLane(nice, tail = false)
+    }
 
     /**
      * B23b: a burst's merge finish runs on its own lane, so the next burst's start and frames (on [mergeLane]) are not
      * queued behind a whole finish: the native pool interleaves their jobs, and the camera gets its buffers back.
+     * B23b.1: the tail runs [WorkerGovernor.TAIL_NICE_STEP] nicer than the adds, and natively in slices that wait while a
+     * frame add is in progress, so a burst queued behind another keeps its RAW arrivals about a frame apart.
      */
-    private val mergeTailLane = GovernedLane("redline-merge-tail", { budget(mergeThreads) }) { RedlineNative.setBurstWorkerNice(it.nice) }
+    private val mergeTailLane = GovernedLane("redline-merge-tail", { budget(mergeThreads) }, WorkerGovernor::tailNice) { _, nice ->
+        RedlineNative.setBurstLane(nice, tail = true)
+    }
 
     /**
      * B23b: saving is two lanes, one thread each, FIFO: render (colour pipeline; governed thread count) hands each shot
      * to store (encode, EXIF, MediaStore insert, DNG) through [stagedSlots], so a render overlaps the previous store
      * and at most [STAGED_MAX] shots are between render start and store end. MediaStore inserts keep the save order.
      */
-    private val renderLane = GovernedLane("redline-render", { budget(renderThreads) }) {
-        colourPipeline?.threadLimit = if (it.loaded) it.threads else null
+    private val renderLane = GovernedLane("redline-render", { budget(renderThreads) }) { b, _ ->
+        colourPipeline?.threadLimit = if (b.loaded) b.threads else null
     }
-    private val storeLane = GovernedLane("redline-store", { budget(1) })
+
+    /** B23b.1: under load the store lane (JPEG encode, EXIF, MediaStore) runs [WorkerGovernor.STORE_NICE_STEP] nicer. */
+    private val storeLane = GovernedLane("redline-store", { budget(1) }, WorkerGovernor::storeNice)
     private val stagedSlots = Semaphore(STAGED_MAX)
 
     init {
@@ -315,6 +332,7 @@ class ViewfinderController(
     private fun syncLoad() {
         loadProcessing = jobs
         loadCapturing = waitingPresses.size + if (pending != null) 1 else 0
+        governorLatch.update(viewfinderActive, loadProcessing + loadCapturing)
     }
     private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
@@ -332,6 +350,9 @@ class ViewfinderController(
     private var manual: ManualApplied? = null
     private val closeWaiters = mutableListOf<CompletableFuture<Unit>>()
     private val fps = RollingFps()
+
+    /** B23b.1: preview fps under load with burst pauses and the warm-up after them excluded. */
+    private var loadMeter = PreviewLoadMeter(PreviewFps.TARGET)
     private var frameStats = FrameStats(PreviewFps.TARGET)
     private var firstCaptureSeen = false
     private var streamStartMs = 0L
@@ -606,6 +627,7 @@ class ViewfinderController(
         firstCaptureSeen = false
         fps.reset()
         frameStats = FrameStats(setup.aeFpsRange?.second ?: PreviewFps.TARGET)
+        loadMeter.restart(clearCaptures = true)
         characteristics = runCatching { manager.getCameraCharacteristics(setup.cameraId) }.getOrNull()
         rawMinFrameNs = setup.rawSize?.let { size ->
             runCatching {
@@ -901,7 +923,8 @@ class ViewfinderController(
                     null
                 }
                 // B23b: thread budget from the work ahead of this burst (this shot is not counted yet).
-                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads).threads
+                val latched = governorLatch.latched
+                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads, latched).threads
                 run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup, threads)
             }
         }
@@ -986,6 +1009,9 @@ class ViewfinderController(
                 for (i in 1..run.plan.frames) requests += burstRequest(cam, su, run.plan, shot.id, i)
                 requests += jpegFrame
                 s.captureBurst(requests, stillCallback, handler)
+                // B23b.1: the preview pauses for the burst (RAW-only frames): those frames are not preview frames.
+                loadMeter.captureStarted(shot.id)
+                if (RESUBMIT_AFTER_BURST) repeat(afterBurst = true)
             } else {
                 s.capture(jpegFrame, stillCallback, handler)
             }
@@ -1097,6 +1123,7 @@ class ViewfinderController(
     /** B22b: the burst's last request (its JPEG frame) is done: the preview resumes, and that gap is not a dropped frame. */
     private fun endOfBurst(p: PendingShot) {
         if (p.run == null) return
+        loadMeter.captureEnded(p.id)
         previewResumePending = true
         frameStats.breakRun()
     }
@@ -1540,6 +1567,7 @@ class ViewfinderController(
      */
     private fun failShot(p: PendingShot, message: String, dropped: String? = null) {
         if (p.finished) return
+        loadMeter.captureEnded(p.id)
         p.finished = true
         active.remove(p)
         if (pending === p) pending = null
@@ -1654,18 +1682,24 @@ class ViewfinderController(
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             val warm = now - streamStartMs >= WARMUP_MS
             if (warm) frameStats.add(ts) else frameStats.breakRun()
+            if (warm) loadMeter.frame(ts, result.get(CaptureResult.SENSOR_FRAME_DURATION))
             val rate = fps.add(ts) ?: return
             if (now - lastFpsReportMs >= FPS_REPORT_MS) {
                 lastFpsReportMs = now
                 listener.onPreviewFps(rate, warm)
                 listener.onFrameStats(frameStats.intervals, frameStats.dropped, frameStats.worstNs / 1e6)
+                if (warm) listener.onPreviewLoad(loadMeter.reading())
                 listener.onPreviewValues(ResultValues.of(result))
             }
         }
     }
 
-    /** (Re)issues the repeating preview request with the current zoom and stabilization. */
-    private fun repeat() {
+    /**
+     * (Re)issues the repeating preview request with the current zoom and stabilization. B23b.1 [afterBurst]: issued right
+     * after a burst was queued, so the preview resumes behind it with AE, AF and the fixed fps range as set here (and a
+     * 1/30 s frame duration when the AE range is fixed at 30); the under-load meter keeps its state.
+     */
+    private fun repeat(afterBurst: Boolean = false) {
         val s = session ?: return
         val cam = device ?: return
         val su = setup ?: return
@@ -1676,19 +1710,27 @@ class ViewfinderController(
                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 su.aeFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
+                PreviewFps.fixedFrameDurationNs(su.aeFpsRange)?.let { set(CaptureRequest.SENSOR_FRAME_DURATION, it) }
                 if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
                 applyZoom(this, su)
                 applyManual(this, preview = true)
             }
             val targetFps = su.aeFpsRange?.second ?: PreviewFps.TARGET
+            if (afterBurst) {
+                s.setRepeatingRequest(req.build(), captureCallback, handler)
+                return
+            }
             if (frameStats.intervals == 0) frameStats = FrameStats(targetFps)
             frameStats.breakRun()
+            loadMeter = loadMeter.takeIf { it.targetFps == targetFps } ?: PreviewLoadMeter(targetFps)
+            loadMeter.restart()
             s.setRepeatingRequest(req.build(), captureCallback, handler)
             listener.onStreaming(su, stabilization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
         } catch (e: Exception) {
             Log.w(TAG, "setRepeatingRequest failed", e)
-            listener.onError("preview request failed: ${e.javaClass.simpleName}")
+            // B23b.1: the re-issue after a burst is an optimisation; the running repeating request carries on without it.
+            if (!afterBurst) listener.onError("preview request failed: ${e.javaClass.simpleName}")
         }
     }
 
@@ -1797,18 +1839,27 @@ class ViewfinderController(
         }
         private const val RAW_MAX_IMAGES = 4
 
+        /** B23b.1: re-issue the repeating preview request right after each burst is queued (see [repeat]). */
+        private const val RESUBMIT_AFTER_BURST = true
+
         /**
          * B23b: one worker thread; every task first takes the governor's budget: the thread's nice value, then [apply]
          * (the native merge workers' nice, the colour pipeline's thread limit). A rendered thread inherits the nice.
          */
-        private class GovernedLane(name: String, private val budget: () -> WorkerBudget, private val apply: (WorkerBudget) -> Unit = {}) {
+        private class GovernedLane(
+            name: String,
+            private val budget: () -> WorkerBudget,
+            private val niceOf: (WorkerBudget) -> Int = { it.nice },
+            private val apply: (WorkerBudget, Int) -> Unit = { _, _ -> }
+        ) {
             private val exec = Executors.newSingleThreadExecutor(niceThreads(name))
 
             fun execute(task: () -> Unit) {
                 exec.execute {
                     val b = budget()
-                    runCatching { Process.setThreadPriority(b.nice) }
-                    runCatching { apply(b) }
+                    val nice = niceOf(b)
+                    runCatching { Process.setThreadPriority(nice) }
+                    runCatching { apply(b, nice) }
                     task()
                 }
             }

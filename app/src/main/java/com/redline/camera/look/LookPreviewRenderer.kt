@@ -13,6 +13,7 @@ import android.opengl.GLES30
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Process
 import android.os.SystemClock
 import android.util.Half
 import android.util.Log
@@ -56,10 +57,23 @@ class LookPreviewRenderer(private val listener: Listener) {
         val lutSize: Int? = null,
         val lutFormat: String? = null,
         val timerMethod: String? = null,
-        val selfCheckMaxErrorSteps: Int? = null
+        val selfCheckMaxErrorSteps: Int? = null,
+        /** B23b.1: every LUT format tried at start-up with its self-check result. */
+        val lutFormatsTried: String? = null
     )
 
-    data class Stats(val timing: TimingSnapshot, val timerMethod: String?, val displayFrames: Int, val displayDropped: Int)
+    data class Stats(
+        val timing: TimingSnapshot,
+        val timerMethod: String?,
+        val displayFrames: Int,
+        val displayDropped: Int,
+        /** B23b.1: the fence round trip (no draw) measured alongside each sample, median; null for GPU timer queries. */
+        val timerOverheadP50Ms: Double? = null,
+        /** B23b.1: the size the LUT pass renders at (the view's size on screen, at most the camera buffer). */
+        val renderSize: Dim? = null,
+        /** B23b.1: the GL thread's nice value, read back. */
+        val glThreadNice: Int? = null
+    )
 
     private class Program(val id: Int) {
         val uTexMatrix = GLES30.glGetUniformLocation(id, "uTexMatrix")
@@ -75,6 +89,16 @@ class LookPreviewRenderer(private val listener: Listener) {
     private val thread = HandlerThread("redline-gl").apply { start() }
     private val handler = Handler(thread.looper)
 
+    // B23b.1: the GL thread draws every viewfinder frame; give it display priority (as a UI render thread) when allowed.
+    @Volatile private var glNice: Int? = null
+
+    init {
+        handler.post {
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) }
+            glNice = runCatching { Process.getThreadPriority(Process.myTid()) }.getOrNull()
+        }
+    }
+
     // GL-thread state.
     private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var context: EGLContext = EGL14.EGL_NO_CONTEXT
@@ -88,6 +112,7 @@ class LookPreviewRenderer(private val listener: Listener) {
     private var oesTex = 0
     private var cameraTexture: SurfaceTexture? = null
     private var bufferSize = Dim(0, 0)
+    private var renderSize = Dim(0, 0)
     private var ready = false
     private var failed = false
     private var released = false
@@ -110,6 +135,7 @@ class LookPreviewRenderer(private val listener: Listener) {
     private var sessionStartFrame = 0L
     private var frameIndex = 0L
     private val timing = LutTimingStats()
+    private val overhead = LutTimingStats(window = 200)
     private var displayStats = FrameStats(DEFAULT_FPS)
     private var attachedAtMs = 0L
     private var lastStatsMs = 0L
@@ -134,7 +160,13 @@ class LookPreviewRenderer(private val listener: Listener) {
      * SurfaceTexture the camera should write to, or an error. Call only while no other producer (the camera) is
      * connected to [displayTexture].
      */
-    fun attach(displayTexture: SurfaceTexture, size: Dim, expectedFps: Int, done: (SurfaceTexture?, String?) -> Unit) {
+    fun attach(
+        displayTexture: SurfaceTexture,
+        size: Dim,
+        expectedFps: Int,
+        outputSize: Dim = size,
+        done: (SurfaceTexture?, String?) -> Unit
+    ) {
         handler.post {
             if (!ready || failed || released) {
                 done(null, if (failed) "renderer failed earlier" else "renderer not ready")
@@ -142,7 +174,10 @@ class LookPreviewRenderer(private val listener: Listener) {
             }
             try {
                 detachOnThread()
-                displayTexture.setDefaultBufferSize(size.width, size.height)
+                // B23b.1: the LUT pass renders at [outputSize] (the view's size on screen, same aspect as the camera
+                // buffer); the TextureView scales the buffer to its bounds, so its crop / rotation transform is unchanged.
+                val out = if (outputSize.width in 1..size.width && outputSize.height in 1..size.height) outputSize else size
+                displayTexture.setDefaultBufferSize(out.width, out.height)
                 val surface: EGLSurface? = EGL14.eglCreateWindowSurface(display, config, displayTexture, intArrayOf(EGL14.EGL_NONE), 0)
                 check(surface != null && surface != EGL14.EGL_NO_SURFACE) { "eglCreateWindowSurface failed: ${eglError()}" }
                 window = surface
@@ -153,7 +188,9 @@ class LookPreviewRenderer(private val listener: Listener) {
                 cam.setOnFrameAvailableListener({ drawFrame() }, handler)
                 cameraTexture = cam
                 bufferSize = size
+                renderSize = out
                 timing.reset()
+                overhead.reset()
                 sessionStartFrame = frameIndex
                 gpuResults = 0
                 gpuDisjoint = 0
@@ -222,7 +259,7 @@ class LookPreviewRenderer(private val listener: Listener) {
         programOes = buildProgram(LookShaders.FRAGMENT_OES) ?: return base.copy(reason = "look shader (OES) did not compile/link")
         program2d = buildProgram(LookShaders.FRAGMENT_2D) ?: return base.copy(reason = "look shader (2D) did not compile/link")
         val (format, check, tried) = uploadAndCheckLut(loaded)
-        val withLut = base.copy(lutSize = loaded.size, lutFormat = format, selfCheckMaxErrorSteps = check?.maxErr)
+        val withLut = base.copy(lutSize = loaded.size, lutFormat = format, selfCheckMaxErrorSteps = check?.maxErr, lutFormatsTried = tried)
         if (format == null || check == null) {
             return withLut.copy(reason = "GPU self-check failed for every 3D LUT format, LUT not applied: $tried")
         }
@@ -308,7 +345,8 @@ class LookPreviewRenderer(private val listener: Listener) {
 
     /**
      * Uploads the LUT as a 3D texture in the first format that both uploads cleanly and passes the GPU self-check:
-     * RGBA16F (half floats; linear-filterable in core ES 3.0), RGB16F (from floats), then RGBA8.
+     * B23b.1: RGB10_A2 and RGBA8 (4 bytes per node) when within [LutMath.COMPACT_TOLERANCE], else RGBA16F (half floats;
+     * linear-filterable in core ES 3.0), then RGB16F (from floats).
      */
     @SuppressLint("HalfFloat") // the ShortBuffer carries raw half-float bits for GL_HALF_FLOAT, by design
     private fun uploadAndCheckLut(l: CubeLut): LutChoice {
@@ -336,6 +374,12 @@ class LookPreviewRenderer(private val listener: Listener) {
                     data.position(0)
                     GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_RGB16F, n, n, n, 0, GLES30.GL_RGB, GLES30.GL_FLOAT, data)
                 }
+                "RGB10A2" -> {
+                    val words = ByteBuffer.allocateDirect(count * 4).order(ByteOrder.nativeOrder()).asIntBuffer().put(LutMath.toRgb10a2(l))
+                    words.position(0)
+                    val t = GLES30.GL_TEXTURE_3D
+                    GLES30.glTexImage3D(t, 0, GLES30.GL_RGB10_A2, n, n, n, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_INT_2_10_10_10_REV, words)
+                }
                 else -> {
                     val bytes = ByteBuffer.allocateDirect(count * 4).put(LutMath.toRgba8(l))
                     bytes.position(0)
@@ -354,7 +398,8 @@ class LookPreviewRenderer(private val listener: Listener) {
                 continue
             }
             tried += "$format: ${check.detail}"
-            if (check.maxErr <= LutMath.SELF_CHECK_TOLERANCE) return LutChoice(format, check, tried.joinToString("; "))
+            val tolerance = if (format in COMPACT_FORMATS) LutMath.COMPACT_TOLERANCE else LutMath.SELF_CHECK_TOLERANCE
+            if (check.maxErr <= tolerance) return LutChoice(format, check, tried.joinToString("; "))
         }
         Log.w(TAG, "LUT self-check failed: $tried")
         return LutChoice(null, null, tried.joinToString("; "))
@@ -469,12 +514,14 @@ class LookPreviewRenderer(private val listener: Listener) {
             cam.getTransformMatrix(texMatrix)
             val now = SystemClock.elapsedRealtime()
             if (now - attachedAtMs >= WARMUP_MS) displayStats.add(cam.timestamp) else displayStats.breakRun()
-            GLES30.glViewport(0, 0, bufferSize.width, bufferSize.height)
+            GLES30.glViewport(0, 0, renderSize.width, renderSize.height)
             timedDraw(p, l)
             if (!EGL14.eglSwapBuffers(display, window)) throw IllegalStateException("eglSwapBuffers failed: ${eglError()}")
             if (now - lastStatsMs >= STATS_PERIOD_MS) {
                 lastStatsMs = now
-                listener.onStats(Stats(timing.snapshot(), timerMethod, displayStats.intervals, displayStats.dropped))
+                val oh = if (gpuTimer) null else overhead.snapshot().p50Ms
+                val st = Stats(timing.snapshot(), timerMethod, displayStats.intervals, displayStats.dropped, oh, renderSize, glNice)
+                listener.onStats(st)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "look preview frame failed", t)
@@ -510,14 +557,36 @@ class LookPreviewRenderer(private val listener: Listener) {
             }
             queryPending[slot] = true
         } else if (frameIndex % CPU_SAMPLE_EVERY == 0L) {
-            GLES30.glFinish()
-            val t0 = System.nanoTime()
-            draw(p, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex, l, strength)
-            GLES30.glFinish()
-            timing.add((System.nanoTime() - t0) / 1e6)
+            fenceTimedDraw(p, l)
         } else {
             draw(p, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex, l, strength)
         }
+    }
+
+    /**
+     * B23b.1: one sampled frame timed with GL fence syncs instead of glFinish: wait for the GPU to be idle, time an
+     * empty fence round trip (the overhead, reported apart), then time the draw to its fence. Both are CPU-side waits
+     * on the GPU, so the draw time includes one round trip; the overhead shows how much.
+     */
+    private fun fenceTimedDraw(p: Program, l: CubeLut) {
+        waitFence()
+        val t0 = System.nanoTime()
+        val emptyOk = waitFence()
+        val t1 = System.nanoTime()
+        draw(p, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex, l, strength)
+        val drawOk = waitFence()
+        val t2 = System.nanoTime()
+        if (emptyOk) overhead.add((t1 - t0) / 1e6)
+        if (drawOk) timing.add((t2 - t1) / 1e6)
+    }
+
+    /** Inserts a fence, flushes, and waits for it; false when it did not signal within [FENCE_TIMEOUT_NS]. */
+    private fun waitFence(): Boolean {
+        val sync = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+        if (sync == 0L) return false
+        val r = GLES30.glClientWaitSync(sync, GLES30.GL_SYNC_FLUSH_COMMANDS_BIT, FENCE_TIMEOUT_NS)
+        GLES30.glDeleteSync(sync)
+        return r == GLES30.GL_ALREADY_SIGNALED || r == GLES30.GL_CONDITION_SATISFIED
     }
 
     private fun collectQueries() {
@@ -546,6 +615,7 @@ class LookPreviewRenderer(private val listener: Listener) {
                 "$gpuResults results, $gpuDisjoint disjoint)"
             queryPending.fill(false)
             timing.reset()
+            overhead.reset()
         }
     }
 
@@ -613,11 +683,15 @@ class LookPreviewRenderer(private val listener: Listener) {
     companion object {
         private const val TAG = "RedlineLook"
         const val TIMER_GPU = "GL_EXT_disjoint_timer_query"
-        const val TIMER_CPU = "cpu_glfinish_estimate (every 15th frame)"
+        const val TIMER_CPU = "cpu_gl_fence_sync (glFenceSync + glClientWaitSync, every 15th frame)"
+        private const val FENCE_TIMEOUT_NS = 100_000_000L
         private const val CPU_SAMPLE_EVERY = 15L
         private const val QUERY_RING = 4
         private const val GPU_GRACE_FRAMES = 90L
-        private val LUT_FORMATS = listOf("RGBA16F", "RGB16F", "RGBA8")
+
+        // B23b.1: the compact 4-byte formats first (accepted only within [LutMath.COMPACT_TOLERANCE]), then half floats.
+        private val LUT_FORMATS = listOf("RGB10A2", "RGBA8", "RGBA16F", "RGB16F")
+        private val COMPACT_FORMATS = setOf("RGB10A2", "RGBA8")
         private const val HALF_ONE: Short = 0x3C00
         private const val DEFAULT_FPS = 30
         private const val WARMUP_MS = 2_000L

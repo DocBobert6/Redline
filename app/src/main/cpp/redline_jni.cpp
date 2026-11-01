@@ -328,7 +328,10 @@ extern "C" JNIEXPORT jintArray JNICALL Java_com_redline_camera_nativebridge_Redl
     std::vector<int> released;
     if (h == nullptr) err = "no merger";
     const std::uint16_t* data = err.empty() ? frameData(env, frame, h->width, h->height, rowStrideBytes, err) : nullptr;
-    if (err.empty()) err = h->merger.add({data, rowStrideBytes / 2}, released);
+    if (err.empty()) {
+        const redline::FrameWorkScope frameWork;  // B23b.1: the merge tail steps aside meanwhile
+        err = h->merger.add({data, rowStrideBytes / 2}, released);
+    }
     if (!err.empty()) {
         throwIllegalArgument(env, err);
         return nullptr;
@@ -371,6 +374,20 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redline_camera_nativebridge_RedlineNa
 
 extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBurstWorkerNice(JNIEnv*, jclass, jint nice) {
     redline::burstSetWorkerNice(nice);
+}
+
+// B23b.1: the calling lane's nice for the pool jobs it starts, and whether it is the merge tail (sliced, yields to adds).
+extern "C" JNIEXPORT void JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBurstLane(JNIEnv*, jclass, jint nice,
+                                                                                                    jboolean tail) {
+    redline::burstSetLane(nice, tail == JNI_TRUE);
+}
+
+// B23b.1: [pool worker nice read back, last job nice, tail yields, tail yield ms, tail slices, render thread nice read back].
+extern "C" JNIEXPORT jintArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeWorkerStats(JNIEnv* env, jclass) {
+    const redline::WorkerStats w = redline::burstWorkerStats();
+    const std::vector<int> v = {w.workerNiceSeen, w.jobNiceLast, w.tailYields,
+                                w.tailYieldMs,    w.tailSlices,  redline::renderThreadNiceSeen()};
+    return intArray(env, v);
 }
 
 // [alignedFraction, noiseRatio, ms]; throws IllegalArgumentException on an internal error.
@@ -488,7 +505,10 @@ extern "C" JNIEXPORT jintArray JNICALL Java_com_redline_camera_nativebridge_Redl
     std::vector<int> released;
     if (h == nullptr) err = "no merger";
     const std::uint16_t* data = err.empty() ? frameData(env, frame, h->width, h->height, rowStrideBytes, err) : nullptr;
-    if (err.empty()) err = h->merger.add({data, rowStrideBytes / 2}, released);
+    if (err.empty()) {
+        const redline::FrameWorkScope frameWork;  // B23b.1: the merge tail steps aside meanwhile
+        err = h->merger.add({data, rowStrideBytes / 2}, released);
+    }
     if (!err.empty()) {
         throwIllegalArgument(env, err);
         return nullptr;
