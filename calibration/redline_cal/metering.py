@@ -36,7 +36,7 @@ import numpy as np
 
 from .color import srgb_decode, srgb_encode, srgb_encoded_to_lab, XYZ_TO_SRGB
 from .lut import apply_lut, read_cube
-from .raw_pipeline import EXPOSURE_MAX_EV, EXPOSURE_MIN_EV, KNEE_EV, LUMA, ToneCurve, invert_fitted
+from .raw_pipeline import EXPOSURE_MAX_EV, EXPOSURE_MIN_EV, KNEE_EV, LUMA, Headroom, ToneCurve, invert_fitted
 
 QUANTILES = (1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 98.0, 99.0)
 CLIP_LEVEL = 0.98          # a RAW value at or above this fraction of the clip counts as clipped
@@ -66,9 +66,10 @@ def quantiles(y: np.ndarray) -> dict:
 
 
 def features(stats: dict) -> dict:
-    """Scale-free scene features: highlight spread log2(p98 / p50), shadow spread log2(p50 / p5)."""
+    """Scale-free scene features: highlight spread log2(p98 / p50), shadow spread log2(p50 / p5), and (B23c.1)
+    the shadow split log2(p50 / p25)."""
     q = stats["q"]
-    return {"hi": q["p98"] - q["p50"], "lo": q["p50"] - q["p5"]}
+    return {"hi": q["p98"] - q["p50"], "lo": q["p50"] - q["p5"], "split": q["p50"] - q["p25"]}
 
 
 MODELS = {
@@ -119,6 +120,60 @@ def gain_ev(target: float, median_y: float) -> float:
     if not (median_y > 1e-6 and math.isfinite(median_y)):
         return 0.0
     return float(min(max(target - math.log2(median_y), EXPOSURE_MIN_EV), EXPOSURE_MAX_EV))
+
+
+# ----------------------------------------------------------------------------------------------- B23c.1 headroom lift
+
+HEADROOM_FLOOR_GRID = tuple(round(-2.2 + 0.05 * i, 2) for i in range(25))   # p98 floor, EV on the curve input axis
+HEADROOM_SPLIT_GRID = tuple(round(1.0 + 0.1 * i, 1) for i in range(17))     # log2(p50 / p25) gate
+HEADROOM_CLIPPED_MAX = 0.02  # a frame clipping more than 2 % already has its p98 at the clip: no lift
+
+
+def headroom_lift(h: Headroom, base_target: float, feats: dict, clipped: float) -> float:
+    """``Headroom.lift`` on the dataset's features (RAW quantiles relative to the clip)."""
+    med = 1.0
+    return h.lift(base_target, med, 2.0 ** feats["hi"], 2.0 ** -feats["split"], clipped)
+
+
+def fit_headroom(rows: list[dict], predict) -> tuple[Headroom, dict]:
+    """Grid-select the p98 floor and split gate by mean |error| on ``rows`` (ties: the stricter gate). The lift cap is
+    the largest under-placement of the fit on ``rows`` (rounded down to 0.05 EV). ``predict(row)`` is the fit's
+    target. Also returns a nested leave-one-out error (floor and gate re-selected without each row)."""
+    under = max(0.0, max(r["target_ev"] - predict(r) for r in rows))
+    cap = math.floor(under / 0.05) * 0.05
+
+    def err(r, f, g):
+        h = Headroom(f, g, cap, HEADROOM_CLIPPED_MAX)
+        t = predict(r)
+        return abs(t + headroom_lift(h, t, r["features"], r["stats"]["clipped_fraction"]) - r["target_ev"])
+
+    table = {(f, g): np.array([err(r, f, g) for r in rows]) for f in HEADROOM_FLOOR_GRID for g in HEADROOM_SPLIT_GRID}
+
+    def pick(mask):
+        return min(table, key=lambda k: (round(float(np.mean(table[k][mask])), 4), -k[1], k[0]))
+
+    best = pick(np.ones(len(rows), bool))
+    loo = []
+    for i in range(len(rows)):
+        m = np.ones(len(rows), bool)
+        m[i] = False
+        loo.append(table[pick(m)][i])
+    base = np.array([abs(predict(r) - r["target_ev"]) for r in rows])
+    info = {"train_mae_ev_before": round(float(np.mean(base)), 4),
+            "train_mae_ev_after": round(float(np.mean(table[best])), 4),
+            "nested_loo_mae_ev_after": round(float(np.mean(loo)), 4),
+            "grid": {"p98_floor_ev": [HEADROOM_FLOOR_GRID[0], HEADROOM_FLOOR_GRID[-1], 0.05],
+                     "split_min_ev": [HEADROOM_SPLIT_GRID[0], HEADROOM_SPLIT_GRID[-1], 0.1]}}
+    return Headroom(best[0], best[1], cap, HEADROOM_CLIPPED_MAX), info
+
+
+def error_summary(e: np.ndarray) -> dict:
+    e = np.asarray(e, float)
+    if e.size == 0:
+        return {"n": 0}
+    return {"n": int(e.size), "mae_ev": round(float(np.mean(np.abs(e))), 3),
+            "median_abs_ev": round(float(np.median(np.abs(e))), 3), "max_abs_ev": round(float(np.max(np.abs(e))), 3),
+            "bias_ev": round(float(np.mean(e)), 3)}
 
 
 # ----------------------------------------------------------------------------------------------- per-pair extraction
@@ -358,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(a.asset, "w", newline="\n") as fh:
             json.dump(asset_json(report), fh, indent=1)
             fh.write("\n")
-    summary = {k: report[k] for k in ("pairs", "selection", "metering_holdout")}
+    summary = {k: report[k] for k in ("pairs", "selection", "metering_holdout", "headroom")}
     summary["tone_holdout_matched"] = {k: v for k, v in report["tone_holdout"]["matched"].items() if k != "per_image"}
     print(json.dumps(summary, indent=1))
     return 0
@@ -377,6 +432,14 @@ def asset_json(report: dict) -> dict:
         "coef": m["model"]["coef"],
         "hi_range": report["hi_range_train"],
         "fallback_target_ev": report["constant_target_ev"],
+        "headroom": {
+            "description": "B23c.1: when log2(median / p25) >= split_min_ev and the clipped fraction <= clipped_max, "
+                           "raise the target so log2(p98 / median) + target reaches p98_floor_ev (EV on the tone "
+                           "curve's input axis), by at most lift_max_ev. Fitted on the train split "
+                           "(redline_cal.metering.fit_headroom).",
+            **report["headroom"]["rule"],
+            "holdout_mae_ev": report["headroom"]["holdout_after"]["mae_ev"],
+        },
         "fit": {"pairs_train": report["pairs"]["train"], "pairs_holdout": report["pairs"]["holdout"],
                 "loo_mae_ev_train": report["selection"]["loo_mae_ev_train"][m["model"]["name"]],
                 "holdout_mae_ev": m["mae_ev"], "holdout_median_abs_ev": m["median_abs_ev"],
@@ -437,6 +500,38 @@ def evaluate(rows: list[dict], tone: np.ndarray, lut: np.ndarray) -> dict:
     tone_train = tone_check(train, tone, lut, align=True)
     his = [r["features"]["hi"] for r in train]
     const = fit_model("constant", train)
+
+    # B23c.1 headroom lift, fitted on the train split only, then scored once on the hold-out
+    def pred(r):
+        return model.predict(clamped(r["features"]))
+
+    head, head_info = fit_headroom(train, pred)
+
+    def lifted(r):
+        return pred(r) + headroom_lift(head, pred(r), r["features"], r["stats"]["clipped_fraction"])
+
+    def canon_e98(r):  # where the camera JPEG puts the frame's p98 on the tone curve's input axis
+        return r["target_ev"] + r["features"]["hi"]
+
+    no_clip = [canon_e98(r) for r in train if r["stats"]["clipped_fraction"] <= HEADROOM_CLIPPED_MAX]
+    gate = [r for r in hold if r["features"]["split"] >= head.split_min_ev]
+    lifted_rows = [r for r in hold if lifted(r) > pred(r)]
+    headroom = {
+        "rule": {"p98_floor_ev": head.p98_floor_ev, "split_min_ev": head.split_min_ev,
+                 "lift_max_ev": round(head.lift_max_ev, 3), "clipped_max": head.clipped_max},
+        "fit": head_info,
+        "canon_p98_input_ev_train": {
+            "percentiles_5_10_25_50_75": [round(float(v), 3) for v in np.percentile(no_clip, [5, 10, 25, 50, 75])],
+            "n_unclipped": len(no_clip)},
+        "holdout_before": error_summary(np.array([pred(r) - r["target_ev"] for r in hold])),
+        "holdout_after": error_summary(np.array([lifted(r) - r["target_ev"] for r in hold])),
+        "holdout_split_gate_before": error_summary(np.array([pred(r) - r["target_ev"] for r in gate])),
+        "holdout_split_gate_after": error_summary(np.array([lifted(r) - r["target_ev"] for r in gate])),
+        "holdout_lifted": {r["id"]: {"lift_ev": round(lifted(r) - pred(r), 3),
+                                     "error_before": round(pred(r) - r["target_ev"], 3),
+                                     "error_after": round(lifted(r) - r["target_ev"], 3)} for r in lifted_rows},
+        "train_lifted": sum(lifted(r) > pred(r) for r in train),
+    }
     return {
         "hi_range_train": [round(float(min(his)), 4), round(float(max(his)), 4)],
         "constant_target_ev": round(float(const.coef[0]), 6),
@@ -444,6 +539,7 @@ def evaluate(rows: list[dict], tone: np.ndarray, lut: np.ndarray) -> dict:
                   "ae_holdout": sum(r["ae"] for r in hold)},
         "selection": {"loo_mae_ev_train": selection, "chosen": best},
         "metering_holdout": metering,
+        "headroom": headroom,
         "tone_holdout": tone_hold,
         "tone_train_matched": tone_train,
         "train_targets": {r["id"]: round(r["target_ev"], 3) for r in train},

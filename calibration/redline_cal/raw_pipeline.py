@@ -25,7 +25,9 @@ Per pixel, in order:
                slope at the knee. ``g`` is the exposure gain. B23c: the mid-tone target is fitted from the R5 II
                dataset (``redline_cal.metering``, asset ``colour/metering.json``): target EV = c0 + c1 * clamp(
                log2(p98 / median)), and g = target - log2(median), so high-contrast scenes are placed lower, as the
-               R5 II's JPEGs place them. Before B23c: the camera JPEG's median luma, inverted through the fitted tone
+               R5 II's JPEGs place them. B23c.1: a headroom lift raises the target when the median sits in a dominant bright
+               region over a large dark part (log2(median / p25) >= split_min_ev) and p98 lands below the camera
+               JPEGs' p98 floor (``Headroom``). Before B23c: the camera JPEG's median luma, inverted through the fitted tone
                curve, over the RAW frame's median luminance (``solve_exposure``, still used by the self-check).
 8. look        33^3 residual LUT (trilinear) -> sRGB-encoded output.
 """
@@ -221,12 +223,54 @@ P98 = 0.98  # upper quantile of the stats pass: the order statistic at floor(0.9
 
 
 @dataclass
+class Headroom:
+    """B23c.1 headroom lift, fitted on the same R5 II train split (``redline_cal.metering.fit_headroom``).
+
+    The R5 II leaves little unused highlight headroom when the frame's median sits in a dominant bright region with a
+    large dark part below it (overcast sky over asphalt, a sunlit wall over shade): the fitted line only sees
+    log2(p98 / median), which is small there, and places that bright region like a flat mid-tone. When the shadow
+    split log2(median / p25) is at least ``split_min_ev`` and the frame is not clipping, the target is raised so the
+    frame's p98 reaches at least ``p98_floor_ev`` on the tone curve's input axis (where the camera JPEGs put p98),
+    by at most ``lift_max_ev``. A frame whose p98 already sits at or above the floor is unchanged."""
+
+    p98_floor_ev: float
+    split_min_ev: float
+    lift_max_ev: float
+    clipped_max: float
+
+    def lift(self, target_ev: float, median_y: float, p98_y: float | None, p25_y: float | None,
+             clipped_fraction: float | None) -> float:
+        if p98_y is None or p25_y is None or not (math.isfinite(p98_y) and math.isfinite(p25_y)) or median_y <= 0:
+            return 0.0
+        if clipped_fraction is not None and clipped_fraction > self.clipped_max:
+            return 0.0
+        if scene_split(median_y, p25_y) < self.split_min_ev:
+            return 0.0
+        e98 = target_ev + scene_hi(median_y, p98_y)
+        return float(min(max(self.p98_floor_ev - e98, 0.0), self.lift_max_ev))
+
+
+def scene_hi(median_y: float, p98_y: float) -> float:
+    """log2(p98 / median), the metering fit's feature (not clamped)."""
+    return math.log2(max(p98_y, median_y) / median_y)
+
+
+SPLIT_FLOOR = 2.0**-20
+
+
+def scene_split(median_y: float, p25_y: float) -> float:
+    """log2(median / p25): how far the darkest quarter of the frame sits below the median (0 if p25 >= median)."""
+    return math.log2(median_y / min(max(p25_y, SPLIT_FLOOR), median_y))
+
+
+@dataclass
 class Metering:
     """B23c metering model fitted from R5 II RAW + camera JPEG pairs (see ``redline_cal.metering``)."""
 
     coef: tuple[float, float]           # target EV = coef[0] + coef[1] * hi
     hi_range: tuple[float, float]       # hi = log2(p98 / median), clamped to the training range
     fallback_target_ev: float           # constant model, used when the frame has no usable p98
+    headroom: Headroom | None = None    # B23c.1
 
     def target(self, median_y: float, p98_y: float | None) -> tuple[float, str]:
         if p98_y is None or not (math.isfinite(p98_y) and p98_y > 0 and median_y > 0):
@@ -240,18 +284,47 @@ def load_metering(path: str) -> Metering:
         m = json.load(f)
     if m.get("model") != "r5ii_metering v1":
         raise ValueError("unexpected metering model")
-    return Metering(tuple(m["coef"]), tuple(m["hi_range"]), float(m["fallback_target_ev"]))
+    h = m.get("headroom")
+    head = Headroom(float(h["p98_floor_ev"]), float(h["split_min_ev"]), float(h["lift_max_ev"]),
+                    float(h["clipped_max"])) if h else None
+    return Metering(tuple(m["coef"]), tuple(m["hi_range"]), float(m["fallback_target_ev"]), head)
 
 
-def solve_exposure_metered(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering) -> tuple[float, str]:
-    """B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee)."""
+@dataclass
+class MeteredExposure:
+    ev: float
+    method: str
+    headroom_lift_ev: float = 0.0  # B23c.1: what the headroom lift added to the gain (after the knee and gain clamps)
+
+
+def metered_exposure(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering,
+                     p25_y: float | None = None, clipped_fraction: float | None = None) -> MeteredExposure:
+    """B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee);
+    B23c.1: plus the headroom lift when the metering carries one and the frame qualifies."""
     if not (median_y > 1e-6 and math.isfinite(median_y)):
-        return 0.0, "no_signal"
+        return MeteredExposure(0.0, "no_signal")
     target, method = metering.target(median_y, p98_y)
+    lift = 0.0
+    if metering.headroom is not None and method == METERING_METHOD:
+        lift = metering.headroom.lift(target, median_y, p98_y, p25_y, clipped_fraction)
     y_knee = float(np.interp(KNEE_EV, np.linspace(EV_MIN, EV_MAX, len(tone)), tone))
-    target = min(target, invert_fitted(tone, y_knee - 1e-3))
-    ev = target - math.log2(median_y)
-    return float(min(max(ev, EXPOSURE_MIN_EV), EXPOSURE_MAX_EV)), method
+    knee_t = invert_fitted(tone, y_knee - 1e-3)
+
+    def gain(t: float) -> float:
+        return float(min(max(min(t, knee_t) - math.log2(median_y), EXPOSURE_MIN_EV), EXPOSURE_MAX_EV))
+
+    ev = gain(target + lift)
+    return MeteredExposure(ev, method, ev - gain(target) if lift > 0 else 0.0)
+
+
+def solve_exposure_metered(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering,
+                           p25_y: float | None = None, clipped_fraction: float | None = None) -> tuple[float, str]:
+    """``metered_exposure`` as (gain, method)."""
+    e = metered_exposure(tone, median_y, p98_y, metering, p25_y, clipped_fraction)
+    return e.ev, e.method
+
+
+P25 = 0.25  # B23c.1: lower quantile of the stats pass (same order-statistic rule)
 
 
 def upper_quantile(values: np.ndarray, q: float = P98) -> float:
@@ -425,7 +498,8 @@ def raw_stats(frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) ->
     clipped = float(np.mean(np.any(c >= 1.0, axis=-1)))
     lin = np.clip(c, 0.0, 1.0) @ np.asarray(matrix, float).T
     yv = (lin @ LUMA).reshape(-1)
-    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "clipped_fraction": clipped,
+    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "p25_y": upper_quantile(yv, P25),
+            "clipped_fraction": clipped,
             "cells": int(yv.size)}
 
 
@@ -444,7 +518,8 @@ def linear_stats(rgb_camera: np.ndarray, neutral, matrix, step: int = 2 * STATS_
     clipped = float(np.mean(np.any(c >= 1.0, axis=-1)))
     lin = np.clip(c, 0.0, 1.0) @ np.asarray(matrix, float).T
     yv = (lin @ LUMA).reshape(-1)
-    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "clipped_fraction": clipped,
+    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "p25_y": upper_quantile(yv, P25),
+            "clipped_fraction": clipped,
             "cells": int(yv.size)}
 
 
@@ -519,7 +594,8 @@ def plan_shot(frame: RawFrame, cal: dp.ColorCalibration, as_shot_neutral, tone: 
     if stats is None:
         stats = raw_stats(frame, crop, solve.neutral, solve.matrix)
     if metering is not None:
-        ev, method = solve_exposure_metered(tone, stats["median_y"], stats.get("p98_y"), metering)
+        ev, method = solve_exposure_metered(tone, stats["median_y"], stats.get("p98_y"), metering,
+                                            stats.get("p25_y"), stats.get("clipped_fraction"))
     else:
         ev, method = solve_exposure(tone, stats["median_y"], target_encoded)
     curve = ToneCurve(tone, 2.0**ev)
@@ -571,6 +647,8 @@ def native_stats(tool: str, frame: RawFrame, crop, neutral, matrix, step: int = 
     st = {"median_y": float(out[0]), "clipped_fraction": float(out[1]), "cells": int(out[2])}
     if len(out) > 3:
         st["p98_y"] = float(out[3])
+    if len(out) > 4:
+        st["p25_y"] = float(out[4])
     return st
 
 

@@ -119,6 +119,17 @@ def colour_math_cases() -> dict:
                      (0.05, 0.05), (1e-5, 0.9)):
         ev, method = rp.solve_exposure_metered(tone, med, p98, met)
         mexp.append({"median_y": med, "p98_y": p98, "ev": ev, "method": method})
+    # B23c.1: the headroom lift. Overcast sky over asphalt (median in the sky, darkest quarter ~2.9 EV down), the same
+    # with clipping, with p25 = 0, a uniform wall (no split), a contrasty scene with a split (p98 already high), the
+    # lift cap, and a bright frame where the gain clamp eats part of the lift.
+    for med, hi, split, clipped in ((0.2, 0.37, 2.86, 0.0), (0.2, 0.37, 2.86, 0.05), (0.2, 0.37, None, 0.0),
+                                    (0.2, 0.37, 0.16, 0.0), (0.05, 3.39, 0.76, 0.0), (0.05, 2.2, 2.5, 0.001),
+                                    (0.1, 0.0, 3.5, 0.0), (0.9, 0.37, 2.86, 0.0), (0.2, 1.0, 1.7, 0.0), (0.2, 1.0, 1.5, 0.0)):
+        p98 = med * 2.0**hi
+        p25 = 0.0 if split is None else med * 2.0**-split
+        e = rp.metered_exposure(tone, med, p98, met, p25, clipped)
+        mexp.append({"median_y": med, "p98_y": p98, "p25_y": p25, "clipped_fraction": clipped, "ev": e.ev,
+                     "method": e.method, "headroom_lift_ev": e.headroom_lift_ev})
     out["metering"] = mexp
     rng = np.random.default_rng(7)
     jm = []

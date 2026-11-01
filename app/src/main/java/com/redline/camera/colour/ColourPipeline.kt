@@ -129,7 +129,8 @@ class ColourPipeline(context: Context) {
      * is null when the pipeline could not render; [Outcome.shot] then says why and the caller saves the camera JPEG.
      * B22: [raw] is a pool copy of the frame, or the merged burst; [levelScale] is the factor its samples were scaled
      * by (16 for the merge's extra precision), applied to the result's black and white levels. The exposure is solved
-     * from the frame's own median and p98 with the R5 II metering fit (B23c; it was the camera JPEG's median before), so
+     * from the frame's own median and p98 with the R5 II metering fit (B23c; it was the camera JPEG's median before) plus
+     * the B23c.1 headroom lift (p25 and the clipped fraction), so
      * an under-exposed burst is brought back up here. The camera JPEG's median is still read, for the report only.
      */
     fun render(
@@ -165,7 +166,7 @@ class ColourPipeline(context: Context) {
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val met = metering ?: return fail("metering not loaded")
-            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met)
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction)
             val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
@@ -193,6 +194,10 @@ class ColourPipeline(context: Context) {
                     jpegMedian = median,
                     exposureEvCameraJpeg = jpegEv,
                     clippedFraction = st.clippedFraction,
+                    headroomLiftEv = tn.exposure.headroomLiftEv,
+                    p98Y = st.p98Y.takeIf { it.isFinite() },
+                    sceneHiEv = sceneHi(st),
+                    sceneSplitEv = sceneSplit(st),
                     outSize = g.out,
                     timingsMs = timings
                 )
@@ -240,7 +245,7 @@ class ColourPipeline(context: Context) {
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val met = metering ?: return fail("metering not loaded")
-            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met)
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction)
             val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
@@ -267,6 +272,10 @@ class ColourPipeline(context: Context) {
                     jpegMedian = median,
                     exposureEvCameraJpeg = jpegEv,
                     clippedFraction = st.clippedFraction,
+                    headroomLiftEv = tn.exposure.headroomLiftEv,
+                    p98Y = st.p98Y.takeIf { it.isFinite() },
+                    sceneHiEv = sceneHi(st),
+                    sceneSplitEv = sceneSplit(st),
                     outSize = Dim(outWidth, outHeight),
                     timingsMs = timings
                 )
@@ -310,6 +319,12 @@ class ColourPipeline(context: Context) {
     val isReady: Boolean get() = ready
 
     /** The camera JPEG's median luma (encoded) over the same 3:2 framing, from an 1/8-scale decode. */
+    private fun sceneHi(st: RedlineNative.Stats): Double? =
+        if (st.p98Y.isFinite() && st.medianY > 0) ColourMath.sceneHi(st.medianY, st.p98Y) else null
+
+    private fun sceneSplit(st: RedlineNative.Stats): Double? =
+        if (st.p25Y.isFinite() && st.medianY > 0) ColourMath.sceneSplit(st.medianY, st.p25Y) else null
+
     private fun jpegMedian(jpeg: ByteArray): Double? {
         val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, BitmapFactory.Options().apply { inSampleSize = 8 }) ?: return null
         try {

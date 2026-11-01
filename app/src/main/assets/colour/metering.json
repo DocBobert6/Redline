@@ -10,6 +10,14 @@
   5.3278
  ],
  "fallback_target_ev": -3.908289,
+ "headroom": {
+  "description": "B23c.1: when log2(median / p25) >= split_min_ev and the clipped fraction <= clipped_max, raise the target so log2(p98 / median) + target reaches p98_floor_ev (EV on the tone curve's input axis), by at most lift_max_ev. Fitted on the train split (redline_cal.metering.fit_headroom).",
+  "p98_floor_ev": -1.55,
+  "split_min_ev": 1.6,
+  "lift_max_ev": 1.0,
+  "clipped_max": 0.02,
+  "holdout_mae_ev": 0.391
+ },
  "fit": {
   "pairs_train": 71,
   "pairs_holdout": 17,

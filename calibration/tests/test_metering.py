@@ -13,6 +13,7 @@ from redline_cal.color import XYZ_TO_SRGB
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ASSETS = os.path.join(ROOT, "app", "src", "main", "assets")
+METERING = os.path.join(ASSETS, "colour", "metering.json")
 
 
 @pytest.fixture(scope="module")
@@ -80,3 +81,70 @@ def test_render_blocks_matches_the_reference_curve(tone):
     c = rp.ToneCurve(tone, 2.0**0.5)
     assert mt.render_blocks(xyz, 0.5, tone, None) == pytest.approx(c(c.gain * lin), abs=1e-9)
     assert math.isfinite(float(mt.render_blocks(xyz, -3.0, tone, None).sum()))
+
+
+# ----------------------------------------------------------------------------------------------- B23c.1 headroom lift
+
+
+def _overcast_stats(rng, sky_fraction=0.55, sky=0.25, asphalt_ev=-3.3, n=40000):
+    """Linear Y of an overcast frame: a uniform bright sky (the median) over dark asphalt and a treeline."""
+    n_sky = int(n * sky_fraction)
+    y_sky = sky * np.exp2(rng.normal(0.0, 0.12, n_sky))
+    y_ground = sky * np.exp2(rng.normal(asphalt_ev, 0.4, n - n_sky))
+    y = np.concatenate([y_sky, y_ground]).clip(0, 1)
+    return {"median_y": float(np.median(y)), "p98_y": rp.upper_quantile(y), "p25_y": rp.upper_quantile(y, rp.P25),
+            "clipped_fraction": float(np.mean(y >= 1.0))}
+
+
+def test_overcast_sky_over_asphalt_is_lifted(tone):
+    """B23c.1 device case: the median sits in the sky, so log2(p98 / median) is tiny and the fit alone places the sky
+    like a flat mid-tone (about 157/255, ~1 EV under what an R5 II renders). The headroom lift brings it up."""
+    m = rp.load_metering(METERING)
+    assert m.headroom is not None
+    st = _overcast_stats(np.random.default_rng(5))
+    hi = rp.scene_hi(st["median_y"], st["p98_y"])
+    split = rp.scene_split(st["median_y"], st["p25_y"])
+    assert hi < 0.6 and split > m.headroom.split_min_ev
+    base = rp.metered_exposure(tone, st["median_y"], st["p98_y"], m)  # no p25: the B23c behaviour
+    lifted = rp.metered_exposure(tone, st["median_y"], st["p98_y"], m, st["p25_y"], st["clipped_fraction"])
+    assert base.headroom_lift_ev == 0.0
+    assert 0.8 < lifted.headroom_lift_ev <= m.headroom.lift_max_ev
+    assert lifted.ev == pytest.approx(base.ev + lifted.headroom_lift_ev, abs=1e-12)
+    # Rendered: the sky's p98 moves from below the shoulder knee up to the floor, still short of white.
+    def rendered_p98(ev):
+        c = rp.ToneCurve(tone, 2.0**ev)
+        return float(c(np.array([c.gain * st["p98_y"]]))[0])
+    assert rendered_p98(base.ev) < 0.72
+    assert 0.78 < rendered_p98(lifted.ev) < 0.95
+
+
+def test_headroom_lift_leaves_other_scenes_alone(tone):
+    m = rp.load_metering(METERING)
+    rng = np.random.default_rng(6)
+    # A uniform wall: same small p98 / median, but no dark quarter.
+    y = (0.2 * np.exp2(rng.normal(0.0, 0.15, 20000))).clip(0, 1)
+    e = rp.metered_exposure(tone, float(np.median(y)), rp.upper_quantile(y), m, rp.upper_quantile(y, rp.P25), 0.0)
+    assert e.headroom_lift_ev == 0.0
+    # A contrasty frame with a split (overcast sky in the top fifth over a garden): p98 already above the floor.
+    st = _overcast_stats(rng, sky_fraction=0.2, sky=0.6, asphalt_ev=-3.0)
+    e = rp.metered_exposure(tone, st["median_y"], st["p98_y"], m, st["p25_y"], st["clipped_fraction"])
+    assert e.headroom_lift_ev == 0.0
+    # Clipping frame: never lifted.
+    st = _overcast_stats(rng)
+    e = rp.metered_exposure(tone, st["median_y"], st["p98_y"], m, st["p25_y"], 0.05)
+    assert e.headroom_lift_ev == 0.0
+
+
+def test_fit_headroom_recovers_a_floor():
+    """Synthetic rows whose camera target lifts p98 to -1.5 EV when the split is large: the grid finds that rule."""
+    rng = np.random.default_rng(8)
+    rows = []
+    for _ in range(80):
+        hi, split = rng.uniform(0.3, 4.0), rng.uniform(0.3, 3.5)
+        base = -2.7 - 0.47 * hi
+        target = base + (max(-1.5 - (base + hi), 0.0) if split >= 2.0 else 0.0) + rng.normal(0, 0.05)
+        rows.append({"features": {"hi": hi, "split": split}, "stats": {"clipped_fraction": 0.0}, "target_ev": target})
+    h, info = mt.fit_headroom(rows, lambda r: -2.7 - 0.47 * r["features"]["hi"])
+    assert h.p98_floor_ev == pytest.approx(-1.5, abs=0.11)
+    assert h.split_min_ev == pytest.approx(2.0, abs=0.31)
+    assert info["train_mae_ev_after"] < info["train_mae_ev_before"]

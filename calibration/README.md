@@ -75,6 +75,8 @@ Before B23c the app placed a still's mid-tone where the phone's own camera JPEG 
 
 The same run re-checks the shipped tone curve on the hold-out on matched scenes (each pair at its own exposure, aligned on the central mid-tones as in B03 `--align-exposure`): median |dL\*| for the black point (JPEG L\* < 15), mid-tones (L\* 30-70) and the highlight shoulder (gained input above the -1.5 EV knee), and chroma of near-white blocks (specular desaturation). `--extract-only --shard i/n` extracts pairs in parallel; extraction caches per pair.
 
+**B23c.1 headroom lift.** The fit sees only `log2(p98/median)`. When the median sits in a dominant bright region (overcast sky filling half the frame over dark asphalt, a sunlit wall over shade) that spread is tiny and the fit places the bright region like a flat mid-tone, about 1 EV under the R5 II. On the train pairs, the R5 II lifts exactly those frames: the ones whose darkest quarter sits far below the median (`log2(median/p25)` large). The same run fits `raw_pipeline.Headroom` on the train split (`fit_headroom`: grid over the p98 floor on the tone curve's input axis and the split gate, the cap is the fit's largest under-placement on train), scores it once on the hold-out (`headroom` in the report) and writes it to the asset's `headroom` block. Frames that are clipping (> 2 %) or whose p98 already reaches the floor are unchanged. The stats pass also returns p25 for it.
+
 ## Tests
 
 ```bash

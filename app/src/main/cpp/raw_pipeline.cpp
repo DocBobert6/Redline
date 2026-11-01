@@ -481,10 +481,11 @@ std::string renderRawFloat(const RawInput& in, const RenderSpec& spec, float* rg
     return "";
 }
 
-// B23c: the order statistic at floor(0.98 * (n - 1)) (= reference upper_quantile); reorders `v`.
-static float upperQuantile(std::vector<float>& v) {
+// B23c / B23c.1: the order statistic at floor(q * (n - 1)) (= reference upper_quantile(values, q)); reorders `v`
+// (the value does not depend on v's order, so p98 and p25 can be taken from the same vector one after the other).
+static float orderQuantile(std::vector<float>& v, double q) {
     if (v.empty()) return 0.0f;
-    const std::size_t k = static_cast<std::size_t>(std::floor(0.98 * static_cast<double>(v.size() - 1)));
+    const std::size_t k = static_cast<std::size_t>(std::floor(q * static_cast<double>(v.size() - 1)));
     std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
     return v[k];
 }
@@ -541,7 +542,8 @@ std::string rawStats(const RawInput& in, const CropRect& crop, const ColourSpec&
     }
     if (ys.empty()) return "crop too small for statistics";
     const std::size_t n = ys.size();
-    out.p98Y = upperQuantile(ys);
+    out.p98Y = orderQuantile(ys, 0.98);
+    out.p25Y = orderQuantile(ys, 0.25);  // B23c.1: shadow split for the headroom lift
     std::nth_element(ys.begin(), ys.begin() + n / 2, ys.end());
     float med = ys[n / 2];
     if (n % 2 == 0) {
@@ -664,7 +666,8 @@ std::string linearStats(const LinearRgb& in, const ColourSpec& colour, int step,
         }
     }
     const std::size_t n = ys.size();
-    out.p98Y = upperQuantile(ys);
+    out.p98Y = orderQuantile(ys, 0.98);
+    out.p25Y = orderQuantile(ys, 0.25);  // B23c.1: shadow split for the headroom lift
     std::nth_element(ys.begin(), ys.begin() + n / 2, ys.end());
     float med = ys[n / 2];
     if (n % 2 == 0) {
