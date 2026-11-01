@@ -1,5 +1,6 @@
 package com.redline.camera.capture
 
+import com.redline.camera.viewfinder.PreviewLoadReading
 import kotlin.math.max
 
 /**
@@ -286,6 +287,14 @@ data class BurstReport(
 
     /** B23b: a warm preview reading ([fps] rolling rate, [droppedTotal] the viewfinder's cumulative dropped frames). */
     fun preview(fps: Double?, droppedTotal: Int?): BurstReport = copy(rapidFire = rapidFire.preview(fps, droppedTotal))
+
+    /** B23b.1: a reading of the viewfinder's under-load meter (see [RapidFire.load]). */
+    fun load(r: PreviewLoadReading): BurstReport = copy(
+        rapidFire = rapidFire.load(r.fps, r.dropped, r.pauses, r.pauseMs, r.warmupFrames, r.recentResumes.map { it.toMap() })
+    )
+
+    /** B23b.1: the native worker read-back for the report. */
+    fun nativeWorkers(v: IntArray?): BurstReport = RapidFire.nativeWorkerMap(v)?.let { copy(rapidFire = rapidFire.copy(nativeWorkers = it)) } ?: this
 
     /** B23b: why a shot was the camera JPEG: the router's reason (the last "...: camera JPEG" part of the plan's reason). */
     private fun jpegReason(shot: BurstShot): String? {

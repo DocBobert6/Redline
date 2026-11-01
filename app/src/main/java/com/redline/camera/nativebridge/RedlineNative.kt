@@ -238,6 +238,20 @@ object RedlineNative {
         if (load().loaded) nativeBurstWorkerNice(nice)
     }
 
+    /**
+     * B23b.1: the calling lane thread's settings for the native pool jobs it starts: the workers' [nice] for its jobs,
+     * and [tail] for the merge tail (finish / gather run in slices and wait between them while a frame add runs).
+     */
+    fun setBurstLane(nice: Int, tail: Boolean) {
+        if (load().loaded) nativeBurstLane(nice, tail)
+    }
+
+    /**
+     * B23b.1: what the native workers report: [pool worker nice read back, last pool job nice, merge-tail yields,
+     * merge-tail yield ms, merge-tail slices, render thread nice read back] (-1000: none yet); null when not loaded.
+     */
+    fun workerStats(): IntArray? = if (load().loaded) runCatching { nativeWorkerStats() }.getOrNull() else null
+
     class BurstSelfCheck(val alignedFraction: Double, val noiseRatio: Double, val ms: Double)
 
     /** The native synthetic burst check (known shifts + noise). Throws like [mergeBurst]. */
@@ -490,6 +504,10 @@ object RedlineNative {
 
     @JvmStatic
     private external fun nativeBurstWorkerNice(nice: Int)
+
+    private external fun nativeBurstLane(nice: Int, tail: Boolean)
+
+    private external fun nativeWorkerStats(): IntArray
 
     @JvmStatic
     private external fun nativeVersion(): String

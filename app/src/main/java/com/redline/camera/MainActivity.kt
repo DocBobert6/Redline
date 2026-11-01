@@ -63,6 +63,7 @@ import com.redline.camera.ui.CapabilityScreen
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
 import com.redline.camera.ui.ViewfinderScreen
+import com.redline.camera.viewfinder.PreviewLoadReading
 import com.redline.camera.viewfinder.ViewfinderController
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ViewfinderSetup
@@ -308,25 +309,23 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onPreviewFps(fps: Double, warm: Boolean) {
-            // B23b: rapid fire counts warm readings while the processing queue drains (one state change for both).
             update { s ->
                 val m = s.viewfinder ?: ViewfinderMetrics()
                 val min = if (warm) minOf(m.previewFpsMin ?: fps, fps) else m.previewFpsMin
-                s.copy(
-                    viewfinder = m.copy(previewFps = fps, previewFpsMin = min),
-                    burst = if (warm) s.burst.preview(fps, null) else s.burst
-                )
+                s.copy(viewfinder = m.copy(previewFps = fps, previewFpsMin = min))
             }
         }
 
         override fun onFrameStats(intervals: Int, dropped: Int, worstIntervalMs: Double) {
             update { s ->
                 val m = s.viewfinder ?: ViewfinderMetrics()
-                s.copy(
-                    viewfinder = m.copy(framesCounted = intervals, droppedFrames = dropped, worstFrameIntervalMs = worstIntervalMs),
-                    burst = s.burst.preview(null, dropped)
-                )
+                s.copy(viewfinder = m.copy(framesCounted = intervals, droppedFrames = dropped, worstFrameIntervalMs = worstIntervalMs))
             }
+        }
+
+        override fun onPreviewLoad(reading: PreviewLoadReading) {
+            // B23b.1: rapid fire counts the under-load meter (burst pauses and their warm-up excluded) while the queue drains.
+            update { s -> s.copy(burst = s.burst.load(reading)) }
         }
 
         override fun onStreaming(setup: ViewfinderSetup, stabilization: Boolean) {
@@ -974,7 +973,7 @@ class MainActivity : ComponentActivity() {
                     result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
                 var burst = state.value.burst.press(result.shutterWaitMs, result.shutterBlocked, stress)
                 result.dropped?.let { burst = burst.drop(it, refused = result.shutterBlocked) }
-                result.burst?.let { burst = burst.record(it, result.shutterToSavedMs, result.ok) }
+                result.burst?.let { burst = burst.record(it, result.shutterToSavedMs, result.ok).nativeWorkers(RedlineNative.workerStats()) }
                 if (stress && result.burst == null) {
                     val failed = !result.ok && result.dropped == null
                     burst = burst.copy(stressDone = burst.stressDone + 1, stressFailures = burst.stressFailures + if (failed) 1 else 0)

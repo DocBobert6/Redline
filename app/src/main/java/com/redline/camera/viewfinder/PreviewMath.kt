@@ -13,6 +13,13 @@ import kotlin.math.abs
 object PreviewFps {
     const val TARGET = 30
 
+    /**
+     * B23b.1: the frame duration to request with a fixed AE range ([n, n]): 1/n s. Null for a variable range, which
+     * leaves the frame duration to AE. (With AE on the HAL may ignore it; it is a hint that matches the range.)
+     */
+    fun fixedFrameDurationNs(range: Pair<Int, Int>?): Long? =
+        range?.takeIf { it.first == it.second && it.first > 0 }?.let { 1_000_000_000L / it.first }
+
     fun choose(ranges: List<Pair<Int, Int>>): Pair<Int, Int>? {
         if ((TARGET to TARGET) in ranges) return TARGET to TARGET
         if ((24 to TARGET) in ranges) return 24 to TARGET

@@ -18,21 +18,57 @@ object WorkerGovernor {
     const val LOADED_NICE = 10
     const val LOADED_THREADS = 2
 
-    /** [processing]: shots out of the camera and not yet saved; [capturing]: presses waiting plus the shot capturing. */
-    fun budget(viewfinderActive: Boolean, processing: Int, capturing: Int, maxThreads: Int): WorkerBudget {
+    /** B23b.1: the merge tail (finish / gather) runs this much nicer than the frame adds, so a queued burst's adds win. */
+    const val TAIL_NICE_STEP = 3
+
+    /** B23b.1: under load the store lane (JPEG encode, MediaStore) runs this much nicer than merge and render. */
+    const val STORE_NICE_STEP = 2
+    const val MAX_NICE = 19
+
+    /**
+     * [processing]: shots out of the camera and not yet saved; [capturing]: presses waiting plus the shot capturing.
+     * B23b.1: [latched] (see [GovernorLatch]) keeps the budget loaded down to a backlog of one, so the last shots of a
+     * rapid-fire run drain at the loaded budget too; a lone shot never latches.
+     */
+    fun budget(viewfinderActive: Boolean, processing: Int, capturing: Int, maxThreads: Int, latched: Boolean = false): WorkerBudget {
         val all = max(1, maxThreads)
         val backlog = processing + capturing
-        return if (viewfinderActive && backlog >= 2) {
+        return if (viewfinderActive && (backlog >= 2 || (latched && backlog >= 1))) {
             WorkerBudget(min(all, LOADED_THREADS), LOADED_NICE, loaded = true)
         } else {
             WorkerBudget(all, IDLE_NICE, loaded = false)
         }
     }
 
+    /** B23b.1: the merge tail's nice for a budget. */
+    fun tailNice(b: WorkerBudget): Int = min(MAX_NICE, b.nice + TAIL_NICE_STEP)
+
+    /** B23b.1: the store lane's nice for a budget (lowered only under load). */
+    fun storeNice(b: WorkerBudget): Int = if (b.loaded) min(MAX_NICE, b.nice + STORE_NICE_STEP) else b.nice
+
     /** Threads a pool of [cores] may use: at most [cap], and at most [limit] when the governor set one; never below 1. */
     fun cappedThreads(cores: Int, cap: Int, limit: Int?): Int {
         val n = cores.coerceIn(1, max(1, cap))
         return if (limit == null) n else n.coerceAtMost(max(1, limit))
+    }
+}
+
+/**
+ * B23b.1: the governor stays loaded from the moment the backlog reaches two (a rapid-fire run) until the queue is empty
+ * or the viewfinder is gone, so the whole drain (backlog > 0) runs at the loaded budget. A lone shot (backlog one, never
+ * two) does not latch and keeps every thread (the B22 unhurried save time).
+ */
+class GovernorLatch {
+    @Volatile var latched = false
+        private set
+
+    fun update(viewfinderActive: Boolean, backlog: Int): Boolean {
+        latched = when {
+            !viewfinderActive || backlog <= 0 -> false
+            backlog >= 2 -> true
+            else -> latched
+        }
+        return latched
     }
 }
 
@@ -51,7 +87,10 @@ data class RapidFireRun(
     val maxQueueDepth: Int = 0,
     val fpsMin: Double? = null,
     val fpsSamples: Int = 0,
-    val droppedFrames: Int = 0
+    val droppedFrames: Int = 0,
+    /** B23b.1: preview pauses for burst captures during this run, and their total length. */
+    val pauses: Int = 0,
+    val pauseMs: Double = 0.0
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "shots" to shots,
@@ -63,7 +102,9 @@ data class RapidFireRun(
         "max_queue_depth" to maxQueueDepth,
         "preview_fps_min_during_drain" to fpsMin?.let { Math.round(it * 10.0) / 10.0 },
         "preview_fps_samples_during_drain" to fpsSamples,
-        "preview_dropped_during_drain" to droppedFrames
+        "preview_dropped_during_drain" to droppedFrames,
+        "preview_pauses_during_drain" to pauses,
+        "preview_pause_ms_during_drain" to Math.round(pauseMs)
     )
 }
 
@@ -91,7 +132,18 @@ data class RapidFire(
     /** The cumulative dropped-frame count last seen from the viewfinder (deltas count while busy). */
     val lastDroppedSeen: Int? = null,
     val workerThreadsLoaded: Int = WorkerGovernor.LOADED_THREADS,
-    val workerNiceLoaded: Int = WorkerGovernor.LOADED_NICE
+    val workerNiceLoaded: Int = WorkerGovernor.LOADED_NICE,
+    /** B23b.1: burst pauses while busy (count, ms), from the cumulative meter values last seen. */
+    val pausesUnderLoad: Int = 0,
+    val pauseMsUnderLoad: Double = 0.0,
+    val warmupFramesUnderLoad: Int = 0,
+    val lastPausesSeen: Int? = null,
+    val lastPauseMsSeen: Double? = null,
+    val lastWarmupSeen: Int? = null,
+    /** B23b.1: the latest meter reading's first frames after recent pauses (diagnostic). */
+    val recentResumes: List<Map<String, Any?>> = emptyList(),
+    /** B23b.1: native worker read-back (pool nice, tail yields, render nice); null until read. */
+    val nativeWorkers: Map<String, Int>? = null
 ) {
     /** The processing queue depth changed. Empty to non-empty starts a new run (closing the previous one). */
     fun queue(depth: Int): RapidFire {
@@ -153,6 +205,36 @@ data class RapidFire(
         return next
     }
 
+    /**
+     * B23b.1: a reading of the honest under-load meter (fps over counted frames only; drops; burst pauses; warm-up).
+     * The fps and drops go through [preview]; pauses and warm-up frames are recorded separately and never lower the fps.
+     */
+    fun load(
+        fps: Double?,
+        droppedTotal: Int,
+        pausesTotal: Int,
+        pauseMsTotal: Double,
+        warmupTotal: Int,
+        resumes: List<Map<String, Any?>> = recentResumes
+    ): RapidFire {
+        var next = preview(fps, droppedTotal)
+        val dp = delta(lastPausesSeen, pausesTotal)
+        val dms = lastPauseMsSeen.let { if (it == null || pauseMsTotal < it) 0.0 else pauseMsTotal - it }
+        val dw = delta(lastWarmupSeen, warmupTotal)
+        next = next.copy(lastPausesSeen = pausesTotal, lastPauseMsSeen = pauseMsTotal, lastWarmupSeen = warmupTotal, recentResumes = resumes)
+        if (busy) {
+            next = next.copy(
+                pausesUnderLoad = next.pausesUnderLoad + dp,
+                pauseMsUnderLoad = next.pauseMsUnderLoad + dms,
+                warmupFramesUnderLoad = next.warmupFramesUnderLoad + dw,
+                current = next.current.copy(pauses = next.current.pauses + dp, pauseMs = next.current.pauseMs + dms)
+            )
+        }
+        return next
+    }
+
+    private fun delta(prev: Int?, total: Int): Int = if (prev == null || total < prev) 0 else total - prev
+
     /** Folds the current run into the gate tallies and the largest run (a new run is about to start). */
     private fun close(): RapidFire {
         val c = current
@@ -187,12 +269,23 @@ data class RapidFire(
             "max_save_wait_ms" to maxSaveWaitMs,
             "preview_fps_min_under_load" to fpsMinUnderLoad?.let { Math.round(it * 10.0) / 10.0 },
             "preview_dropped_under_load" to droppedUnderLoad,
+            "preview_fps_method" to FPS_METHOD,
+            "preview_pauses_under_load" to pausesUnderLoad,
+            "preview_pause_ms_under_load" to Math.round(pauseMsUnderLoad),
+            "preview_warmup_frames_excluded" to warmupFramesUnderLoad,
+            "preview_recent_resumes" to recentResumes,
             "runs" to runs,
             "busy" to busy,
             "current_run" to current.toMap(),
             "largest_run" to largest?.toMap(),
             "gate_runs_15_plus" to g.gateRuns,
-            "worker_loaded" to linkedMapOf("threads" to workerThreadsLoaded, "nice" to workerNiceLoaded),
+            "worker_loaded" to linkedMapOf(
+                "threads" to workerThreadsLoaded,
+                "nice" to workerNiceLoaded,
+                "tail_nice_step" to WorkerGovernor.TAIL_NICE_STEP,
+                "store_nice_step" to WorkerGovernor.STORE_NICE_STEP
+            ),
+            "native_workers" to nativeWorkers,
             "holding_queue_max" to RawHoldingQueue.MAX_SINGLES,
             "gate" to linkedMapOf(
                 "no_camera_jpeg_in_15_taps" to noCameraJpegGate,
@@ -204,5 +297,19 @@ data class RapidFire(
     companion object {
         const val GATE_TAPS = 15
         const val GATE_FPS_MIN = 29.5
+        const val FPS_METHOD = "counted frames only: excludes frames while a burst capture is in flight and warm-up after each pause"
+
+        /** B23b.1: the native worker read-back ([com.redline.camera.nativebridge.RedlineNative.workerStats]) for the report. */
+        fun nativeWorkerMap(v: IntArray?): Map<String, Int>? {
+            if (v == null || v.size < 6) return null
+            return linkedMapOf(
+                "pool_worker_nice_seen" to v[0],
+                "pool_last_job_nice" to v[1],
+                "tail_yields" to v[2],
+                "tail_yield_ms" to v[3],
+                "tail_slices" to v[4],
+                "render_thread_nice_seen" to v[5]
+            )
+        }
     }
 }
