@@ -238,6 +238,7 @@ def test_native_matches_reference(tool, cal, tone, lut, white, cfa, shading, zoo
     assert st["median_y"] == pytest.approx(ref_plan.stats["median_y"], rel=1e-4)
     assert st["clipped_fraction"] == pytest.approx(ref_plan.stats["clipped_fraction"], abs=1e-6)
     assert st["p98_y"] == pytest.approx(ref_plan.stats["p98_y"], rel=1e-4)  # B23c: the metering fit's input
+    assert st["p25_y"] == pytest.approx(ref_plan.stats["p25_y"], rel=1e-4)  # B23c.1: the headroom lift's split
     metered = rp.plan_shot(frame, cal, n, tone, zoom=zoom, long_px=long_px, stats=st, metering=rp.load_metering(METERING))
     assert metered.exposure_method == rp.METERING_METHOD
     plan = rp.plan_shot(frame, cal, n, tone, zoom=zoom, long_px=long_px, target_encoded=0.46, stats=st)
@@ -307,5 +308,6 @@ def test_metering_asset_and_solve(tone):
 def test_upper_quantile_is_the_native_order_statistic():
     v = np.arange(101, dtype=float)[::-1]
     assert rp.upper_quantile(v) == 98.0
+    assert rp.upper_quantile(v, rp.P25) == 25.0
     assert rp.upper_quantile(np.array([3.0])) == 3.0
     assert rp.upper_quantile(np.arange(10.0)) == 8.0  # floor(0.98 * 9) = 8

@@ -60,10 +60,25 @@ object RedlineNative {
         val shadingCols: Int
     )
 
-    /** B23c: [p98Y] is the 98th-percentile luminance (order statistic), for the R5 II metering fit; NaN if absent. */
-    class Stats(val medianY: Double, val clippedFraction: Double, val cells: Int, val p98Y: Double = Double.NaN) {
+    /**
+     * B23c: [p98Y] is the 98th-percentile luminance (order statistic), for the R5 II metering fit; B23c.1: [p25Y] the
+     * 25th, for the metering headroom lift. NaN if absent.
+     */
+    class Stats(
+        val medianY: Double,
+        val clippedFraction: Double,
+        val cells: Int,
+        val p98Y: Double = Double.NaN,
+        val p25Y: Double = Double.NaN
+    ) {
         companion object {
-            fun of(r: FloatArray): Stats = Stats(r[0].toDouble(), r[1].toDouble(), r[2].toInt(), r.getOrNull(3)?.toDouble() ?: Double.NaN)
+            fun of(r: FloatArray): Stats = Stats(
+                r[0].toDouble(),
+                r[1].toDouble(),
+                r[2].toInt(),
+                r.getOrNull(3)?.toDouble() ?: Double.NaN,
+                r.getOrNull(4)?.toDouble() ?: Double.NaN
+            )
         }
     }
 

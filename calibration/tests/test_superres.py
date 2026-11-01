@@ -256,4 +256,5 @@ def test_native_render_linear_parity(tmp_path):
     assert float(out[1]) == pytest.approx(st["clipped_fraction"], abs=1e-6)
     assert int(out[2]) == st["cells"]
     assert float(out[3]) == pytest.approx(st["p98_y"], abs=1e-5)  # B23c
+    assert float(out[4]) == pytest.approx(st["p25_y"], abs=1e-5)  # B23c.1
     assert math.isfinite(float(out[0]))

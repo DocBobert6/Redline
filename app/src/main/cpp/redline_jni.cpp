@@ -141,10 +141,11 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
         throwIllegalArgument(env, err);
         return nullptr;
     }
-    jfloatArray out = env->NewFloatArray(4);
+    jfloatArray out = env->NewFloatArray(5);
     if (out == nullptr) return nullptr;
-    const jfloat v[4] = {st.medianY, st.clippedFraction, static_cast<jfloat>(st.cells), st.p98Y};  // B23c: + p98Y
-    env->SetFloatArrayRegion(out, 0, 4, v);
+    // B23c: + p98Y; B23c.1: + p25Y
+    const jfloat v[5] = {st.medianY, st.clippedFraction, static_cast<jfloat>(st.cells), st.p98Y, st.p25Y};
+    env->SetFloatArrayRegion(out, 0, 5, v);
     return out;
 }
 
@@ -586,7 +587,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     return err.empty() ? nullptr : env->NewStringUTF(err.c_str());
 }
 
-// [medianY, clippedFraction, cells, p98Y] of the finished merge.
+// [medianY, clippedFraction, cells, p98Y, p25Y] of the finished merge.
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeSrStats(JNIEnv* env, jclass, jlong handle,
                                                                                                         jfloatArray matrix,
                                                                                                         jfloatArray neutral, jint step) {
@@ -606,10 +607,11 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
         throwIllegalArgument(env, err);
         return nullptr;
     }
-    jfloatArray out = env->NewFloatArray(4);
+    jfloatArray out = env->NewFloatArray(5);
     if (out == nullptr) return nullptr;
-    const jfloat v[4] = {st.medianY, st.clippedFraction, static_cast<jfloat>(st.cells), st.p98Y};  // B23c: + p98Y
-    env->SetFloatArrayRegion(out, 0, 4, v);
+    // B23c: + p98Y; B23c.1: + p25Y
+    const jfloat v[5] = {st.medianY, st.clippedFraction, static_cast<jfloat>(st.cells), st.p98Y, st.p25Y};
+    env->SetFloatArrayRegion(out, 0, 5, v);
     return out;
 }
 

@@ -127,10 +127,37 @@ class ColourMathTest {
         list("metering").forEach { c ->
             c as Map<*, *>
             val p98 = (c["p98_y"] as? Number)?.toDouble() ?: Double.NaN
-            val e = ColourMath.solveExposureMetered(tone, d(c["median_y"]), p98, met)
-            close("metered ${c["median_y"]} ${c["p98_y"]}", d(c["ev"]), e.ev, rel = 1e-7, abs = 1e-9)
+            val p25 = (c["p25_y"] as? Number)?.toDouble() ?: Double.NaN
+            val clipped = (c["clipped_fraction"] as? Number)?.toDouble() ?: Double.NaN
+            val e = ColourMath.solveExposureMetered(tone, d(c["median_y"]), p98, met, p25, clipped)
+            close("metered ${c["median_y"]} ${c["p98_y"]} ${c["p25_y"]}", d(c["ev"]), e.ev, rel = 1e-7, abs = 1e-9)
             assertEquals(c["method"], e.method)
+            val lift = (c["headroom_lift_ev"] as? Number)?.toDouble() ?: 0.0
+            close("headroom lift ${c["median_y"]} ${c["p25_y"]}", lift, e.headroomLiftEv, rel = 1e-7, abs = 1e-9)
         }
+    }
+
+    @Test
+    fun overcastSkyOverAsphaltIsLiftedAndAFlatWallIsNot() {
+        // B23c.1 device case: overcast sky is the median (p98 only 0.37 EV above it), asphalt fills the darkest quarter
+        // (~2.9 EV down). The fit alone places the sky like a flat mid-tone; the headroom lift raises it ~1 EV.
+        val tone = tone()
+        val met = ColourMath.Metering.parse(cases["metering_model"] as Map<*, *>)
+        val head = met.headroom!!
+        val med = 0.2
+        val p98 = med * Math.pow(2.0, 0.37)
+        val overcast = ColourMath.solveExposureMetered(tone, med, p98, met, med * Math.pow(2.0, -2.86), 0.0)
+        val noLift = ColourMath.solveExposureMetered(tone, med, p98, met)
+        assertTrue("lift ${overcast.headroomLiftEv}", overcast.headroomLiftEv > 0.8 && overcast.headroomLiftEv <= head.liftMaxEv)
+        close("lifted gain", noLift.ev + overcast.headroomLiftEv, overcast.ev, rel = 0.0, abs = 1e-12)
+        // A uniform wall with the same p98 / median but no dark quarter, and a clipping frame: unchanged.
+        val wall = ColourMath.solveExposureMetered(tone, med, p98, met, med * Math.pow(2.0, -0.16), 0.0)
+        assertEquals(0.0, wall.headroomLiftEv, 0.0)
+        val clipping = ColourMath.solveExposureMetered(tone, med, p98, met, med * Math.pow(2.0, -2.86), 0.05)
+        assertEquals(0.0, clipping.headroomLiftEv, 0.0)
+        // A contrasty control (p98 3.4 EV over the median, already above the floor): unchanged.
+        val control = ColourMath.solveExposureMetered(tone, 0.05, 0.05 * Math.pow(2.0, 3.39), met, 0.05 * Math.pow(2.0, -0.76), 0.0)
+        assertEquals(0.0, control.headroomLiftEv, 0.0)
     }
 
     @Test

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#define REDLINE_NATIVE_VERSION "redline_native 0.2.4-alpha.1 (B20 .cube parser, B21 RAW colour pipeline, B22b streaming burst merge, B23 super-resolution, B23b.1 rapid fire, B23c metering stats)"
+#define REDLINE_NATIVE_VERSION "redline_native 0.2.4-alpha.2 (B20 .cube parser, B21 RAW colour pipeline, B22b streaming burst merge, B23 super-resolution, B23b.1 rapid fire, B23c metering stats, B23c.1 p25 for the headroom lift)"
 
 namespace redline {
 

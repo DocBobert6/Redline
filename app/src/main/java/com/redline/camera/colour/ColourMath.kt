@@ -367,7 +367,8 @@ object ColourMath {
         return grid[i] + (grid[i + 1] - grid[i]) * (y - t[i]) / (t[i + 1] - t[i])
     }
 
-    class Exposure(val ev: Double, val method: String)
+    /** [headroomLiftEv]: B23c.1, what the metering headroom lift added to [ev] (after the knee and gain clamps). */
+    class Exposure(val ev: Double, val method: String, val headroomLiftEv: Double = 0.0)
 
     /** Exposure gain (log2) that puts the RAW frame's median luminance where the camera JPEG's median sits. */
     fun solveExposure(tone: DoubleArray, medianY: Double, targetEncoded: Double?): Exposure {
@@ -392,7 +393,13 @@ object ColourMath {
      * ``raw_pipeline.Metering``): the mid-tone target (EV on the tone curve's input axis) is
      * coef[0] + coef[1] * clamp(log2(p98 / median), hiRange), so high-contrast scenes sit lower, as on the R5 II.
      */
-    class Metering(val coef: DoubleArray, val hiRange: DoubleArray, val fallbackTargetEv: Double, val holdoutMaeEv: Double? = null) {
+    class Metering(
+        val coef: DoubleArray,
+        val hiRange: DoubleArray,
+        val fallbackTargetEv: Double,
+        val holdoutMaeEv: Double? = null,
+        val headroom: Headroom? = null
+    ) {
         fun target(medianY: Double, p98Y: Double): Exposure {
             if (!(p98Y.isFinite() && p98Y > 0 && medianY > 0)) return Exposure(fallbackTargetEv, METERING_CONSTANT_METHOD)
             val hi = log2(max(p98Y, medianY) / medianY).coerceIn(hiRange[0], hiRange[1])
@@ -409,18 +416,60 @@ object ColourMath {
                 val range = nums("hi_range")
                 require(coef.size == 2 && range.size == 2 && range[0] < range[1]) { "bad metering model" }
                 val mae = ((m["fit"] as? Map<*, *>)?.get("holdout_mae_ev") as? Number)?.toDouble()
-                return Metering(coef, range, (m["fallback_target_ev"] as Number).toDouble(), mae)
+                val head = (m["headroom"] as? Map<*, *>)?.let { h ->
+                    fun d(k: String) = (h[k] as Number).toDouble()
+                    Headroom(d("p98_floor_ev"), d("split_min_ev"), d("lift_max_ev"), d("clipped_max"))
+                }
+                return Metering(coef, range, (m["fallback_target_ev"] as Number).toDouble(), mae, head)
             }
         }
     }
 
-    /** B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee). */
-    fun solveExposureMetered(tone: DoubleArray, medianY: Double, p98Y: Double, metering: Metering): Exposure {
+    /**
+     * B23c.1 headroom lift (reference ``raw_pipeline.Headroom``, fitted on the R5 II train split): when the darkest
+     * quarter of the frame sits at least [splitMinEv] below the median (log2(median / p25)) and the frame is not
+     * clipping, raise the target so the frame's p98 reaches [p98FloorEv] on the tone curve's input axis, by at most
+     * [liftMaxEv]. A frame whose p98 is already at or above the floor is unchanged.
+     */
+    class Headroom(val p98FloorEv: Double, val splitMinEv: Double, val liftMaxEv: Double, val clippedMax: Double) {
+        fun lift(targetEv: Double, medianY: Double, p98Y: Double, p25Y: Double, clippedFraction: Double): Double {
+            if (!(p98Y.isFinite() && p25Y.isFinite()) || medianY <= 0) return 0.0
+            if (clippedFraction.isFinite() && clippedFraction > clippedMax) return 0.0
+            if (sceneSplit(medianY, p25Y) < splitMinEv) return 0.0
+            val e98 = targetEv + sceneHi(medianY, p98Y)
+            return (p98FloorEv - e98).coerceIn(0.0, liftMaxEv)
+        }
+    }
+
+    /** log2(p98 / median), the metering fit's feature (not clamped). */
+    fun sceneHi(medianY: Double, p98Y: Double): Double = log2(max(p98Y, medianY) / medianY)
+
+    private val SPLIT_FLOOR = Math.pow(2.0, -20.0)
+
+    /** log2(median / p25): how far the darkest quarter of the frame sits below the median (0 if p25 >= median). */
+    fun sceneSplit(medianY: Double, p25Y: Double): Double = log2(medianY / min(max(p25Y, SPLIT_FLOOR), medianY))
+
+    /**
+     * B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee);
+     * B23c.1: plus the headroom lift when the metering carries one and the frame qualifies.
+     */
+    fun solveExposureMetered(
+        tone: DoubleArray,
+        medianY: Double,
+        p98Y: Double,
+        metering: Metering,
+        p25Y: Double = Double.NaN,
+        clippedFraction: Double = Double.NaN
+    ): Exposure {
         if (!(medianY > 1e-6 && medianY.isFinite())) return Exposure(0.0, "no_signal")
         val t = metering.target(medianY, p98Y)
+        val head = metering.headroom
+        val lift = if (head != null && t.method == METERING_METHOD) head.lift(t.ev, medianY, p98Y, p25Y, clippedFraction) else 0.0
         val yKnee = interpUniform(KNEE_EV, EV_MIN, EV_MAX, tone)
-        val target = min(t.ev, invertFitted(tone, yKnee - 1e-3))
-        return Exposure((target - log2(medianY)).coerceIn(EXPOSURE_MIN_EV, EXPOSURE_MAX_EV), t.method)
+        val kneeT = invertFitted(tone, yKnee - 1e-3)
+        fun gain(target: Double) = (min(target, kneeT) - log2(medianY)).coerceIn(EXPOSURE_MIN_EV, EXPOSURE_MAX_EV)
+        val ev = gain(t.ev + lift)
+        return Exposure(ev, t.method, if (lift > 0) ev - gain(t.ev) else 0.0)
     }
 
     /** Median luma of sRGB-encoded pixels (0..255 per channel, RGB triples), encoded. */
