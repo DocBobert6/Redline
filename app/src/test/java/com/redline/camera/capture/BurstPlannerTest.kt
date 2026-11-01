@@ -126,15 +126,35 @@ class BurstPlannerTest {
     }
 
     @Test
-    fun busyShotsTakeTheCheapestPathNeverARefusal() {
-        assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3))
-        val full = ShotRouter.route(wantsRaw = true, pendingSingles = ShotRouter.MAX_PENDING_SINGLES, poolFree = 3)
+    fun busyShotsTakeARawFrameAndTheCameraJpegOnlyAsTheLastResort() {
+        // B23b: a busy shot is a single RAW frame while the holding queue has room; no fixed two-single limit.
+        assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3, capacity = 8))
+        assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 5, poolFree = 3, capacity = 8))
+        val full = ShotRouter.route(wantsRaw = true, pendingSingles = 8, poolFree = 3, capacity = 8)
         assertEquals(ShotRouter.Path.CAMERA_JPEG, full.first)
+        assertEquals(ShotRouter.whyQueueFull(8), full.second)
         assertTrue(full.second!!.contains("queue full"))
-        val noMemory = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 0)
-        assertEquals(ShotRouter.Path.CAMERA_JPEG, noMemory.first)
-        assertTrue(noMemory.second!!.contains("memory"))
-        assertEquals(ShotRouter.Path.CAMERA_JPEG to null, ShotRouter.route(wantsRaw = false, pendingSingles = 0, poolFree = 3))
+        val noMemory = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 0, capacity = 8)
+        assertEquals(ShotRouter.Path.CAMERA_JPEG to ShotRouter.WHY_NO_BUFFER, noMemory)
+        val low = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3, capacity = 8, lowMemory = true)
+        assertEquals(ShotRouter.Path.CAMERA_JPEG to ShotRouter.WHY_LOW_MEMORY, low)
+        // Every fallback reason names the camera JPEG (the burst report keys rapid-fire reasons on it).
+        listOf(full.second!!, noMemory.second!!, low.second!!).forEach { assertTrue(it, it.endsWith("camera JPEG")) }
+        // RAW not wanted: the camera JPEG with no fallback reason (it is not a fallback).
+        assertEquals(
+            ShotRouter.Path.CAMERA_JPEG to null,
+            ShotRouter.route(wantsRaw = false, pendingSingles = 0, poolFree = 3, capacity = 8)
+        )
+        assertEquals(
+            ShotRouter.Path.CAMERA_JPEG to null,
+            ShotRouter.route(wantsRaw = false, pendingSingles = 0, poolFree = 0, capacity = 0, lowMemory = true)
+        )
+    }
+
+    @Test
+    fun lowMemoryWinsOverAFreeBufferAndAnEmptyQueue() {
+        val r = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 20, capacity = 16, lowMemory = true)
+        assertEquals(ShotRouter.Path.CAMERA_JPEG, r.first)
     }
 
     @Test

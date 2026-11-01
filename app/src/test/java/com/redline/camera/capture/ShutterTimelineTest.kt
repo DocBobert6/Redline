@@ -170,4 +170,17 @@ class ShutterTimelineTest {
         assertEquals(315L, r.recent.last()["shutter_release_ms"])
         assertEquals(150L, r.recent.last()["merge_tail_ms"])
     }
+
+    @Test
+    fun theDngTakesItsOwnFramesResultNotTheSuperResReference() {
+        // Burst results by sensor timestamp: frame 0 at 1000, frame 1 (the SR reference) at 2000.
+        data class R(val ts: Long?, val name: String)
+        val results = listOf(R(2000, "frame1"), R(1000, "frame0"), R(3000, "frame2"))
+        val jpegFrame = R(null, "jpeg")
+        assertEquals("frame0", FrameResults.forFrame(1000L, results, { it.ts }, jpegFrame).name)
+        assertEquals("frame1", FrameResults.forFrame(2000L, results, { it.ts }, jpegFrame).name)
+        // No match: the first burst result; no burst result at all: the JPEG frame's.
+        assertEquals("frame1", FrameResults.forFrame(9999L, results, { it.ts }, jpegFrame).name)
+        assertEquals("jpeg", FrameResults.forFrame(1000L, emptyList(), { it.ts }, jpegFrame).name)
+    }
 }
