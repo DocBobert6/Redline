@@ -28,13 +28,21 @@ import com.redline.camera.nativebridge.RedlineNative
 class ColourPipeline(context: Context) {
     private val app = context.applicationContext
 
-    class Prepared(val ok: Boolean, val reason: String?, val nativeVersion: String?, val selfCheck: ColourSelfCheck?)
+    class Prepared(
+        val ok: Boolean,
+        val reason: String?,
+        val nativeVersion: String?,
+        val selfCheck: ColourSelfCheck?,
+        val metering: ColourMath.Metering? = null
+    )
 
     class Outcome(val bitmap: Bitmap?, val shot: ColourShot)
 
     @Volatile private var tone: DoubleArray? = null
 
     @Volatile private var lut: CubeLut? = null
+
+    @Volatile private var metering: ColourMath.Metering? = null
 
     @Volatile private var bundled: List<BundledProfile> = emptyList()
 
@@ -47,6 +55,7 @@ class ColourPipeline(context: Context) {
         if (!native.loaded) return Prepared(false, "native module not loaded (${native.error})", null, null)
         try {
             tone = loadTone(asset(TONE_ASSET))
+            metering = ColourMath.Metering.parse(JsonParse.parse(asset(METERING_ASSET)) as Map<*, *>)
             lut = RedlineNative.parseCube(app.assets.open(LUT_ASSET).use { it.readBytes() })
             bundled = PROFILE_ASSETS.map { BundledProfile.parse(asset(it)) }
         } catch (e: Exception) {
@@ -55,7 +64,7 @@ class ColourPipeline(context: Context) {
         val check = runSelfCheck()
         ready = check.passed
         val reason = if (check.passed) null else "self-check failed: " + (check.error ?: describe(check))
-        return Prepared(check.passed, reason, native.version, check)
+        return Prepared(check.passed, reason, native.version, check, metering)
     }
 
     private fun describe(c: ColourSelfCheck): String =
@@ -120,7 +129,8 @@ class ColourPipeline(context: Context) {
      * is null when the pipeline could not render; [Outcome.shot] then says why and the caller saves the camera JPEG.
      * B22: [raw] is a pool copy of the frame, or the merged burst; [levelScale] is the factor its samples were scaled
      * by (16 for the merge's extra precision), applied to the result's black and white levels. The exposure is solved
-     * from the frame's own median against the camera JPEG's, so an under-exposed burst is brought back up here.
+     * from the frame's own median and p98 with the R5 II metering fit (B23c; it was the camera JPEG's median before), so
+     * an under-exposed burst is brought back up here. The camera JPEG's median is still read, for the report only.
      */
     fun render(
         raw: RawCopy,
@@ -154,7 +164,9 @@ class ColourPipeline(context: Context) {
             val st = RedlineNative.rawStats(frame, g.crop, m, n, ColourMath.STATS_STEP)
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
-            val tn = ShotPlanner.tone(t, st.medianY, median)
+            val met = metering ?: return fail("metering not loaded")
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met)
+            val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
@@ -179,6 +191,7 @@ class ColourPipeline(context: Context) {
                     exposureEv = tn.exposure.ev,
                     exposureMethod = tn.exposure.method,
                     jpegMedian = median,
+                    exposureEvCameraJpeg = jpegEv,
                     clippedFraction = st.clippedFraction,
                     outSize = g.out,
                     timingsMs = timings
@@ -194,7 +207,7 @@ class ColourPipeline(context: Context) {
     /**
      * B23: renders a finished super-resolution merge (normalised camera RGB already on the [outWidth] x [outHeight] grid
      * of the stop's crop) through stages 4-8, planned exactly as [render] plans a frame: the colour solve from the
-     * reference frame's [result], the exposure from the merge's own median against the camera JPEG's.
+     * reference frame's [result], the exposure from the merge's own median and p98 (B23c metering fit).
      */
     fun renderSuperRes(
         sr: RedlineNative.SuperResMerger,
@@ -226,7 +239,9 @@ class ColourPipeline(context: Context) {
             val st = sr.stats(m, n, 2 * ColourMath.STATS_STEP)
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
-            val tn = ShotPlanner.tone(t, st.medianY, median)
+            val met = metering ?: return fail("metering not loaded")
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met)
+            val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
@@ -250,6 +265,7 @@ class ColourPipeline(context: Context) {
                     exposureEv = tn.exposure.ev,
                     exposureMethod = tn.exposure.method,
                     jpegMedian = median,
+                    exposureEvCameraJpeg = jpegEv,
                     clippedFraction = st.clippedFraction,
                     outSize = Dim(outWidth, outHeight),
                     timingsMs = timings
@@ -325,6 +341,7 @@ class ColourPipeline(context: Context) {
     companion object {
         const val LOOK_NAME = "Redline Standard"
         const val TONE_ASSET = "colour/standard_tone.json"
+        const val METERING_ASSET = "colour/metering.json"
         const val LUT_ASSET = "luts/redline_standard_preview_33.cube"
         const val SELF_CHECK_ASSET = "colour/self_check.json"
         val PROFILE_ASSETS = listOf("colour/baseline_profile.json")

@@ -456,7 +456,13 @@ class MainActivity : ComponentActivity() {
             val prepared = colourPipeline.prepare()
             runOnUiThread {
                 colourPrepared = prepared
-                updateColour { it.copy(nativeVersion = prepared.nativeVersion, selfCheck = prepared.selfCheck) }
+                updateColour {
+                    it.copy(
+                        nativeVersion = prepared.nativeVersion,
+                        selfCheck = prepared.selfCheck,
+                        meteringHoldoutMaeEv = prepared.metering?.holdoutMaeEv
+                    )
+                }
                 refreshColourAvailability()
             }
             // B22: the native burst merge on a synthetic burst with known shifts (CPU only, ~0.1-0.3 s).

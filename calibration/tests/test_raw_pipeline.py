@@ -26,6 +26,7 @@ from redline_cal.color import D65, XYZ_TO_SRGB
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ASSETS = os.path.join(ROOT, "app", "src", "main", "assets")
 CUBE = os.path.join(ASSETS, "luts", "redline_standard_preview_33.cube")
+METERING = os.path.join(ASSETS, "colour", "metering.json")
 PARITY_MAX_DE = 1.0
 NEUTRAL_MAX_CHROMA = 2.0
 
@@ -236,6 +237,9 @@ def test_native_matches_reference(tool, cal, tone, lut, white, cfa, shading, zoo
     st = rp.native_stats(tool, frame, ref_plan.crop, ref_plan.solve.neutral, ref_plan.solve.matrix)
     assert st["median_y"] == pytest.approx(ref_plan.stats["median_y"], rel=1e-4)
     assert st["clipped_fraction"] == pytest.approx(ref_plan.stats["clipped_fraction"], abs=1e-6)
+    assert st["p98_y"] == pytest.approx(ref_plan.stats["p98_y"], rel=1e-4)  # B23c: the metering fit's input
+    metered = rp.plan_shot(frame, cal, n, tone, zoom=zoom, long_px=long_px, stats=st, metering=rp.load_metering(METERING))
+    assert metered.exposure_method == rp.METERING_METHOD
     plan = rp.plan_shot(frame, cal, n, tone, zoom=zoom, long_px=long_px, target_encoded=0.46, stats=st)
     img, _ = rp.native_render(tool, frame, plan, CUBE, threads=3)
     assert img.shape[:2] == (ref_plan.out_size[1], ref_plan.out_size[0])
@@ -272,3 +276,36 @@ def test_native_self_check_frame(tool, tone):
     exp = np.frombuffer(base64.b64decode(sc["expected"]["rgb8_b64"]), np.uint8).reshape(oh, ow, 3) / 255.0
     assert np.abs(exp - img).max() <= 1.0 / 255 + 1e-9  # the 8-bit expectation, within one code value
     assert math.isfinite(st["median_y"])
+
+
+# ----------------------------------------------------------------------------------------------- B23c metering
+
+
+def test_metering_asset_and_solve(tone):
+    m = rp.load_metering(METERING)
+    assert m.coef[1] < 0  # higher-contrast scenes (bright highlights over the median) are placed lower
+    lo, hi = m.hi_range
+    assert 0 <= lo < hi
+    # A flat scene (p98 = 2x median) and a contrasty one (p98 = 32x median), same median: the contrasty one darker.
+    ev_flat, method = rp.solve_exposure_metered(tone, 0.02, 0.04, m)
+    ev_hard, _ = rp.solve_exposure_metered(tone, 0.02, 0.64, m)
+    assert method == rp.METERING_METHOD
+    assert ev_hard < ev_flat
+    assert ev_flat - ev_hard == pytest.approx(-m.coef[1] * (min(5.0, hi) - max(1.0, lo)), abs=1e-9)
+    # Exposure does not change the decision: the same scene at half the level gets one EV more gain.
+    assert rp.solve_exposure_metered(tone, 0.01, 0.32, m)[0] == pytest.approx(ev_hard + 1.0, abs=1e-9)
+    # Missing p98: the constant fit; no signal: no gain.
+    ev_c, method_c = rp.solve_exposure_metered(tone, 0.02, None, m)
+    assert method_c == rp.METERING_CONSTANT_METHOD
+    assert ev_c == pytest.approx(m.fallback_target_ev - math.log2(0.02))
+    assert rp.solve_exposure_metered(tone, 0.0, 0.1, m) == (0.0, "no_signal")
+    # Beyond the training range the spread is clamped (no extrapolation).
+    assert rp.solve_exposure_metered(tone, 0.001, 1.0, m)[0] == pytest.approx(
+        rp.solve_exposure_metered(tone, 0.001, 0.001 * 2.0**hi, m)[0], abs=1e-9)
+
+
+def test_upper_quantile_is_the_native_order_statistic():
+    v = np.arange(101, dtype=float)[::-1]
+    assert rp.upper_quantile(v) == 98.0
+    assert rp.upper_quantile(np.array([3.0])) == 3.0
+    assert rp.upper_quantile(np.arange(10.0)) == 8.0  # floor(0.98 * 9) = 8

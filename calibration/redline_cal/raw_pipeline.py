@@ -22,8 +22,11 @@ Per pixel, in order:
 6. resample    area (box) downscale in linear light to the output size.
 7. curve       y = C(g * lin) per channel: the fitted Standard tone curve (B03) up to the knee at -1.5 EV, then a
                highlight shoulder that rolls off to exactly 1.0 at the sensor clip (g * 1.0), matching the fitted
-               slope at the knee. ``g`` is the exposure gain: the camera JPEG's median luma, inverted through the
-               fitted tone curve, over the RAW frame's median luminance.
+               slope at the knee. ``g`` is the exposure gain. B23c: the mid-tone target is fitted from the R5 II
+               dataset (``redline_cal.metering``, asset ``colour/metering.json``): target EV = c0 + c1 * clamp(
+               log2(p98 / median)), and g = target - log2(median), so high-contrast scenes are placed lower, as the
+               R5 II's JPEGs place them. Before B23c: the camera JPEG's median luma, inverted through the fitted tone
+               curve, over the RAW frame's median luminance (``solve_exposure``, still used by the self-check).
 8. look        33^3 residual LUT (trilinear) -> sRGB-encoded output.
 """
 from __future__ import annotations
@@ -212,6 +215,51 @@ def solve_exposure(tone: np.ndarray, median_y: float, target_encoded: float | No
     return float(min(max(ev, EXPOSURE_MIN_EV), EXPOSURE_MAX_EV)), method
 
 
+METERING_METHOD = "r5ii_metering_fit"
+METERING_CONSTANT_METHOD = "r5ii_metering_constant"
+P98 = 0.98  # upper quantile of the stats pass: the order statistic at floor(0.98 * (n - 1))
+
+
+@dataclass
+class Metering:
+    """B23c metering model fitted from R5 II RAW + camera JPEG pairs (see ``redline_cal.metering``)."""
+
+    coef: tuple[float, float]           # target EV = coef[0] + coef[1] * hi
+    hi_range: tuple[float, float]       # hi = log2(p98 / median), clamped to the training range
+    fallback_target_ev: float           # constant model, used when the frame has no usable p98
+
+    def target(self, median_y: float, p98_y: float | None) -> tuple[float, str]:
+        if p98_y is None or not (math.isfinite(p98_y) and p98_y > 0 and median_y > 0):
+            return float(self.fallback_target_ev), METERING_CONSTANT_METHOD
+        hi = min(max(math.log2(max(p98_y, median_y) / median_y), self.hi_range[0]), self.hi_range[1])
+        return float(self.coef[0] + self.coef[1] * hi), METERING_METHOD
+
+
+def load_metering(path: str) -> Metering:
+    with open(path) as f:
+        m = json.load(f)
+    if m.get("model") != "r5ii_metering v1":
+        raise ValueError("unexpected metering model")
+    return Metering(tuple(m["coef"]), tuple(m["hi_range"]), float(m["fallback_target_ev"]))
+
+
+def solve_exposure_metered(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering) -> tuple[float, str]:
+    """B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee)."""
+    if not (median_y > 1e-6 and math.isfinite(median_y)):
+        return 0.0, "no_signal"
+    target, method = metering.target(median_y, p98_y)
+    y_knee = float(np.interp(KNEE_EV, np.linspace(EV_MIN, EV_MAX, len(tone)), tone))
+    target = min(target, invert_fitted(tone, y_knee - 1e-3))
+    ev = target - math.log2(median_y)
+    return float(min(max(ev, EXPOSURE_MIN_EV), EXPOSURE_MAX_EV)), method
+
+
+def upper_quantile(values: np.ndarray, q: float = P98) -> float:
+    """The order statistic at floor(q * (n - 1)) (what the native stats pass computes with nth_element)."""
+    v = np.sort(np.asarray(values, float).reshape(-1))
+    return float(v[int(math.floor(q * (len(v) - 1)))])
+
+
 def jpeg_median_encoded(rgb_encoded: np.ndarray) -> float:
     """Median luma of an sRGB-encoded image, encoded (what Kotlin computes from the decoded camera JPEG)."""
     y = srgb_decode(np.asarray(rgb_encoded, float).reshape(-1, 3)) @ LUMA
@@ -377,7 +425,8 @@ def raw_stats(frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) ->
     clipped = float(np.mean(np.any(c >= 1.0, axis=-1)))
     lin = np.clip(c, 0.0, 1.0) @ np.asarray(matrix, float).T
     yv = (lin @ LUMA).reshape(-1)
-    return {"median_y": float(np.median(yv)), "clipped_fraction": clipped, "cells": int(yv.size)}
+    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "clipped_fraction": clipped,
+            "cells": int(yv.size)}
 
 
 def render_linear(rgb_camera: np.ndarray, matrix, neutral, curve: ToneCurve, lut: np.ndarray) -> np.ndarray:
@@ -395,7 +444,8 @@ def linear_stats(rgb_camera: np.ndarray, neutral, matrix, step: int = 2 * STATS_
     clipped = float(np.mean(np.any(c >= 1.0, axis=-1)))
     lin = np.clip(c, 0.0, 1.0) @ np.asarray(matrix, float).T
     yv = (lin @ LUMA).reshape(-1)
-    return {"median_y": float(np.median(yv)), "clipped_fraction": clipped, "cells": int(yv.size)}
+    return {"median_y": float(np.median(yv)), "p98_y": upper_quantile(yv), "clipped_fraction": clipped,
+            "cells": int(yv.size)}
 
 
 def quantise8(rgb_encoded: np.ndarray) -> np.ndarray:
@@ -459,7 +509,8 @@ class ShotPlan:
 
 
 def plan_shot(frame: RawFrame, cal: dp.ColorCalibration, as_shot_neutral, tone: np.ndarray, *, zoom: float = 1.0,
-              long_px: int = 0, target_encoded: float | None = None, warmth: bool = True, stats: dict | None = None) -> ShotPlan:
+              long_px: int = 0, target_encoded: float | None = None, warmth: bool = True, stats: dict | None = None,
+              metering: Metering | None = None) -> ShotPlan:
     """Per-shot decisions (what Kotlin ``ColourMath`` does on the phone). ``stats`` lets a caller supply the
     native statistics so the native render is planned exactly as the app plans it."""
     solve = solve_colour(cal, as_shot_neutral, warmth)
@@ -467,7 +518,10 @@ def plan_shot(frame: RawFrame, cal: dp.ColorCalibration, as_shot_neutral, tone: 
     crop = crop_32(w, h, zoom)
     if stats is None:
         stats = raw_stats(frame, crop, solve.neutral, solve.matrix)
-    ev, method = solve_exposure(tone, stats["median_y"], target_encoded)
+    if metering is not None:
+        ev, method = solve_exposure_metered(tone, stats["median_y"], stats.get("p98_y"), metering)
+    else:
+        ev, method = solve_exposure(tone, stats["median_y"], target_encoded)
     curve = ToneCurve(tone, 2.0**ev)
     return ShotPlan(solve, crop, output_size(crop[2], crop[3], long_px), stats, ev, method, curve)
 
@@ -514,7 +568,10 @@ def native_stats(tool: str, frame: RawFrame, crop, neutral, matrix, step: int = 
         with open(p, "w") as f:
             f.write("\n".join(lines) + "\n")
         out = subprocess.run([tool, "stats", p], check=True, capture_output=True, text=True).stdout.split()
-    return {"median_y": float(out[0]), "clipped_fraction": float(out[1]), "cells": int(out[2])}
+    st = {"median_y": float(out[0]), "clipped_fraction": float(out[1]), "cells": int(out[2])}
+    if len(out) > 3:
+        st["p98_y"] = float(out[3])
+    return st
 
 
 def native_render(tool: str, frame: RawFrame, plan: ShotPlan, cube_path: str, threads: int = 4,

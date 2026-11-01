@@ -35,6 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 ASSETS = os.path.join(ROOT, "app", "src", "main", "assets")
 PROFILE = os.path.join(ASSETS, "colour", "baseline_profile.json")
 TONE = os.path.join(ASSETS, "colour", "standard_tone.json")
+METERING = os.path.join(ASSETS, "colour", "metering.json")
 CUBE = os.path.join(ASSETS, "luts", "redline_standard_preview_33.cube")
 CASES_OUT = os.path.join(ROOT, "app", "src", "test", "resources", "colour", "colour_math_cases.json")
 SELF_CHECK_OUT = os.path.join(ASSETS, "colour", "self_check.json")
@@ -110,6 +111,15 @@ def colour_math_cases() -> dict:
         ev, method = rp.solve_exposure(tone, med, target)
         exp.append({"median_y": med, "target": target, "ev": ev, "method": method})
     out["exposure"] = exp
+    # B23c: the R5 II metering fit (asset colour/metering.json), as the app reads it.
+    met = rp.load_metering(METERING)
+    out["metering_model"] = json.load(open(METERING))
+    mexp = []
+    for med, p98 in ((0.02, 0.04), (0.02, 0.64), (0.01, 0.32), (0.02, None), (0.0, 0.1), (0.001, 1.0), (0.3, 0.31),
+                     (0.05, 0.05), (1e-5, 0.9)):
+        ev, method = rp.solve_exposure_metered(tone, med, p98, met)
+        mexp.append({"median_y": med, "p98_y": p98, "ev": ev, "method": method})
+    out["metering"] = mexp
     rng = np.random.default_rng(7)
     jm = []
     for n in (1, 2, 7, 64):

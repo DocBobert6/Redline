@@ -35,6 +35,12 @@ object ShotPlanner {
         return Tone(e, ColourMath.ToneCurve(tone, Math.pow(2.0, e.ev)))
     }
 
+    /** B23c: the shot's tone from the R5 II metering fit (the frame's own median and p98). */
+    fun meteredTone(tone: DoubleArray, medianY: Double, p98Y: Double, metering: ColourMath.Metering): Tone {
+        val e = ColourMath.solveExposureMetered(tone, medianY, p98Y, metering)
+        return Tone(e, ColourMath.ToneCurve(tone, Math.pow(2.0, e.ev)))
+    }
+
     fun floats(d: DoubleArray): FloatArray = FloatArray(d.size) { d[it].toFloat() }
 }
 
@@ -48,6 +54,8 @@ data class ColourShot(
     val exposureEv: Double? = null,
     val exposureMethod: String? = null,
     val jpegMedian: Double? = null,
+    /** B23c: the gain the pre-B23c method (match the camera JPEG's median) would have used, for comparison only. */
+    val exposureEvCameraJpeg: Double? = null,
     val clippedFraction: Double? = null,
     val outSize: Dim? = null,
     /** Stage timings in ms: jpeg_median, stats, plan, render, encode (filled by the saver), total. */
@@ -62,6 +70,7 @@ data class ColourShot(
         "exposure_ev" to exposureEv?.let { r3(it) },
         "exposure_method" to exposureMethod,
         "camera_jpeg_median" to jpegMedian?.let { r3(it) },
+        "exposure_ev_camera_jpeg_method" to exposureEvCameraJpeg?.let { r3(it) },
         "clipped_fraction" to clippedFraction?.let { r3(it) },
         "out_size" to outSize?.toString(),
         "timings_ms" to timingsMs
@@ -112,8 +121,12 @@ data class ColourPipelineReport(
     val maxRenderMs: Long = 0,
     val totalShotMs: Long = 0,
     val last: ColourShot? = null,
-    val sessionRawUnavailable: String? = null
+    val sessionRawUnavailable: String? = null,
+    /** B23c: how stills are metered (the method of the last rendered shot, else the configured one). */
+    val meteringHoldoutMaeEv: Double? = null
 ) {
+    val exposureMethod: String get() = last?.exposureMethod?.takeIf { last.rendered } ?: ColourMath.METERING_METHOD
+
     /** What the shutter does: render through the pipeline (RAW is then always in the session). */
     val enabled: Boolean get() = userSetting && available == true && sessionRawUnavailable == null
 
@@ -151,6 +164,9 @@ data class ColourPipelineReport(
         "native_version" to nativeVersion,
         "profile_source" to profileSource,
         "profile_id" to profileId,
+        "exposure_method" to exposureMethod,
+        "metering" to METERING_LABEL,
+        "metering_holdout_mae_ev" to meteringHoldoutMaeEv,
         "self_check" to selfCheck?.let {
             linkedMapOf(
                 "mean_de2000" to it.meanDe2000?.let { v -> r4(v) },
@@ -176,6 +192,8 @@ data class ColourPipelineReport(
 
     companion object {
         const val LABEL = "RAW colour pipeline (B21): phone matrices -> XYZ -> Standard"
+        const val METERING_LABEL = "B23c: mid-tone target fitted from R5 II RAW + camera JPEG pairs " +
+            "(log2(p98/median) of the frame), not the phone JPEG's median"
     }
 }
 

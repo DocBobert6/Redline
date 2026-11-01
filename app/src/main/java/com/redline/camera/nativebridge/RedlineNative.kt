@@ -60,7 +60,12 @@ object RedlineNative {
         val shadingCols: Int
     )
 
-    class Stats(val medianY: Double, val clippedFraction: Double, val cells: Int)
+    /** B23c: [p98Y] is the 98th-percentile luminance (order statistic), for the R5 II metering fit; NaN if absent. */
+    class Stats(val medianY: Double, val clippedFraction: Double, val cells: Int, val p98Y: Double = Double.NaN) {
+        companion object {
+            fun of(r: FloatArray): Stats = Stats(r[0].toDouble(), r[1].toDouble(), r[2].toInt(), r.getOrNull(3)?.toDouble() ?: Double.NaN)
+        }
+    }
 
     /** Exposure statistics over [crop] (left, top, width, height). Throws IllegalArgumentException on bad input. */
     fun rawStats(f: RawFrame, crop: IntArray, matrix: FloatArray, neutral: FloatArray, step: Int): Stats {
@@ -69,7 +74,7 @@ object RedlineNative {
             f.buffer, f.width, f.height, f.rowStrideBytes, f.cfa, f.black, f.white, f.shading, f.shadingRows, f.shadingCols,
             crop, matrix, neutral, step
         )
-        return Stats(r[0].toDouble(), r[1].toDouble(), r[2].toInt())
+        return Stats.of(r)
     }
 
     /**
@@ -334,7 +339,7 @@ object RedlineNative {
         fun stats(matrix: FloatArray, neutral: FloatArray, step: Int): Stats {
             check(handle != 0L) { "merger closed" }
             val r = nativeSrStats(handle, matrix, neutral, step)
-            return Stats(r[0].toDouble(), r[1].toDouble(), r[2].toInt())
+            return Stats.of(r)
         }
 
         /** Renders the finished merge into [out] (ARGB_8888 at the output size) through B21 stages 4-8; null or the error. */
