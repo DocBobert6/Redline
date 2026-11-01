@@ -280,11 +280,25 @@ class ViewfinderController(
 
     @Volatile private var loadCapturing = 0
 
+    /** B23c: a burst's RAW frames are arriving (the shot capturing is a burst). */
+    @Volatile private var loadBurstCapturing = false
+
+    /** B23c: RAW holding queue occupancy, 0..1. */
+    @Volatile private var loadHoldingFill = 0.0
+
     /** B23b.1: loaded from a backlog of two until the queue is empty (see [GovernorLatch]). */
     private val governorLatch = GovernorLatch()
 
     private fun budget(maxThreads: Int): WorkerBudget =
-        WorkerGovernor.budget(viewfinderActive, loadProcessing, loadCapturing, maxThreads, governorLatch.latched)
+        WorkerGovernor.budget(
+            viewfinderActive,
+            loadProcessing,
+            loadCapturing,
+            maxThreads,
+            governorLatch.latched,
+            loadBurstCapturing,
+            loadHoldingFill
+        )
 
     /**
      * B22a: the streaming merge (single thread; the native pool works under it): frames are merged as they arrive,
@@ -332,6 +346,8 @@ class ViewfinderController(
     private fun syncLoad() {
         loadProcessing = jobs
         loadCapturing = waitingPresses.size + if (pending != null) 1 else 0
+        loadBurstCapturing = pending?.run != null
+        loadHoldingFill = WorkerGovernor.holdingFill(singlesPending, RawHoldingQueue.capacity(pool?.capacity ?: 0, burstsPending))
         governorLatch.update(viewfinderActive, loadProcessing + loadCapturing)
     }
     private val activityManager = context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -924,7 +940,16 @@ class ViewfinderController(
                 }
                 // B23b: thread budget from the work ahead of this burst (this shot is not counted yet).
                 val latched = governorLatch.latched
-                val threads = WorkerGovernor.budget(viewfinderActive, jobs, waitingPresses.size, mergeThreads, latched).threads
+                // B23c: this burst is about to capture, so the "burst capturing" condition holds for its own merge.
+                val threads = WorkerGovernor.budget(
+                    viewfinderActive,
+                    jobs,
+                    waitingPresses.size,
+                    mergeThreads,
+                    latched,
+                    burstCapturing = true,
+                    holdingFill = loadHoldingFill
+                ).threads
                 run = BurstRun(plan, slots.take(resident), if (dngSlot == 1) slots.last() else null, srSetup, threads)
             }
         }
@@ -1527,7 +1552,12 @@ class ViewfinderController(
             release = {
                 currentPool?.release(keep)
                 // B23b: a single RAW frame leaves the holding queue when its buffer goes back.
-                if (p.wantRaw) handler.post { singlesPending-- }
+                if (p.wantRaw) {
+                    handler.post {
+                        singlesPending--
+                        syncLoad()
+                    }
+                }
             }
         )
     }

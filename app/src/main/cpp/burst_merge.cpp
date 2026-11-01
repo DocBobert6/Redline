@@ -57,7 +57,7 @@ constexpr int kReferenceCandidates = 3;
 constexpr double kTileC = 2.0;
 constexpr double kPixK = 3.0;
 constexpr int kMaxThreads = 16;
-constexpr int kTailSlices = 16;      // B23b.1: slices per merge-tail job
+constexpr int kTailSlices = 16;      // B23b.1: slices per merge-tail job (B23c: a slice is only split off when an add waits)
 constexpr int kTailMaxWaitMs = 400;  // B23b.1: longest a tail slice waits for frame adds
 constexpr double kPi = 3.14159265358979323846;
 
@@ -114,6 +114,7 @@ void applyNice(int nice) {
 std::mutex gPrioMu;
 std::condition_variable gPrioCv;
 int gFrameWork = 0;
+std::atomic<int> gFrameWorkActive{0};  // B23c: lock-free mirror of gFrameWork, read by merge-tail slices
 
 void waitForFrameWork() {
     std::unique_lock<std::mutex> lk(gPrioMu);
@@ -210,18 +211,38 @@ private:
     std::atomic<int> next_{0};
 };
 
-// B23b.1: a merge-tail job (finish / gather) runs in [kTailSlices] slices and steps aside between them for frame adds.
+// B23b.1: a merge-tail job (finish / gather) steps aside for frame adds. B23c: it runs as one pool job while no add is
+// waiting; each of its [kTailSlices] slices checks first, and once an add is in progress the slices not yet started
+// are deferred, the pool job ends, the tail waits for the add, then runs the deferred slices the same way. So the
+// finish is only split when a frame add actually waits (alpha.3 split every tail job into 16 pool jobs).
 void parallelFor(int n, int threads, const std::function<void(int, int)>& body) {
     if (!tLaneTail || n < kTailSlices * 2) {
         WorkPool::get().run(n, threads, body);
         return;
     }
-    const int step = (n + kTailSlices - 1) / kTailSlices;
-    for (int a = 0; a < n; a += step) {
+    const int units = std::min(n, std::max(kTailSlices, std::min(threads, kMaxThreads) * 4));
+    const int step = (n + units - 1) / units;
+    std::vector<int> todo;
+    for (int a = 0; a < n; a += step) todo.push_back(a);
+    while (!todo.empty()) {
         waitForFrameWork();
-        const int b = std::min(n, a + step);
-        WorkPool::get().run(b - a, threads, [&body, a](int x, int y) { body(a + x, a + y); });
-        gTailSlices.fetch_add(1);
+        std::mutex deferMu;
+        std::vector<int> deferred;
+        const std::vector<int> run = std::move(todo);
+        WorkPool::get().run(static_cast<int>(run.size()), threads, [&](int i0, int i1) {
+            for (int i = i0; i < i1; ++i) {
+                const int a = run[static_cast<std::size_t>(i)];
+                if (gFrameWorkActive.load(std::memory_order_relaxed) > 0) {
+                    std::lock_guard<std::mutex> lk(deferMu);
+                    deferred.push_back(a);
+                    continue;
+                }
+                body(a, std::min(n, a + step));
+            }
+        });
+        std::sort(deferred.begin(), deferred.end());
+        if (!deferred.empty()) gTailSlices.fetch_add(1);
+        todo = std::move(deferred);
     }
 }
 
@@ -1184,12 +1205,14 @@ void burstSetLane(int nice, bool tail) {
 FrameWorkScope::FrameWorkScope() {
     std::lock_guard<std::mutex> lk(gPrioMu);
     ++gFrameWork;
+    gFrameWorkActive.fetch_add(1);
 }
 
 FrameWorkScope::~FrameWorkScope() {
     {
         std::lock_guard<std::mutex> lk(gPrioMu);
         --gFrameWork;
+        gFrameWorkActive.fetch_sub(1);
     }
     gPrioCv.notify_all();
 }
