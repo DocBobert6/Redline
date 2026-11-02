@@ -234,6 +234,28 @@ void testStripsMatchFullCopy() {
         check(redline::applyDetail(img.data(), k.w, k.h, static_cast<std::size_t>(k.w) * 4, s, st).empty(), "strip distortion ok");
         refDistort(ref, k.w, k.h, k.a, k.b, k.c);
         check(img == ref, "strip distortion is bit-identical to the full-copy version");
+        if (img != ref) {
+            std::size_t n = 0, first = img.size();
+            int maxd = 0;
+            for (std::size_t i = 0; i < img.size(); ++i) {
+                if (img[i] != ref[i]) {
+                    ++n;
+                    first = std::min(first, i);
+                    maxd = std::max(maxd, std::abs(static_cast<int>(img[i]) - static_cast<int>(ref[i])));
+                }
+            }
+            const std::size_t px = first / 4;
+            std::printf("  case %dx%d t%d: %zu bytes differ (max %d), first at x %zu y %zu ch %zu: %d vs %d, scale %.6f\n", k.w, k.h,
+                        k.threads, n, maxd, px % static_cast<std::size_t>(k.w), px / static_cast<std::size_t>(k.w), first % 4,
+                        img[first], ref[first], st.distortScale);
+            auto one = noisy(k.w, k.h, 7u + static_cast<unsigned>(k.w));
+            redline::DetailSpec s1 = s;
+            s1.threads = 1;
+            redline::DetailStats st1;
+            redline::applyDetail(one.data(), k.w, k.h, static_cast<std::size_t>(k.w) * 4, s1, st1);
+            std::printf("  one thread: %s the strip result, %s the reference\n", one == img ? "same as" : "differs from",
+                        one == ref ? "same as" : "differs from");
+        }
         check(st.peakBytes < 0.25 * k.w * k.h * 4 + 64 * 1024, "strip distortion holds far less than a frame copy");
     }
     // Sharpening: the result does not depend on the band count (bands meet at halo rows) and holds no full plane.
