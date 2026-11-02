@@ -56,7 +56,10 @@ target_link_libraries(superres_tool PRIVATE Threads::Threads)
 # B24 detail post-pass (distortion, sharpening, grain): invariants (CTest) and the host tool the Python parity test drives.
 add_executable(detail_test detail_test.cpp ${NATIVE_SRC}/detail.cpp)
 target_include_directories(detail_test PRIVATE ${NATIVE_SRC})
-target_compile_options(detail_test PRIVATE -Wall -Wextra -Werror -O3)
+# B24.1: strict per-statement IEEE evaluation, so the strip stages can be compared bit for bit with the full-copy
+# reference in the test (GCC contracts a*b+c across statements by default where FMA is available; the app's NDK clang
+# contracts only within an expression, and there the strip stages match B24 exactly).
+target_compile_options(detail_test PRIVATE -Wall -Wextra -Werror -O3 -ffp-contract=off)
 target_link_libraries(detail_test PRIVATE Threads::Threads)
 add_test(NAME detail COMMAND detail_test)
 
