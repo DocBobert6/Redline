@@ -367,8 +367,11 @@ object ColourMath {
         return grid[i] + (grid[i + 1] - grid[i]) * (y - t[i]) / (t[i + 1] - t[i])
     }
 
-    /** [headroomLiftEv]: B23c.1, what the metering headroom lift added to [ev] (after the knee and gain clamps). */
-    class Exposure(val ev: Double, val method: String, val headroomLiftEv: Double = 0.0)
+    /**
+     * [headroomLiftEv]: B23c.1, what the metering headroom lift added to [ev] (after the knee and gain clamps). [spotShiftEv]:
+     * B24b, what the tapped region moved [ev] (after the clamps).
+     */
+    class Exposure(val ev: Double, val method: String, val headroomLiftEv: Double = 0.0, val spotShiftEv: Double = 0.0)
 
     /** Exposure gain (log2) that puts the RAW frame's median luminance where the camera JPEG's median sits. */
     fun solveExposure(tone: DoubleArray, medianY: Double, targetEncoded: Double?): Exposure {
@@ -398,7 +401,8 @@ object ColourMath {
         val hiRange: DoubleArray,
         val fallbackTargetEv: Double,
         val holdoutMaeEv: Double? = null,
-        val headroom: Headroom? = null
+        val headroom: Headroom? = null,
+        val spot: Spot? = null
     ) {
         fun target(medianY: Double, p98Y: Double): Exposure {
             if (!(p98Y.isFinite() && p98Y > 0 && medianY > 0)) return Exposure(fallbackTargetEv, METERING_CONSTANT_METHOD)
@@ -420,7 +424,11 @@ object ColourMath {
                     fun d(k: String) = (h[k] as Number).toDouble()
                     Headroom(d("p98_floor_ev"), d("split_min_ev"), d("lift_max_ev"), d("clipped_max"))
                 }
-                return Metering(coef, range, (m["fallback_target_ev"] as Number).toDouble(), mae, head)
+                val spot = (m["spot"] as? Map<*, *>)?.let { sp ->
+                    fun d(k: String) = (sp[k] as Number).toDouble()
+                    Spot(d("w_brighter"), d("w_darker"), d("cap_ev"), d("region_short_side"))
+                }
+                return Metering(coef, range, (m["fallback_target_ev"] as Number).toDouble(), mae, head, spot)
             }
         }
     }
@@ -441,6 +449,21 @@ object ColourMath {
         }
     }
 
+    /**
+     * B24b touch metering (reference ``raw_pipeline.Spot``, fitted from the AF point of the R5 II pairs): with
+     * d = log2(frame median / tapped-region median), the mid-tone target moves by
+     * [wBrighter] * clamp(d, -[capEv], 0) + [wDarker] * clamp(d, 0, [capEv]), a log-domain blend of the region median into
+     * the frame median. The R5 II holds a bright AF subject down (~0.25) and does not lift a dark one (0).
+     * [regionShortSide]: the tap region's side as a fraction of the frame's short side (median R5 II AF area).
+     */
+    class Spot(val wBrighter: Double, val wDarker: Double, val capEv: Double, val regionShortSide: Double) {
+        fun shift(medianY: Double, regionMedianY: Double): Double {
+            if (!(regionMedianY.isFinite() && regionMedianY > 0 && medianY > 0)) return 0.0
+            val d = log2(medianY / regionMedianY)
+            return wBrighter * d.coerceIn(-capEv, 0.0) + wDarker * d.coerceIn(0.0, capEv)
+        }
+    }
+
     /** log2(p98 / median), the metering fit's feature (not clamped). */
     fun sceneHi(medianY: Double, p98Y: Double): Double = log2(max(p98Y, medianY) / medianY)
 
@@ -451,7 +474,8 @@ object ColourMath {
 
     /**
      * B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee);
-     * B23c.1: plus the headroom lift when the metering carries one and the frame qualifies.
+     * B23c.1: plus the headroom lift when the metering carries one and the frame qualifies; B24b: plus the touch-metering
+     * shift when a region was tapped ([regionMedianY], NaN = none) and the metering carries a spot model.
      */
     fun solveExposureMetered(
         tone: DoubleArray,
@@ -459,7 +483,8 @@ object ColourMath {
         p98Y: Double,
         metering: Metering,
         p25Y: Double = Double.NaN,
-        clippedFraction: Double = Double.NaN
+        clippedFraction: Double = Double.NaN,
+        regionMedianY: Double = Double.NaN
     ): Exposure {
         if (!(medianY > 1e-6 && medianY.isFinite())) return Exposure(0.0, "no_signal")
         val t = metering.target(medianY, p98Y)
@@ -468,8 +493,10 @@ object ColourMath {
         val yKnee = interpUniform(KNEE_EV, EV_MIN, EV_MAX, tone)
         val kneeT = invertFitted(tone, yKnee - 1e-3)
         fun gain(target: Double) = (min(target, kneeT) - log2(medianY)).coerceIn(EXPOSURE_MIN_EV, EXPOSURE_MAX_EV)
-        val ev = gain(t.ev + lift)
-        return Exposure(ev, t.method, if (lift > 0) ev - gain(t.ev) else 0.0)
+        val shift = metering.spot?.shift(medianY, regionMedianY) ?: 0.0
+        val base = gain(t.ev + lift)
+        val ev = gain(t.ev + lift + shift)
+        return Exposure(ev, t.method, if (lift > 0) base - gain(t.ev) else 0.0, if (shift != 0.0) ev - base else 0.0)
     }
 
     /** Median luma of sRGB-encoded pixels (0..255 per channel, RGB triples), encoded. */

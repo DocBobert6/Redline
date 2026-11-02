@@ -77,6 +77,18 @@ The same run re-checks the shipped tone curve on the hold-out on matched scenes 
 
 **B23c.1 headroom lift.** The fit sees only `log2(p98/median)`. When the median sits in a dominant bright region (overcast sky filling half the frame over dark asphalt, a sunlit wall over shade) that spread is tiny and the fit places the bright region like a flat mid-tone, about 1 EV under the R5 II. On the train pairs, the R5 II lifts exactly those frames: the ones whose darkest quarter sits far below the median (`log2(median/p25)` large). The same run fits `raw_pipeline.Headroom` on the train split (`fit_headroom`: grid over the p98 floor on the tone curve's input axis and the split gate, the cap is the fit's largest under-placement on train), scores it once on the hold-out (`headroom` in the report) and writes it to the asset's `headroom` block. Frames that are clipping (> 2 %) or whose p98 already reaches the floor are unchanged. The stats pass also returns p25 for it.
 
+## B24b: touch metering weight from the R5 II's AF point
+
+```bash
+exiftool -j -n -AFAreaMode -ValidAFPoints -AFImageWidth -AFImageHeight -AFAreaWidths -AFAreaHeights \
+  -AFAreaXPositions -AFAreaYPositions -AFPointsInFocus -Orientation -@ raws.txt > out/af_exif.json
+python -m redline_cal.spot_metering out/manifest.jsonl --exif out/exif.json --af out/af_exif.json \
+  --tone ../app/src/main/assets/colour/standard_tone.json --metering ../app/src/main/assets/colour/metering.json \
+  --cache out/metering_cache --out out/spot --asset ../app/src/main/assets/colour/metering.json
+```
+
+Every pair is evaluative metering, which Canon links to the AF point, and the CR3 MakerNotes record the AF area. Per pair, `d = log2(frame median / AF-area median)` on the B23c block cache and the shipped metering's residual give the weight directly: no chart, no guessed spot weight. The fit (train 71, hold-out 17, d capped at 1 EV) is asymmetric: a bright AF subject pulls the exposure down with slope 0.25 (bootstrap 5-95 % 0.08-0.44); a dark one does not lift it (slope -0.02, -0.14-0.11), so `w_darker` ships as 0. Hold-out mean |error| 0.391 -> 0.376 EV. The tap region's side (0.11 of the frame's short side) is the median R5 II AF area. The app reads `spot` from `colour/metering.json` (`raw_pipeline.Spot`, Kotlin `ColourMath.Spot`).
+
 ## Tests
 
 ```bash

@@ -25,5 +25,29 @@
   "holdout_mae_ev": 0.43,
   "holdout_median_abs_ev": 0.298,
   "holdout_mae_ev_default_target": 0.734
+ },
+ "spot": {
+  "model": "r5ii_af_spot v1",
+  "description": "B24b touch metering: d = log2(frame median / tapped-region median); the mid-tone target moves by w_brighter * clamp(d, -cap_ev, 0) + w_darker * clamp(d, 0, cap_ev) (a log-domain blend of the region median into the frame median). Fitted from the AF point of the R5 II pairs (evaluative metering, AF-linked; redline_cal.spot_metering): the R5 II holds a bright AF subject down but does not lift a dark one. region_short_side: tap region side / frame short side (median R5 II AF area).",
+  "w_brighter": 0.25,
+  "w_darker": 0.0,
+  "cap_ev": 1.0,
+  "region_short_side": 0.109,
+  "fit": {
+   "pairs_train": 71,
+   "pairs_holdout": 17,
+   "w_brighter_fit": 0.2519,
+   "w_darker_fit": -0.0209,
+   "bootstrap_p5": [
+    0.0778,
+    -0.1396
+   ],
+   "bootstrap_p95": [
+    0.4416,
+    0.1149
+   ],
+   "holdout_mae_ev_before": 0.3909,
+   "holdout_mae_ev_after": 0.3763
+  }
  }
 }

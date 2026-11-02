@@ -71,9 +71,15 @@ import com.redline.camera.ui.DETAIL_SHARPEN
 import com.redline.camera.ui.DETAIL_VIGNETTE
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
+import com.redline.camera.ui.TouchBoxUi
 import com.redline.camera.ui.ViewfinderScreen
 import com.redline.camera.viewfinder.LookRenderSize
 import com.redline.camera.viewfinder.PreviewLoadReading
+import com.redline.camera.viewfinder.PreviewTextureView
+import com.redline.camera.viewfinder.TouchFocusReport
+import com.redline.camera.viewfinder.TouchGeometry
+import com.redline.camera.viewfinder.TouchMapping
+import com.redline.camera.viewfinder.TouchMode
 import com.redline.camera.viewfinder.ViewfinderController
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ViewfinderSetup
@@ -131,6 +137,9 @@ class MainActivity : ComponentActivity() {
     private val liveText = mutableStateOf<String?>(null)
     private var lastAuto: ViewfinderController.ResultValues? = null
     private var previewView: TextureView? = null
+
+    /** B24b: the latest touch-focus state (the AF point on the preview). */
+    private val touchFocus = mutableStateOf<TouchFocusReport?>(null)
     private var histBitmap: Bitmap? = null
     private val histPixels = IntArray(HIST_W * HIST_H)
     private var sensorManager: SensorManager? = null
@@ -394,6 +403,13 @@ class MainActivity : ComponentActivity() {
 
         override fun onMergeWorker(threads: Int, nice: Int) {
             updateBurst { it.copy(workerThreads = threads, workerNice = nice) }
+        }
+
+        override fun onTouchFocus(report: TouchFocusReport) {
+            runOnUiThread {
+                touchFocus.value = report
+                update { it.copy(touchFocus = report) }
+            }
         }
 
         override fun onRawUnavailable(reason: String) {
@@ -695,7 +711,9 @@ class MainActivity : ComponentActivity() {
                 ),
                 manualActions = manualActions,
                 onPreviewView = { previewView = it },
-                lookBadge = if (state.value.lookPreview.active) LOOK_BADGE else null
+                lookBadge = if (state.value.lookPreview.active) LOOK_BADGE else null,
+                onTapFrame = if (setup?.touch?.enabled == true && streaming.value) ::tapFrame else null,
+                touchBox = touchFocus.value?.let { touchBox(it) }
             )
         } else {
             CapabilityScreen(
@@ -1106,6 +1124,59 @@ class MainActivity : ComponentActivity() {
             shoot(keep = false) { next() }
         }
         next()
+    }
+
+    /** B24b: the tap geometry of the preview as laid out now (the box's size, the display rotation), or null. */
+    private fun touchGeometry(): TouchGeometry? {
+        val setup = setupState.value ?: return null
+        val v = previewView ?: return null
+        val active = setup.activeArray ?: return null
+        if (v.width <= 0 || v.height <= 0) return null
+        val rotation = (v as? PreviewTextureView)?.displayRotationDegrees() ?: 0
+        return TouchGeometry(
+            v.width.toDouble(),
+            v.height.toDouble(),
+            setup.previewSize.width,
+            setup.previewSize.height,
+            setup.sensorOrientation,
+            rotation,
+            setup.frontFacing,
+            active.width(),
+            active.height()
+        )
+    }
+
+    /** B24b: a tap or long-press on the preview, mapped to the stop's 3:2 frame (sensor orientation). */
+    private fun tapFrame(x: Float, y: Float, long: Boolean) {
+        val g = touchGeometry() ?: return
+        val (px, py) = TouchMapping.viewToFov(x.toDouble(), y.toDouble(), g)
+        val (fx, fy) = TouchMapping.fovToFrame(px, py, g.activeW, g.activeH)
+        controller.tapFocus(fx, fy, long)
+    }
+
+    /** B24b: the AF point in the preview box's pixels (where the region really is, after it was kept inside the frame). */
+    private fun touchBox(r: TouchFocusReport): TouchBoxUi? {
+        val region = r.region ?: return null
+        val g = touchGeometry() ?: return null
+        val fov = TouchMapping.regionInFov(region, g.activeW, g.activeH)
+        val a = TouchMapping.fovToView(fov.left, fov.top, g)
+        val b = TouchMapping.fovToView(fov.right, fov.bottom, g)
+        val lock = when {
+            !r.locked -> null
+            r.aeLocked && r.caps.af -> "AE/AF L"
+            r.aeLocked -> "AE L"
+            r.caps.af -> "AF L"
+            else -> null
+        }
+        val mode = if (r.mode == TouchMode.AUTO) return null else r.mode.name
+        return TouchBoxUi(
+            minOf(a.first, b.first).toFloat(),
+            minOf(a.second, b.second).toFloat(),
+            maxOf(a.first, b.first).toFloat(),
+            maxOf(a.second, b.second).toFloat(),
+            mode,
+            lock
+        )
     }
 
     private fun selectStop(mm: Int) {

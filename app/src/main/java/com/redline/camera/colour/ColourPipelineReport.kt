@@ -43,9 +43,10 @@ object ShotPlanner {
         p98Y: Double,
         metering: ColourMath.Metering,
         p25Y: Double = Double.NaN,
-        clippedFraction: Double = Double.NaN
+        clippedFraction: Double = Double.NaN,
+        regionMedianY: Double = Double.NaN
     ): Tone {
-        val e = ColourMath.solveExposureMetered(tone, medianY, p98Y, metering, p25Y, clippedFraction)
+        val e = ColourMath.solveExposureMetered(tone, medianY, p98Y, metering, p25Y, clippedFraction, regionMedianY)
         return Tone(e, ColourMath.ToneCurve(tone, Math.pow(2.0, e.ev)))
     }
 
@@ -71,6 +72,8 @@ data class ColourShot(
     val p98Y: Double? = null,
     val sceneHiEv: Double? = null,
     val sceneSplitEv: Double? = null,
+    /** B24b: the tapped region's metering (null: no tap). */
+    val spot: SpotShot? = null,
     val outSize: Dim? = null,
     /** Stage timings in ms: jpeg_median, stats, plan, render, encode (filled by the saver), total. */
     val timingsMs: Map<String, Long> = emptyMap(),
@@ -94,11 +97,26 @@ data class ColourShot(
         "p98_y" to p98Y?.let { r4(it) },
         "scene_hi_ev" to sceneHiEv?.let { r3(it) },
         "scene_split_ev" to sceneSplitEv?.let { r3(it) },
+        "spot_metering" to spot?.toMap(),
         "out_size" to outSize?.toString(),
         "timings_ms" to timingsMs,
         "iso" to iso,
         "picture_style" to detail?.pictureStyle,
         "detail" to detail?.toMap()
+    )
+}
+
+/**
+ * B24b: touch metering on one still: the tapped region in the render's pixels (left, top, width, height), its median
+ * luminance, d = log2(frame median / region median) (> 0: the subject is darker) and what it moved the exposure.
+ */
+data class SpotShot(val regionPx: List<Int>, val regionMedianY: Double, val dEv: Double?, val shiftEv: Double, val samples: Int) {
+    fun toMap(): Map<String, Any?> = linkedMapOf(
+        "region_px" to regionPx,
+        "region_median_y" to Math.round(regionMedianY * 1e5) / 1e5,
+        "d_ev" to dEv?.let { Math.round(it * 1000.0) / 1000.0 },
+        "shift_ev" to Math.round(shiftEv * 1000.0) / 1000.0,
+        "samples" to samples
     )
 }
 

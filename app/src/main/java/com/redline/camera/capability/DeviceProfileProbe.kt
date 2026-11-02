@@ -117,7 +117,9 @@ class DeviceProfileProbe(private val context: Context) {
             extensions = extensions(id),
             colourCalibrationExposed = (listOf(ch) + lensSources.map { it.second }).any {
                 safe { it.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) } != null
-            }
+            },
+            maxRegionsAf = safe { ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) },
+            maxRegionsAe = safe { ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) }
         )
     }
 

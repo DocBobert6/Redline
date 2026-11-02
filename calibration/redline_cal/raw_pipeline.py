@@ -267,6 +267,30 @@ def scene_split(median_y: float, p25_y: float) -> float:
 
 
 @dataclass
+class Spot:
+    """B24b touch metering: how much a tapped region pulls the R5 II metering, fitted from the AF point of the R5 II
+    pairs (``redline_cal.spot_metering``; every pair is evaluative metering, which Canon links to the AF point).
+
+    ``d = log2(frame median / region median)`` (> 0: the tapped subject is darker than the frame). The region median
+    is blended into the frame median in the log domain, log2(m') = log2(m) - shift, which moves the mid-tone target by
+    ``shift = w_brighter * clamp(d, -cap_ev, 0) + w_darker * clamp(d, 0, cap_ev)``. The weights are asymmetric because
+    the data is: the R5 II holds a bright AF subject down (slope ~0.25) but does not lift a dark one (slope ~0).
+    ``region_short_side`` is the tap region's side as a fraction of the frame's short side (the R5 II pairs' median AF
+    area)."""
+
+    w_brighter: float
+    w_darker: float
+    cap_ev: float
+    region_short_side: float
+
+    def shift(self, median_y: float, region_median_y: float | None) -> float:
+        if region_median_y is None or not (math.isfinite(region_median_y) and region_median_y > 0 and median_y > 0):
+            return 0.0
+        d = math.log2(median_y / region_median_y)
+        return float(self.w_brighter * min(max(d, -self.cap_ev), 0.0) + self.w_darker * min(max(d, 0.0), self.cap_ev))
+
+
+@dataclass
 class Metering:
     """B23c metering model fitted from R5 II RAW + camera JPEG pairs (see ``redline_cal.metering``)."""
 
@@ -274,6 +298,7 @@ class Metering:
     hi_range: tuple[float, float]       # hi = log2(p98 / median), clamped to the training range
     fallback_target_ev: float           # constant model, used when the frame has no usable p98
     headroom: Headroom | None = None    # B23c.1
+    spot: Spot | None = None            # B24b
 
     def target(self, median_y: float, p98_y: float | None) -> tuple[float, str]:
         if p98_y is None or not (math.isfinite(p98_y) and p98_y > 0 and median_y > 0):
@@ -290,7 +315,10 @@ def load_metering(path: str) -> Metering:
     h = m.get("headroom")
     head = Headroom(float(h["p98_floor_ev"]), float(h["split_min_ev"]), float(h["lift_max_ev"]),
                     float(h["clipped_max"])) if h else None
-    return Metering(tuple(m["coef"]), tuple(m["hi_range"]), float(m["fallback_target_ev"]), head)
+    sp = m.get("spot")
+    spot = Spot(float(sp["w_brighter"]), float(sp["w_darker"]), float(sp["cap_ev"]),
+                float(sp["region_short_side"])) if sp else None
+    return Metering(tuple(m["coef"]), tuple(m["hi_range"]), float(m["fallback_target_ev"]), head, spot)
 
 
 @dataclass
@@ -298,26 +326,31 @@ class MeteredExposure:
     ev: float
     method: str
     headroom_lift_ev: float = 0.0  # B23c.1: what the headroom lift added to the gain (after the knee and gain clamps)
+    spot_shift_ev: float = 0.0     # B24b: what the tapped region moved the gain (after the knee and gain clamps)
 
 
 def metered_exposure(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering,
-                     p25_y: float | None = None, clipped_fraction: float | None = None) -> MeteredExposure:
+                     p25_y: float | None = None, clipped_fraction: float | None = None,
+                     region_median_y: float | None = None) -> MeteredExposure:
     """B23c: exposure gain (log2) that puts the frame's median at the R5 II metering target (kept below the knee);
-    B23c.1: plus the headroom lift when the metering carries one and the frame qualifies."""
+    B23c.1: plus the headroom lift when the metering carries one and the frame qualifies; B24b: plus the touch-metering
+    shift when a region was tapped (``region_median_y``) and the metering carries a spot model."""
     if not (median_y > 1e-6 and math.isfinite(median_y)):
         return MeteredExposure(0.0, "no_signal")
     target, method = metering.target(median_y, p98_y)
     lift = 0.0
     if metering.headroom is not None and method == METERING_METHOD:
         lift = metering.headroom.lift(target, median_y, p98_y, p25_y, clipped_fraction)
+    shift = metering.spot.shift(median_y, region_median_y) if metering.spot is not None else 0.0
     y_knee = float(np.interp(KNEE_EV, np.linspace(EV_MIN, EV_MAX, len(tone)), tone))
     knee_t = invert_fitted(tone, y_knee - 1e-3)
 
     def gain(t: float) -> float:
         return float(min(max(min(t, knee_t) - math.log2(median_y), EXPOSURE_MIN_EV), EXPOSURE_MAX_EV))
 
-    ev = gain(target + lift)
-    return MeteredExposure(ev, method, ev - gain(target) if lift > 0 else 0.0)
+    base = gain(target + lift)
+    ev = gain(target + lift + shift)
+    return MeteredExposure(ev, method, base - gain(target) if lift > 0 else 0.0, ev - base if shift != 0 else 0.0)
 
 
 def solve_exposure_metered(tone: np.ndarray, median_y: float, p98_y: float | None, metering: Metering,

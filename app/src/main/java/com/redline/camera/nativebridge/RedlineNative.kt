@@ -413,10 +413,13 @@ object RedlineNative {
             return srStats(nativeSrFinish(handle, shading, shadingRows, shadingCols))
         }
 
-        /** Exposure statistics of the finished merge (as [rawStats]). */
-        fun stats(matrix: FloatArray, neutral: FloatArray, step: Int): Stats {
+        /**
+         * Exposure statistics of the finished merge (as [rawStats]). B24b: [region] (left, top, width, height on the output
+         * grid) restricts them to a tapped region; null = the whole merge.
+         */
+        fun stats(matrix: FloatArray, neutral: FloatArray, step: Int, region: IntArray? = null): Stats {
             check(handle != 0L) { "merger closed" }
-            val r = nativeSrStats(handle, matrix, neutral, step)
+            val r = nativeSrStats(handle, matrix, neutral, step, region)
             return Stats.of(r)
         }
 
@@ -511,7 +514,7 @@ object RedlineNative {
     private external fun nativeSrFinish(handle: Long, shading: FloatArray?, shadingRows: Int, shadingCols: Int): FloatArray
 
     @JvmStatic
-    private external fun nativeSrStats(handle: Long, matrix: FloatArray, neutral: FloatArray, step: Int): FloatArray
+    private external fun nativeSrStats(handle: Long, matrix: FloatArray, neutral: FloatArray, step: Int, region: IntArray?): FloatArray
 
     @JvmStatic
     private external fun nativeSrRender(

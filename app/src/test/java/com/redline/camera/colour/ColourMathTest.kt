@@ -129,12 +129,32 @@ class ColourMathTest {
             val p98 = (c["p98_y"] as? Number)?.toDouble() ?: Double.NaN
             val p25 = (c["p25_y"] as? Number)?.toDouble() ?: Double.NaN
             val clipped = (c["clipped_fraction"] as? Number)?.toDouble() ?: Double.NaN
-            val e = ColourMath.solveExposureMetered(tone, d(c["median_y"]), p98, met, p25, clipped)
+            val region = (c["region_median_y"] as? Number)?.toDouble() ?: Double.NaN
+            val e = ColourMath.solveExposureMetered(tone, d(c["median_y"]), p98, met, p25, clipped, region)
             close("metered ${c["median_y"]} ${c["p98_y"]} ${c["p25_y"]}", d(c["ev"]), e.ev, rel = 1e-7, abs = 1e-9)
             assertEquals(c["method"], e.method)
             val lift = (c["headroom_lift_ev"] as? Number)?.toDouble() ?: 0.0
             close("headroom lift ${c["median_y"]} ${c["p25_y"]}", lift, e.headroomLiftEv, rel = 1e-7, abs = 1e-9)
+            val shift = (c["spot_shift_ev"] as? Number)?.toDouble() ?: 0.0
+            close("spot shift ${c["median_y"]} ${c["region_median_y"]}", shift, e.spotShiftEv, rel = 1e-7, abs = 1e-9)
         }
+    }
+
+    @Test
+    fun touchMeteringHoldsABrightSubjectDownAndNeverLiftsADarkOne() {
+        // B24b spot fit: the R5 II pulls exposure down for a bright AF subject (w ~0.25, capped at 1 EV) and leaves a dark
+        // one alone (w 0).
+        val tone = tone()
+        val met = ColourMath.Metering.parse(cases["metering_model"] as Map<*, *>)
+        val spot = met.spot!!
+        assertEquals(0.0, spot.wDarker, 0.0)
+        assertTrue(spot.wBrighter > 0.0 && spot.wBrighter <= 0.5 && spot.capEv <= 1.0)
+        val base = ColourMath.solveExposureMetered(tone, 0.05, 0.4, met)
+        val bright = ColourMath.solveExposureMetered(tone, 0.05, 0.4, met, regionMedianY = 0.4)
+        close("bright subject", base.ev - spot.wBrighter * spot.capEv, bright.ev, rel = 0.0, abs = 1e-12)
+        val dark = ColourMath.solveExposureMetered(tone, 0.05, 0.4, met, regionMedianY = 0.005)
+        assertEquals(base.ev, dark.ev, 0.0)
+        assertEquals(0.0, dark.spotShiftEv, 0.0)
     }
 
     @Test

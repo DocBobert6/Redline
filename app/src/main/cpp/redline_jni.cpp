@@ -596,10 +596,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     return err.empty() ? nullptr : env->NewStringUTF(err.c_str());
 }
 
-// [medianY, clippedFraction, cells, p98Y, p25Y] of the finished merge.
+// [medianY, clippedFraction, cells, p98Y, p25Y] of the finished merge. B24b: `region` (left, top, width, height on the
+// output grid; null = the whole merge) restricts the stats to a tapped region (a view into the same planes).
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeSrStats(JNIEnv* env, jclass, jlong handle,
                                                                                                         jfloatArray matrix,
-                                                                                                        jfloatArray neutral, jint step) {
+                                                                                                        jfloatArray neutral, jint step,
+                                                                                                        jintArray region) {
     auto* h = reinterpret_cast<SrHandle*>(handle);
     const Floats m(env, matrix), n(env, neutral);
     std::string err;
@@ -610,7 +612,23 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
     if (err.empty()) {
         for (int i = 0; i < 9; ++i) colour.matrix[i] = m.get()[i];
         for (int i = 0; i < 3; ++i) colour.neutral[i] = n.get()[i];
-        err = redline::linearStats(h->linear(), colour, step, st);
+        redline::LinearRgb lin = h->linear();
+        if (region != nullptr) {
+            jint r[4] = {0, 0, 0, 0};
+            if (env->GetArrayLength(region) != 4) {
+                err = "region needs 4 values";
+            } else {
+                env->GetIntArrayRegion(region, 0, 4, r);
+                if (r[0] < 0 || r[1] < 0 || r[2] < 1 || r[3] < 1 || r[0] + r[2] > lin.width || r[1] + r[3] > lin.height) {
+                    err = "region outside the merge";
+                } else {
+                    lin.data += static_cast<std::size_t>(r[1]) * lin.rowStride + static_cast<std::size_t>(r[0]);
+                    lin.width = r[2];
+                    lin.height = r[3];
+                }
+            }
+        }
+        if (err.empty()) err = redline::linearStats(lin, colour, step, st);
     }
     if (!err.empty()) {
         throwIllegalArgument(env, err);
