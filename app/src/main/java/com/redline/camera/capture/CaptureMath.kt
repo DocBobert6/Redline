@@ -113,7 +113,10 @@ data class ShotResult(
      */
     val dropped: String? = null,
     /** B23: the 50/70 mm super-resolution step (merged, or upscaled and why); null at other stops or with it off. */
-    val superRes: SuperResShot? = null
+    val superRes: SuperResShot? = null,
+    /** B24.1: how long the press waited for memory (a pool buffer or a holding-queue slot) and why; null = it did not. */
+    val memoryWaitMs: Long? = null,
+    val memoryWaitReason: String? = null
 ) {
     fun summary(): String = when {
         dropped != null && shutterBlocked -> "Not taken: $dropped"

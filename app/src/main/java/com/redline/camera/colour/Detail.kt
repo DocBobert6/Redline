@@ -113,8 +113,14 @@ data class DetailShot(
     val grainMeasured: List<Double?>?,
     val grainAdded: List<Double>?,
     val timingsMs: Map<String, Long>,
-    val error: String? = null
+    val error: String? = null,
+    /** B24.1: the pass's peak working memory (strip buffers, MB) and the size it ran at. */
+    val peakMb: Double? = null,
+    val width: Int? = null,
+    val height: Int? = null
 ) {
+    private fun sizeLabel(): String? = if (width != null && height != null) "${width}x$height" else null
+
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "picture_style" to pictureStyle,
         "stop_mm" to stopMm,
@@ -132,6 +138,7 @@ data class DetailShot(
             )
         },
         "detail_ms" to timingsMs,
+        "memory" to peakMb?.let { linkedMapOf("peak_mb" to r3(it), "size" to sizeLabel()) },
         "error" to error
     )
 }

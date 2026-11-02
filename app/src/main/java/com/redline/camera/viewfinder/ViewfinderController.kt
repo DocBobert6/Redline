@@ -44,9 +44,11 @@ import com.redline.camera.capture.FramePool
 import com.redline.camera.capture.FrameResults
 import com.redline.camera.capture.GovernorLatch
 import com.redline.camera.capture.MemoryBudget
+import com.redline.camera.capture.MemoryWait
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
 import com.redline.camera.capture.RawHoldingQueue
+import com.redline.camera.capture.ShotBuffers
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.ShotRouter
 import com.redline.camera.capture.ShotTimeline
@@ -218,6 +220,9 @@ class ViewfinderController(
 
         /** B22: the frame-buffer pool was sized (frames it may hold, MB per frame). */
         fun onPool(frames: Int, frameMb: Double) {}
+
+        /** B24.1: a press is waiting for memory (a pool buffer or a holding-queue slot): the shutter shows it is busy. */
+        fun onMemoryWait(waiting: Boolean) {}
 
         /** B22a: the merge workers (native threads, their nice value), once at start-up. */
         fun onMergeWorker(threads: Int, nice: Int) {}
@@ -423,7 +428,18 @@ class ViewfinderController(
 
     @Volatile private var motionRadPerSec: Double? = null
 
-    private class QueuedPress(val request: StillRequest, val onCaptured: () -> Unit, val done: (ShotResult) -> Unit, val atMs: Long)
+    private class QueuedPress(val request: StillRequest, val onCaptured: () -> Unit, val done: (ShotResult) -> Unit, val atMs: Long) {
+        /** B24.1: when it first had to wait for memory, and why (null = it never did). */
+        var memoryWaitSinceMs: Long? = null
+        var memoryWaitWhy: String? = null
+
+        /** B24.1: nothing will free memory for it (or it waited too long): taken as a hard camera-JPEG fallback. */
+        var hardFallback: String? = null
+    }
+
+    /** B24.1: the press at the head of the queue is waiting for memory; cleared when buffers come back. */
+    private var memoryBlocked = false
+    private val memoryWatchdog = Runnable { checkMemoryWait() }
 
     private class PendingShot(
         val id: Int,
@@ -770,15 +786,77 @@ class ViewfinderController(
     private fun ensurePool(size: Dim) {
         val bytes = size.width.toLong() * size.height * 2
         val info = ActivityManager.MemoryInfo().also { runCatching { activityManager.getMemoryInfo(it) } }
-        val frames = MemoryBudget.poolFrames(info.availMem, info.lowMemory, bytes)
+        // B24.1: the pool's own buffers are already counted as used by the system: add them back before sizing.
+        val own = pool?.takeIf { it.frameBytes == bytes }?.allocated()?.toLong()?.times(bytes) ?: 0L
+        val frames = MemoryBudget.poolFrames(info.availMem, info.lowMemory, bytes, own)
         val p = pool
         if (p == null || p.frameBytes != bytes) {
             p?.trimIdle()
-            pool = FramePool(bytes, frames, { RedlineNative.allocFrame(it) }, { RedlineNative.freeFrame(it) })
+            pool = FramePool(bytes, frames, { RedlineNative.allocFrame(it) }, { RedlineNative.freeFrame(it) }) {
+                handler.post { onBuffersFreed() }
+            }
         } else {
             p.capacity = maxOf(frames, p.inUse())
         }
         listener.onPool(frames, bytes / 1_048_576.0)
+    }
+
+    private fun systemLowOnMemory(): Boolean =
+        ActivityManager.MemoryInfo().also { runCatching { activityManager.getMemoryInfo(it) } }.lowMemory
+
+    /** B24.1: re-sizes the pool between runs (nothing in flight), so a budget taken at a busy moment does not stick. */
+    private fun refreshPoolIfIdle() {
+        val size = setup?.rawSize ?: return
+        if (inFlight != 0 || pending != null || pool == null || !sessionHasRaw) return
+        ensurePool(size)
+    }
+
+    /** B24.1: buffers came back (or a single left the holding queue): a press waiting for memory may go now. */
+    private fun onBuffersFreed() {
+        if (!memoryBlocked) return
+        memoryBlocked = false
+        pumpPresses()
+    }
+
+    /**
+     * B24.1: [q] could not get memory (no pool buffer, or the holding queue at its bound): it goes back to the head of
+     * the queue and waits, with the shutter showing busy, until a shot ahead hands a buffer back. With nothing in flight
+     * (nothing will free) it is taken at once as a hard fallback; [MemoryWait.MAX_WAIT_MS] bounds the wait.
+     */
+    private fun waitForMemory(q: QueuedPress, why: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (q.memoryWaitSinceMs == null) q.memoryWaitSinceMs = now
+        q.memoryWaitWhy = why
+        waitingPresses.addFirst(q)
+        memoryBlocked = true
+        listener.onMemoryWait(true)
+        syncLoad()
+        val p = pool
+        val hard = MemoryWait.hardReason(now - q.memoryWaitSinceMs!!, inFlight, p?.capacity ?: 0, p?.available() ?: 0)
+        if (hard != null) {
+            q.hardFallback = hard
+            memoryBlocked = false
+            handler.post { pumpPresses() }
+        } else {
+            handler.removeCallbacks(memoryWatchdog)
+            handler.postDelayed(memoryWatchdog, MemoryWait.MAX_WAIT_MS)
+        }
+    }
+
+    private fun checkMemoryWait() {
+        val q = waitingPresses.firstOrNull() ?: return
+        val since = q.memoryWaitSinceMs ?: return
+        if (!memoryBlocked) return
+        val p = pool
+        val waited = SystemClock.elapsedRealtime() - since
+        val hard = MemoryWait.hardReason(waited, inFlight, p?.capacity ?: 0, p?.available() ?: 0)
+        if (hard != null) {
+            q.hardFallback = hard
+            memoryBlocked = false
+            pumpPresses()
+        } else {
+            handler.postDelayed(memoryWatchdog, MemoryWait.MAX_WAIT_MS - waited)
+        }
     }
 
     /**
@@ -806,7 +884,7 @@ class ViewfinderController(
 
     /** The camera can take a new shot now: a configured session, nothing capturing, no session rebuild wanted. */
     private fun canStartNow(): Boolean =
-        session != null && device != null && setup != null && surface != null && pending == null && !rebuildWanted()
+        session != null && device != null && setup != null && surface != null && pending == null && !rebuildWanted() && !memoryBlocked
 
     private fun rebuildWanted(): Boolean = session != null && sessionWantsRaw() != sessionHasRaw
 
@@ -814,6 +892,7 @@ class ViewfinderController(
     private fun outputsPending(): Boolean = pending != null || active.any { !it.finished && (it.jpeg == null || it.result == null) }
 
     private fun startPress(q: QueuedPress) {
+        if (q.memoryWaitSinceMs == null) refreshPoolIfIdle()
         if (jpegReader == null) {
             q.onCaptured()
             storeLane.execute { q.done(ShotResult(ok = false, error = "no JPEG stream", kept = q.request.keep)) }
@@ -892,10 +971,26 @@ class ViewfinderController(
         val timeline = ShotTimeline(q.atMs).also { it.mark(ShotTimeline.START, nowMs) }
         handler.removeCallbacks(trimPool)
         val blocked = waitMs > BurstReport.SHUTTER_BLOCK_MS
-        val doneWithWait: (
-            ShotResult
-        ) -> Unit = { r -> q.done(r.copy(shutterWaitMs = waitMs, shutterBlocked = r.shutterBlocked || blocked)) }
+        // B24.1: how long the press waited for memory (it started now, unless it has to wait again below).
+        val memoryWaitMs = q.memoryWaitSinceMs?.let { nowMs - it }
+        val memoryWhy = q.memoryWaitWhy
+        val doneWithWait: (ShotResult) -> Unit = { r ->
+            q.done(
+                r.copy(
+                    shutterWaitMs = waitMs,
+                    shutterBlocked = r.shutterBlocked || blocked,
+                    memoryWaitMs = memoryWaitMs,
+                    memoryWaitReason = memoryWhy
+                )
+            )
+        }
+        // B24.1: low system memory rules out a burst (a single RAW frame still goes through our pipeline); a hard fallback
+        // (nothing will free a buffer) takes no RAW at all.
+        val lowMemory = sessionHasRaw && rawReader != null && systemLowOnMemory()
         var plan = planShot(su)
+        if (plan?.isBurst == true && (lowMemory || q.hardFallback != null)) {
+            plan = BurstPlan(frames = 0, singleReason = if (lowMemory) ShotRouter.WHY_LOW_MEMORY else "hard fallback", light = plan.light)
+        }
         var run: BurstRun? = null
         // B23: at 50/70 mm a burst becomes a super-resolution burst (8-12 frames); otherwise the still is upscaled.
         val rawCrop = su.rawSize?.let { ColourMath.rawCrop(it.width, it.height, zoomRatio.toDouble()) }
@@ -957,20 +1052,36 @@ class ViewfinderController(
             val why = plan?.singleReason ?: "memory"
             srDecision = srDecision.copy(active = false, frames = 0, reason = "no burst ($why): one frame upscaled")
         }
-        // Not a burst: B23b a single RAW frame (held in the RAW holding queue), or the camera JPEG only as the last resort:
-        // no pool buffer, the system low on memory, or the holding queue at its memory-sized bound (reason recorded).
+        // Not a burst: B23b a single RAW frame (held in the RAW holding queue). B24.1: with no pool buffer or the holding
+        // queue at its bound the press waits for one; the camera JPEG only without a RAW stream or as a hard fallback.
         var buffers: List<ByteBuffer> = emptyList()
         var singlePath = BurstShot.PATH_JPEG
         if (!burst) {
             val wantsRaw = sessionHasRaw && rawReader != null
-            val lowMemory = wantsRaw && ActivityManager.MemoryInfo().also { runCatching { activityManager.getMemoryInfo(it) } }.lowMemory
             val capacity = RawHoldingQueue.capacity(pool?.capacity ?: 0, burstsPending)
             var (path, why) = ShotRouter.route(wantsRaw, singlesPending, pool?.available() ?: 0, capacity, lowMemory)
+            val hard = q.hardFallback
             if (path == ShotRouter.Path.SINGLE_RAW) {
                 buffers = pool?.acquire(1).orEmpty()
                 if (buffers.isEmpty()) {
+                    path = ShotRouter.Path.WAIT
+                    why = ShotRouter.WAIT_NO_BUFFER
+                }
+            }
+            // B24.1: no buffer or holding-queue slot: the press waits for one (never the camera JPEG for pressure).
+            if (path == ShotRouter.Path.WAIT) {
+                if (hard == null) {
+                    waitForMemory(q, why ?: ShotRouter.WAIT_NO_BUFFER)
+                    return
+                }
+                // Waited as long as it may: a free buffer still makes it a RAW single (over the holding queue's bound).
+                buffers = if (wantsRaw) pool?.acquire(1).orEmpty() else emptyList()
+                if (buffers.isNotEmpty()) {
+                    path = ShotRouter.Path.SINGLE_RAW
+                    why = "$why; taken after $hard"
+                } else {
                     path = ShotRouter.Path.CAMERA_JPEG
-                    why = ShotRouter.WHY_NO_BUFFER
+                    why = ShotRouter.hard(hard)
                 }
             }
             if (path == ShotRouter.Path.SINGLE_RAW) singlePath = BurstShot.PATH_SINGLE
@@ -997,6 +1108,10 @@ class ViewfinderController(
             timeline = timeline,
             superRes = srDecision.takeIf { it.applies }
         )
+        if (q.memoryWaitSinceMs != null) {
+            handler.removeCallbacks(memoryWatchdog)
+            listener.onMemoryWait(false)
+        }
         inFlight++
         if (burst) burstsPending++
         if (wantRaw) singlesPending++
@@ -1522,6 +1637,17 @@ class ViewfinderController(
         val r = p.request
         val plan = p.plan
         val currentPool = pool
+        // B24.1: the saver hands the RAW buffers back right after the render (all but a DNG's frame), the rest at the end.
+        // B23b: a single RAW frame leaves the holding queue when its buffer goes back.
+        val buffers = ShotBuffers(keep, { currentPool?.release(it) }) {
+            if (p.wantRaw) {
+                handler.post {
+                    singlesPending--
+                    syncLoad()
+                    onBuffersFreed()
+                }
+            }
+        }
         val hasRaw = p.raw != null || burst?.merged != null || burst?.fallbackRaw != null || burst?.srImage != null
         p.timeline.mark(ShotTimeline.SAVE_QUEUED, queuedAtMs)
         return StillShot(
@@ -1548,16 +1674,8 @@ class ViewfinderController(
             queuedAtMs = queuedAtMs,
             timeline = p.timeline,
             superRes = p.superRes,
-            release = {
-                currentPool?.release(keep)
-                // B23b: a single RAW frame leaves the holding queue when its buffer goes back.
-                if (p.wantRaw) {
-                    handler.post {
-                        singlesPending--
-                        syncLoad()
-                    }
-                }
-            }
+            release = { buffers.releaseAll() },
+            releaseRaw = { k -> buffers.releaseExcept(k) }
         )
     }
 
@@ -1678,6 +1796,11 @@ class ViewfinderController(
     private fun dropWaitingPresses(reason: String) {
         while (true) {
             dropPress(waitingPresses.removeFirstOrNull() ?: break, reason)
+        }
+        if (memoryBlocked) {
+            memoryBlocked = false
+            handler.removeCallbacks(memoryWatchdog)
+            listener.onMemoryWait(false)
         }
         syncLoad()
     }

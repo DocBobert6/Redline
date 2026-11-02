@@ -57,7 +57,9 @@ data class BurstShot(
     /** B22b: press-to-file timeline ([ShotTimeline.toMap]): per-frame capture, RAW arrival, result, merge and save times. */
     val timeline: Map<String, Any?>? = null,
     /** B23b: time the shot waited for the render lane plus for the store lane (queued, not working), ms. */
-    val saveWaitMs: Long? = null
+    val saveWaitMs: Long? = null,
+    /** B24.1: the camera JPEG was saved for a hard reason (a native render error, no RAW buffer at all); null otherwise. */
+    val hardJpegReason: String? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "plan" to plan.toMap(),
@@ -80,6 +82,7 @@ data class BurstShot(
         "path" to path,
         "streaming" to streaming?.toMap(),
         "save_wait_ms" to saveWaitMs,
+        "hard_jpeg_reason" to hardJpegReason,
         "timeline" to timeline
     )
 
@@ -97,6 +100,7 @@ data class BurstShot(
         "capture_ms" to timingsMs["capture"],
         "merge_tail_ms" to timingsMs["merge_tail"],
         "save_wait_ms" to saveWaitMs,
+        "hard_jpeg_reason" to hardJpegReason,
         "total_ms" to totalMs
     )
 
@@ -173,7 +177,17 @@ data class BurstReport(
     /** B22b: timelines of the latest shots ([ShotTimeline.toMap]), newest last. */
     val recentTimelines: List<Map<String, Any?>> = emptyList(),
     /** B23b: rapid-fire runs (camera-JPEG fallbacks, RAW singles, save waits, preview fps while the queue drains). */
-    val rapidFire: RapidFire = RapidFire()
+    val rapidFire: RapidFire = RapidFire(),
+    /** B24.1: presses that waited for memory (instead of a camera-JPEG fallback): count, total and max ms, by reason. */
+    val memoryWaits: Int = 0,
+    val memoryWaitTotalMs: Long = 0,
+    val memoryWaitMaxMs: Long = 0,
+    val memoryWaitReasons: Map<String, Int> = emptyMap(),
+    /** B24.1: camera-JPEG saves for a hard reason (never memory or queue pressure), by reason. */
+    val hardJpegShots: Int = 0,
+    val hardJpegReasons: Map<String, Int> = emptyMap(),
+    /** B24.1: the smallest pool the budget allowed this session (the pool is re-sized between runs). */
+    val poolFramesMin: Int? = null
 ) {
     val enabled: Boolean get() = userSetting && available == true
 
@@ -185,13 +199,27 @@ data class BurstReport(
     }
 
     /** A shutter press: [waitMs] how long it waited for the camera (a press queued behind a capture), [blocked] refused or late. */
-    fun press(waitMs: Long?, blocked: Boolean, stress: Boolean): BurstReport = copy(
-        presses = presses + 1,
-        shutterBlocked = shutterBlocked + if (blocked) 1 else 0,
-        shutterWaits = shutterWaits + if ((waitMs ?: 0) > 0) 1 else 0,
-        maxShutterWaitMs = max(maxShutterWaitMs, waitMs ?: 0),
-        stressBlocked = stressBlocked + if (stress && blocked) 1 else 0
-    )
+    fun press(waitMs: Long?, blocked: Boolean, stress: Boolean, memoryWaitMs: Long? = null, memoryWaitReason: String? = null): BurstReport =
+        copy(
+            presses = presses + 1,
+            shutterBlocked = shutterBlocked + if (blocked) 1 else 0,
+            shutterWaits = shutterWaits + if ((waitMs ?: 0) > 0) 1 else 0,
+            maxShutterWaitMs = max(maxShutterWaitMs, waitMs ?: 0),
+            stressBlocked = stressBlocked + if (stress && blocked) 1 else 0,
+            memoryWaits = memoryWaits + if (memoryWaitMs != null) 1 else 0,
+            memoryWaitTotalMs = memoryWaitTotalMs + (memoryWaitMs ?: 0),
+            memoryWaitMaxMs = max(memoryWaitMaxMs, memoryWaitMs ?: 0),
+            memoryWaitReasons = if (memoryWaitMs != null) {
+                val why = memoryWaitReason ?: "?"
+                memoryWaitReasons + (why to (memoryWaitReasons[why] ?: 0) + 1)
+            } else {
+                memoryWaitReasons
+            }
+        )
+
+    /** B24.1: the pool was (re-)sized to [frames] buffers of [frameMb] MB. */
+    fun pool(frames: Int, frameMb: Double): BurstReport =
+        copy(poolFrames = frames, frameMb = frameMb, poolFramesMin = minOf(poolFramesMin ?: frames, frames))
 
     /** B22b: a press that ended without a shot: refused (queue full) or dropped ([why]); never a capture failure. */
     fun drop(why: String, refused: Boolean): BurstReport = if (refused) {
@@ -210,8 +238,12 @@ data class BurstReport(
     fun record(shot: BurstShot, shutterToSavedMs: Long?, ok: Boolean): BurstReport {
         val ms = shutterToSavedMs ?: 0
         val stress = shot.stress
+        val hard = shot.hardJpegReason
         var next = copy(
             rapidFire = rapidFire.shot(shot.path, jpegReason(shot), shot.saveWaitMs),
+            hardJpegShots = hardJpegShots + if (hard != null) 1 else 0,
+            cameraJpegShots = cameraJpegShots + if (shot.path == BurstShot.PATH_JPEG) 1 else 0,
+            hardJpegReasons = if (hard != null) hardJpegReasons + (hard to (hardJpegReasons[hard] ?: 0) + 1) else hardJpegReasons,
             framesRequested = framesRequested + shot.plan.frames,
             framesCaptured = framesCaptured + shot.framesCaptured,
             framesMerged = framesMerged + shot.framesMerged,
@@ -234,8 +266,7 @@ data class BurstReport(
             val why = shot.plan.singleReason ?: "?"
             return next.copy(
                 singleShots = singleShots + 1,
-                singleReasons = singleReasons + (why to (singleReasons[why] ?: 0) + 1),
-                cameraJpegShots = cameraJpegShots + if (shot.path == BurstShot.PATH_JPEG) 1 else 0
+                singleReasons = singleReasons + (why to (singleReasons[why] ?: 0) + 1)
             )
         }
         shot.plan.light?.let { light ->
@@ -300,6 +331,7 @@ data class BurstReport(
     /** B23b: why a shot was the camera JPEG: the router's reason (the last "...: camera JPEG" part of the plan's reason). */
     private fun jpegReason(shot: BurstShot): String? {
         if (shot.path != BurstShot.PATH_JPEG) return null
+        shot.hardJpegReason?.let { return it }
         val why = shot.plan.singleReason ?: return null
         return why.split("; ").lastOrNull { it.endsWith("camera JPEG") } ?: why
     }
@@ -331,6 +363,7 @@ data class BurstReport(
         ),
         "memory" to linkedMapOf(
             "pool_frames" to poolFrames,
+            "pool_frames_min" to poolFramesMin,
             "frame_mb" to frameMb?.let { r2(it) },
             "peak_resident_mb" to r1(peakResidentMb),
             "peak_native_mb" to r1(peakNativeMb),
@@ -357,6 +390,13 @@ data class BurstReport(
             "max_shutter_to_saved_ms" to if (queuedShots == 0) null else queuedMaxMs
         ),
         "camera_jpeg_shots" to cameraJpegShots,
+        "hard_camera_jpeg" to linkedMapOf("shots" to hardJpegShots, "reasons" to hardJpegReasons),
+        "memory_waits" to linkedMapOf(
+            "delayed_for_memory" to memoryWaits,
+            "avg_wait_ms" to if (memoryWaits == 0) null else memoryWaitTotalMs / memoryWaits,
+            "max_wait_ms" to memoryWaitMaxMs,
+            "reasons" to memoryWaitReasons
+        ),
         "frames_by_light" to framesByLight.entries.sortedBy { lightOrder(it.key) }.associate { (k, v) ->
             k to linkedMapOf("shots" to v[0], "avg_frames" to r2(v[1].toDouble() / v[0]), "min_frames" to v[2], "max_frames" to v[3])
         },

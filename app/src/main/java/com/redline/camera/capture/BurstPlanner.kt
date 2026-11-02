@@ -186,31 +186,53 @@ object BurstPlanner {
 /**
  * B22a: where a shot goes when it is not a burst. B23b: a busy shot (bursts pending, presses waiting) is a single RAW
  * frame rendered through our pipeline, held in a bounded RAW holding queue (one pool buffer each) sized by the memory
- * budget ([RawHoldingQueue.capacity]). The camera JPEG is the last resort only: no RAW stream, no pool buffer free,
- * the system reports low memory, or the holding queue is at its memory-sized bound; the reason is always recorded.
- * The shutter is never refused.
+ * budget ([RawHoldingQueue.capacity]). B24.1: memory or queue pressure never makes a shot the camera JPEG. With no pool
+ * buffer free or the holding queue at its bound, the press [Path.WAIT]s (a busy state on the shutter) until a shot ahead
+ * of it hands its buffer back; low system memory only rules out a burst. The camera JPEG is left for a session without a
+ * RAW stream (RAW not wanted) and for a hard error ([HARD_PREFIX]), always with its reason.
  */
 object ShotRouter {
-    enum class Path { SINGLE_RAW, CAMERA_JPEG }
+    enum class Path { SINGLE_RAW, CAMERA_JPEG, WAIT }
 
-    const val WHY_NO_BUFFER = "no memory for a RAW copy: camera JPEG"
-    const val WHY_LOW_MEMORY = "system low on memory: camera JPEG"
+    const val WAIT_NO_BUFFER = "no pool buffer free for a RAW copy (waited for one)"
+    const val WHY_LOW_MEMORY = "system low on memory (single RAW, no burst)"
 
-    fun whyQueueFull(capacity: Int) = "RAW holding queue full ($capacity waiting, memory budget): camera JPEG"
+    /** A camera JPEG for a reason that is not pressure: a native render error, or no RAW buffer could be had at all. */
+    const val HARD_PREFIX = "hard: "
+
+    fun waitQueueFull(capacity: Int) = "RAW holding queue full ($capacity waiting, memory budget; waited)"
+
+    fun hard(why: String) = "$HARD_PREFIX$why: camera JPEG"
 
     /**
-     * [wantsRaw]: the session has RAW and the pipeline or the DNG toggle wants it. [pendingSingles]: single RAW frames
-     * held and not yet saved; [capacity]: the holding queue's bound ([RawHoldingQueue.capacity]); [poolFree]: buffers
-     * free right now. Returns the path and why it is the JPEG (null when it is not, or when RAW is simply not wanted).
+     * [wantsRaw]: the session has a RAW stream. [pendingSingles]: single RAW frames held and not yet released;
+     * [capacity]: the holding queue's bound ([RawHoldingQueue.capacity]); [poolFree]: buffers free right now. Returns the
+     * path and its note: why the press waits, or why a single RAW (low memory); null otherwise.
      */
     fun route(wantsRaw: Boolean, pendingSingles: Int, poolFree: Int, capacity: Int, lowMemory: Boolean = false): Pair<Path, String?> =
         when {
             !wantsRaw -> Path.CAMERA_JPEG to null
-            lowMemory -> Path.CAMERA_JPEG to WHY_LOW_MEMORY
-            poolFree < 1 -> Path.CAMERA_JPEG to WHY_NO_BUFFER
-            pendingSingles >= capacity -> Path.CAMERA_JPEG to whyQueueFull(capacity)
+            poolFree < 1 -> Path.WAIT to WAIT_NO_BUFFER
+            pendingSingles >= capacity -> Path.WAIT to waitQueueFull(capacity)
+            lowMemory -> Path.SINGLE_RAW to WHY_LOW_MEMORY
             else -> Path.SINGLE_RAW to null
         }
+}
+
+/**
+ * B24.1: a press waiting for memory (a pool buffer or a holding-queue slot). It waits while shots ahead of it can still
+ * hand buffers back; with nothing ahead of it (nothing will free) or after [MAX_WAIT_MS], it is taken anyway as a hard
+ * camera-JPEG fallback with the reason recorded, so a press is never lost.
+ */
+object MemoryWait {
+    const val MAX_WAIT_MS = 8_000L
+
+    /** Why the waiting press must now be taken as a hard fallback, or null to keep waiting. */
+    fun hardReason(waitedMs: Long, shotsAhead: Int, poolCapacity: Int, poolFree: Int): String? = when {
+        shotsAhead <= 0 -> "no RAW buffer with nothing in flight (pool $poolCapacity, free $poolFree)"
+        waitedMs >= MAX_WAIT_MS -> "waited $waitedMs ms for a RAW buffer (pool $poolCapacity, free $poolFree)"
+        else -> null
+    }
 }
 
 /**
@@ -234,18 +256,21 @@ object RawHoldingQueue {
  * How many frame buffers the memory pool may hold (PLAN 12: merge memory cap ~1.2 GB on an 8 GB phone): a third
  * of what the system reports available, capped at [MAX_BUDGET_BYTES], minus the merge's own working set (B22a: one
  * streaming accumulator, ~5.5 bytes per RAW pixel, since bursts merge one at a time), halved when the system says
- * memory is low.
+ * memory is low. B24.1: [ownBytes] (the pool's own buffers, already counted as used by the system) is added back, so
+ * re-sizing a pool that holds buffers does not shrink it by itself; and never fewer than [MIN_POOL_FRAMES], since a
+ * press now waits for a buffer instead of falling back to the camera JPEG. The detail post-pass needs no share of it
+ * (strip buffers, about 1 MB since B24.1).
  */
 object MemoryBudget {
     const val MAX_BUDGET_BYTES = 1_200L * 1024 * 1024
     const val WORKING_SET_BYTES = 192L * 1024 * 1024
     const val MAX_POOL_FRAMES = 2 * (BurstPlanner.MAX_FRAMES + 1)
+    const val MIN_POOL_FRAMES = 2
 
-    fun poolFrames(availBytes: Long, lowMemory: Boolean, frameBytes: Long): Int {
+    fun poolFrames(availBytes: Long, lowMemory: Boolean, frameBytes: Long, ownBytes: Long = 0): Int {
         if (frameBytes <= 0) return 0
-        var budget = min(MAX_BUDGET_BYTES, availBytes / 3) - WORKING_SET_BYTES
+        var budget = min(MAX_BUDGET_BYTES, (availBytes + ownBytes.coerceAtLeast(0)) / 3) - WORKING_SET_BYTES
         if (lowMemory) budget /= 2
-        if (budget <= 0) return 0
-        return min((budget / frameBytes).toInt(), MAX_POOL_FRAMES)
+        return (budget.coerceAtLeast(0) / frameBytes).toInt().coerceIn(MIN_POOL_FRAMES, MAX_POOL_FRAMES)
     }
 }

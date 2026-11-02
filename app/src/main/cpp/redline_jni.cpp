@@ -648,7 +648,7 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
 // ---------------------------------------------------------------------------------------------------- B24 detail post-pass
 
 // In place on an ARGB_8888 bitmap: distortion (optional), sharpening, grain. Returns
-// [total, distort, sharpen, noise, grain ms, distortScale, measured x7 (-1 = no estimate), added x7]; throws
+// [total, distort, sharpen, noise, grain ms, distortScale, measured x7 (-1 = no estimate), added x7, peak working MB (B24.1)]; throws
 // IllegalArgumentException on bad input.
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeApplyDetail(
     JNIEnv* env, jclass, jobject bitmap, jboolean distort, jfloat distA, jfloat distB, jfloat distC, jfloat sharpenSigma,
@@ -696,7 +696,7 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
         throwIllegalArgument(env, err);
         return nullptr;
     }
-    constexpr int kN = 6 + 2 * redline::kNoiseBins;
+    constexpr int kN = 6 + 2 * redline::kNoiseBins + 1;
     jfloat v[kN];
     v[0] = static_cast<jfloat>(st.totalMs);
     v[1] = static_cast<jfloat>(st.distortMs);
@@ -708,6 +708,7 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
         v[6 + i] = st.measured[i];
         v[6 + redline::kNoiseBins + i] = st.added[i];
     }
+    v[6 + 2 * redline::kNoiseBins] = static_cast<jfloat>(st.peakBytes / (1024.0 * 1024.0));
     jfloatArray out = env->NewFloatArray(kN);
     if (out == nullptr) return nullptr;
     env->SetFloatArrayRegion(out, 0, kN, v);
