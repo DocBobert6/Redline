@@ -244,7 +244,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     shot.cameraId,
                     shot.jpeg,
                     sr.outWidth,
-                    sr.outHeight
+                    sr.outHeight,
+                    shot.stopTargetMm
                 )
                 srImage.close()
                 rendered = o.bitmap
@@ -262,7 +263,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.jpeg,
                         shot.zoomRatio,
                         shot.stopLongPx,
-                        b.mergedScale
+                        b.mergedScale,
+                        shot.stopTargetMm
                     )
                     rendered = o.bitmap
                     colour = o.shot
@@ -277,7 +279,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.cameraId,
                         shot.jpeg,
                         shot.zoomRatio,
-                        shot.stopLongPx
+                        shot.stopLongPx,
+                        stopMm = shot.stopTargetMm
                     )
                     rendered = o.bitmap
                     colour = o.shot
@@ -315,7 +318,16 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 streaming = b.streaming
             )
         } else if (shot.renderRaw && shot.raw != null && pipeline != null) {
-            val o = pipeline.render(shot.raw, shot.result, shot.characteristics, shot.cameraId, shot.jpeg, shot.zoomRatio, shot.stopLongPx)
+            val o = pipeline.render(
+                shot.raw,
+                shot.result,
+                shot.characteristics,
+                shot.cameraId,
+                shot.jpeg,
+                shot.zoomRatio,
+                shot.stopLongPx,
+                stopMm = shot.stopTargetMm
+            )
             rendered = o.bitmap
             colour = o.shot
         } else if (shot.renderRaw) {
@@ -338,6 +350,17 @@ class StillSaver(context: Context, private val version: String, private val pipe
             }
             if (srFallback == null) {
                 srFallback = sr.reason ?: if (bmp == null) "camera JPEG (not rendered from RAW)" else "super-resolution unavailable"
+            }
+        }
+        // B24: the detail post-pass on the finished still (after the upscale): distortion if toggled, sharpening, grain.
+        val still = rendered
+        if (still != null && pipeline != null) {
+            val seed = (runCatching { shot.result.get(CaptureResult.SENSOR_TIMESTAMP) }.getOrNull() ?: shot.shutterAtMs).toInt()
+            val d = pipeline.applyDetail(still, colour?.iso, shot.stopTargetMm, seed)
+            if (d != null) {
+                val ms = d.timingsMs["total"] ?: 0L
+                colour = colour?.let { c -> c.copy(detail = d, timingsMs = c.timingsMs + ("detail" to ms)) }
+                burstShot = burstShot?.let { it.copy(timingsMs = it.timingsMs + ("detail" to ms)) }
             }
         }
         val lookName = if (rendered != null) ColourPipeline.LOOK_NAME else LOOK_NONE

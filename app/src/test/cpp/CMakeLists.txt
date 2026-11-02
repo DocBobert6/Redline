@@ -52,3 +52,15 @@ add_executable(superres_tool superres_tool.cpp ${NATIVE_SRC}/superres.cpp ${NATI
 target_include_directories(superres_tool PRIVATE ${NATIVE_SRC})
 target_compile_options(superres_tool PRIVATE -Wall -Wextra -Werror -O3)
 target_link_libraries(superres_tool PRIVATE Threads::Threads)
+
+# B24 detail post-pass (distortion, sharpening, grain): invariants (CTest) and the host tool the Python parity test drives.
+add_executable(detail_test detail_test.cpp ${NATIVE_SRC}/detail.cpp)
+target_include_directories(detail_test PRIVATE ${NATIVE_SRC})
+target_compile_options(detail_test PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(detail_test PRIVATE Threads::Threads)
+add_test(NAME detail COMMAND detail_test)
+
+add_executable(detail_tool detail_tool.cpp ${NATIVE_SRC}/detail.cpp)
+target_include_directories(detail_tool PRIVATE ${NATIVE_SRC})
+target_compile_options(detail_tool PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(detail_tool PRIVATE Threads::Threads)

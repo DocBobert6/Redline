@@ -13,6 +13,7 @@
 //   crop L T W H  out OW OH  matrix M0..M8  neutral N0 N1 N2  gain G
 //   curve N LO HI PATH (float32 N)  cube PATH (.cube file)  threads T  step S
 //   linear W H PATH (float32 planar R, G, B planes of W*H; the linear modes need no raw)
+//   vignette N PATH (B24: float32 N gains on r = 0..1; optional)
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -51,7 +52,9 @@ int main(int argc, char** argv) {
     redline::RawInput in;
     redline::RenderSpec spec;
     std::vector<std::uint16_t> raw;
-    std::vector<float> shading, curve;
+    std::vector<float> shading, curve, vignette;
+    int vignettePoints = 0;
+    std::string vignettePath;
     redline::CubeLut lut;
     std::string rawPath, shadingPath, curvePath, cubePath;
     int step = 8;
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
         else if (key == "threads") pf >> spec.threads;
         else if (key == "step") pf >> step;
         else if (key == "linear") pf >> linW >> linH >> linPath;
+        else if (key == "vignette") pf >> vignettePoints >> vignettePath;
         else return fail("unknown key " + key);
     }
     const bool linearMode = mode == "linearf" || mode == "linearstats";
@@ -117,6 +121,11 @@ int main(int argc, char** argv) {
     if ((mode != "render" && mode != "renderf" && mode != "linearf") || argc < 4) return fail("render needs an output path");
     if (!readBinary(curvePath, curve, static_cast<std::size_t>(spec.curvePoints))) return fail("cannot read curve");
     spec.curve = curve.data();
+    if (vignettePoints > 0) {
+        if (!readBinary(vignettePath, vignette, static_cast<std::size_t>(vignettePoints))) return fail("cannot read vignette");
+        spec.vignette = vignette.data();
+        spec.vignettePoints = vignettePoints;
+    }
     std::ifstream cf(cubePath, std::ios::binary);
     if (!cf) return fail("cannot read cube");
     std::stringstream ss;

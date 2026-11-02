@@ -49,6 +49,7 @@ fun CapabilityScreen(
     onToggleLook: (() -> Unit)? = null,
     onCycleLookStrength: (() -> Unit)? = null,
     onToggleColourPipeline: (() -> Unit)? = null,
+    onToggleDetail: ((String) -> Unit)? = null,
     onToggleBurst: (() -> Unit)? = null,
     onToggleSuperRes: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
@@ -194,6 +195,7 @@ fun CapabilityScreen(
                 }
                 item {
                     ColourPipelineCard(state.colourPipeline, onToggleColourPipeline)
+                    DetailCard(state.colourPipeline, onToggleDetail)
                 }
                 item {
                     BurstCard(state.burst, onToggleBurst, onRunBurstStress)
@@ -281,6 +283,52 @@ private fun ColourPipelineCard(r: ColourPipelineReport, onToggle: (() -> Unit)?)
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(COLOUR_TOGGLE_TAG)) {
                 Text("Turn colour pipeline ${if (r.userSetting) "off" else "on"} (default on when the self-check passes)")
+            }
+        }
+    }
+}
+
+const val DETAIL_SECTION_TITLE = "Detail (B24)"
+const val DETAIL_VIGNETTE = "vignette"
+const val DETAIL_SHARPEN = "sharpen"
+const val DETAIL_GRAIN = "grain"
+const val DETAIL_DISTORTION = "distortion"
+const val DETAIL_TOGGLE_TAG_PREFIX = "detail_toggle_"
+
+/** B24: Picture Style (Standard only), the detail toggles and what the last still's detail stage did. */
+@Composable
+private fun DetailCard(r: ColourPipelineReport, onToggle: ((String) -> Unit)?) {
+    SectionCard(DETAIL_SECTION_TITLE) {
+        Text(ColourPipelineReport.DETAIL_LABEL, style = MaterialTheme.typography.bodySmall)
+        Text("Picture Style: ${r.pictureStyle ?: "Standard"} (the only style fitted)")
+        r.pictureStylesNote?.let { Text("Other styles: $it", style = MaterialTheme.typography.bodySmall) }
+        r.detailError?.let { Text("Detail asset not loaded: $it", style = MaterialTheme.typography.bodySmall) }
+        val d = r.detailSettings
+        val word = { on: Boolean -> if (on) "on" else "off" }
+        Text(
+            "Vignette ${word(d.vignette)}, sharpening ${word(d.sharpen)}, grain ${word(d.grain)}, " +
+                "distortion (RAW feel) ${word(d.distortion)}"
+        )
+        r.last?.detail?.let { l ->
+            Text(
+                "Last: ${l.stopMm} mm, vignette corner ${l.vignetteCornerEv?.let { "%+.2f EV".format(it) } ?: "off"}, " +
+                    "grain ISO ${l.grainIso?.let { Math.round(it) } ?: "-"}, detail ${l.timingsMs["total"] ?: "-"} ms" +
+                    (l.error?.let { " (error: $it)" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (onToggle != null) {
+            listOf(
+                DETAIL_VIGNETTE to "Vignette ${word(!d.vignette)}",
+                DETAIL_SHARPEN to "Sharpening ${word(!d.sharpen)}",
+                DETAIL_GRAIN to "Grain ${word(!d.grain)}",
+                DETAIL_DISTORTION to "Distortion (RAW feel) ${word(!d.distortion)}"
+            ).forEach { (key, label) ->
+                OutlinedButton(onClick = {
+                    onToggle(key)
+                }, modifier = Modifier.padding(top = 4.dp).testTag(DETAIL_TOGGLE_TAG_PREFIX + key)) {
+                    Text("Turn $label")
+                }
             }
         }
     }

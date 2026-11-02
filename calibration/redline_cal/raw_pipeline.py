@@ -20,6 +20,8 @@ Per pixel, in order:
                the Canon-style warmth retention r(CCT): 0 at 5000 K and above, rising linearly to 0.30 at 3000 K and
                below, so a tungsten scene keeps about 30 % of its cast and daylight neutrals stay neutral.
 6. resample    area (box) downscale in linear light to the output size.
+6b. vignette   B24: lin *= g(r), the RF 24-70's in-camera residual falloff at the zoom stop (``detail``), r = 1 at the
+               output corner; optional (None = off).
 7. curve       y = C(g * lin) per channel: the fitted Standard tone curve (B03) up to the knee at -1.5 EV, then a
                highlight shoulder that rolls off to exactly 1.0 at the sensor clip (g * 1.0), matching the fitted
                slope at the knee. ``g`` is the exposure gain. B23c: the mid-tone target is fitted from the R5 II
@@ -30,6 +32,7 @@ Per pixel, in order:
                JPEGs' p98 floor (``Headroom``). Before B23c: the camera JPEG's median luma, inverted through the fitted tone
                curve, over the RAW frame's median luminance (``solve_exposure``, still used by the self-check).
 8. look        33^3 residual LUT (trilinear) -> sRGB-encoded output.
+9. detail      B24, on the 8-bit output: distortion (off by default), sharpening, grain (``detail.apply_detail``).
 """
 from __future__ import annotations
 
@@ -454,6 +457,7 @@ class RenderParams:
     neutral: np.ndarray               # 3
     curve: ToneCurve
     lut: np.ndarray                   # (n, n, n, 3) [r][g][b]
+    vignette: np.ndarray | None = None  # B24: residual vignette gain table on r = 0..1 (detail.table_lookup); None = off
 
 
 def balanced_linear(frame: RawFrame, crop, neutral, matrix) -> np.ndarray:
@@ -476,6 +480,10 @@ def render(frame: RawFrame, p: RenderParams) -> np.ndarray:
         ay, ax = sparse.csr_matrix(area_weights(h, oh)), sparse.csr_matrix(area_weights(w, ow))
         lin = (ay @ lin.reshape(h, w * 3)).reshape(oh, w, 3)
         lin = (ax @ lin.transpose(1, 0, 2).reshape(w, oh * 3)).reshape(ow, oh, 3).transpose(1, 0, 2)
+    if p.vignette is not None:
+        from .detail import vignette_gain
+
+        lin = lin * vignette_gain(ow, oh, p.vignette)[..., None]
     y = p.curve(p.curve.gain * lin)
     return np.clip(apply_lut(y, p.lut), 0.0, 1.0)
 
@@ -503,11 +511,17 @@ def raw_stats(frame: RawFrame, crop, neutral, matrix, step: int = STATS_STEP) ->
             "cells": int(yv.size)}
 
 
-def render_linear(rgb_camera: np.ndarray, matrix, neutral, curve: ToneCurve, lut: np.ndarray) -> np.ndarray:
+def render_linear(rgb_camera: np.ndarray, matrix, neutral, curve: ToneCurve, lut: np.ndarray,
+                  vignette: np.ndarray | None = None) -> np.ndarray:
     """B23: stages 4-8 on camera RGB that is already on the output grid (the super-resolution merge's normalised,
-    shading-corrected values, ``superres.merge``): balance + clip, matrix, tone curve, LUT. Nothing is resampled."""
+    shading-corrected values, ``superres.merge``): balance + clip, matrix, tone curve, LUT. Nothing is resampled.
+    B24: ``vignette`` (gain table, ``detail``) multiplies the linear values before the curve, as in ``render``."""
     c = np.clip(np.asarray(rgb_camera, float) / np.asarray(neutral, float), 0.0, 1.0)
     lin = c @ np.asarray(matrix, float).T
+    if vignette is not None:
+        from .detail import vignette_gain
+
+        lin = lin * vignette_gain(lin.shape[1], lin.shape[0], vignette)[..., None]
     y = curve(curve.gain * lin)
     return np.clip(apply_lut(y, lut), 0.0, 1.0)
 
@@ -653,9 +667,10 @@ def native_stats(tool: str, frame: RawFrame, crop, neutral, matrix, step: int = 
 
 
 def native_render(tool: str, frame: RawFrame, plan: ShotPlan, cube_path: str, threads: int = 4,
-                  precise: bool = True) -> tuple[np.ndarray, float]:
+                  precise: bool = True, vignette: np.ndarray | None = None) -> tuple[np.ndarray, float]:
     """Runs the C++ pipeline through the host tool; returns (sRGB-encoded float image, render ms). ``precise``
-    reads the native float output (before the 8-bit rounding the app's bitmap gets); otherwise the 8-bit one."""
+    reads the native float output (before the 8-bit rounding the app's bitmap gets); otherwise the 8-bit one.
+    B24: ``vignette`` is the residual vignette gain table (``detail``)."""
     import os
     import subprocess
     import tempfile
@@ -668,6 +683,10 @@ def native_render(tool: str, frame: RawFrame, plan: ShotPlan, cube_path: str, th
         lines = _write_inputs(d, frame) + _colour_lines(plan.crop, plan.solve.neutral, plan.solve.matrix) + [
             f"out {ow} {oh}", f"gain {plan.curve.gain:.9g}",
             f"curve {len(table)} {EV_MIN:.9g} {plan.curve.clip_ev:.9g} {cp}", f"cube {cube_path}", f"threads {threads}"]
+        if vignette is not None:
+            vp = os.path.join(d, "vignette.f32")
+            np.asarray(vignette, dtype="<f4").tofile(vp)
+            lines.append(f"vignette {len(vignette)} {vp}")
         p = os.path.join(d, "params.txt")
         with open(p, "w") as f:
             f.write("\n".join(lines) + "\n")
