@@ -130,6 +130,13 @@ def colour_math_cases() -> dict:
         e = rp.metered_exposure(tone, med, p98, met, p25, clipped)
         mexp.append({"median_y": med, "p98_y": p98, "p25_y": p25, "clipped_fraction": clipped, "ev": e.ev,
                      "method": e.method, "headroom_lift_ev": e.headroom_lift_ev})
+    # B24b: touch metering (spot block). A tapped subject 2 EV brighter (held down, capped at 1 EV), 0.4 EV brighter,
+    # 1.5 EV darker (no lift: w_darker 0), equal, no region, an invalid region, and a bright frame at the gain clamp.
+    for med, p98, region in ((0.05, 0.4, 0.2), (0.05, 0.4, 0.05 * 2.0**0.4), (0.05, 0.4, 0.05 * 2.0**-1.5),
+                             (0.05, 0.4, 0.05), (0.05, 0.4, None), (0.05, 0.4, 0.0), (0.9, 0.95, 0.99)):
+        e = rp.metered_exposure(tone, med, p98, met, region_median_y=region)
+        mexp.append({"median_y": med, "p98_y": p98, "region_median_y": region, "ev": e.ev, "method": e.method,
+                     "spot_shift_ev": e.spot_shift_ev})
     out["metering"] = mexp
     rng = np.random.default_rng(7)
     jm = []

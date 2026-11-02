@@ -30,7 +30,7 @@ data class DeviceProfile(
     )
 
     companion object {
-        const val SCHEMA = 1
+        const val SCHEMA = 2
     }
 }
 
@@ -115,7 +115,10 @@ data class CameraProfile(
     val cctWhiteBalance: Boolean,
     val lowLightBoost: Boolean,
     val extensions: List<String>,
-    val colourCalibrationExposed: Boolean
+    val colourCalibrationExposed: Boolean,
+    /** B24b: CONTROL_MAX_REGIONS_AF / _AE (null: not reported). Touch focus / metering only where > 0. */
+    val maxRegionsAf: Int? = null,
+    val maxRegionsAe: Int? = null
 ) {
     fun has(cap: String): Boolean = cap in capabilities
 
@@ -145,7 +148,9 @@ data class CameraProfile(
         "cct_white_balance" to cctWhiteBalance,
         "low_light_boost" to lowLightBoost,
         "extensions" to extensions,
-        "colour_calibration_exposed" to colourCalibrationExposed
+        "colour_calibration_exposed" to colourCalibrationExposed,
+        "max_regions_af" to maxRegionsAf,
+        "max_regions_ae" to maxRegionsAe
     )
 }
 

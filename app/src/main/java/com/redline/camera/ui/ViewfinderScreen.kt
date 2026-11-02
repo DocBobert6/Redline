@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -51,6 +53,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -60,6 +63,7 @@ import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
 import com.redline.camera.viewfinder.ZoomStop
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 
 const val VIEWFINDER_TAG = "viewfinder"
@@ -70,6 +74,17 @@ const val OPEN_CAPABILITY_TAG = "open_capability"
 const val SHUTTER_TAG = "shutter"
 const val RAW_TOGGLE_TAG = "raw_toggle"
 const val LOOK_BADGE_TAG = "look_badge"
+const val AF_POINT_TAG = "af_point"
+const val AF_LOCK_TAG = "af_lock"
+
+/**
+ * B24b: the AF point on the preview, in the frame box's pixels ([mode]: FOCUSING, FOCUSED, NOT_FOCUSED, METERED,
+ * TIMED_OUT), and the lock label ("AE/AF L", "AF L") for a long-press.
+ */
+data class TouchBoxUi(val left: Float, val top: Float, val right: Float, val bottom: Float, val mode: String, val lockLabel: String?)
+
+private val AfFocused = Color(0xFF66BB6A)
+private val AfMissed = Color(0xFFFFA726)
 
 fun zoomStopTag(mm: Int): String = "zoom_stop_$mm"
 
@@ -124,7 +139,11 @@ fun ViewfinderScreen(
     manualActions: ManualActions = ManualActions(),
     onPreviewView: (TextureView) -> Unit = {},
     /** B20: shown while the camera renders through the GPU look-preview LUT. */
-    lookBadge: String? = null
+    lookBadge: String? = null,
+    /** B24b: tap (long = false) or long-press (long = true) on the preview at (x, y) px of the frame box; null = no touch focus. */
+    onTapFrame: ((x: Float, y: Float, long: Boolean) -> Unit)? = null,
+    /** B24b: the AF point to draw, or null. */
+    touchBox: TouchBoxUi? = null
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     val view = LocalView.current
@@ -150,6 +169,21 @@ fun ViewfinderScreen(
                         .align(Alignment.Center)
                         .aspectRatio(if (portrait) 2f / 3f else 3f / 2f)
                         .clipToBounds()
+                        .then(
+                            if (onTapFrame != null) {
+                                Modifier.pointerInput(onTapFrame) {
+                                    detectTapGestures(
+                                        onTap = { o -> onTapFrame(o.x, o.y, false) },
+                                        onLongPress = { o ->
+                                            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                            onTapFrame(o.x, o.y, true)
+                                        }
+                                    )
+                                }
+                            } else {
+                                Modifier
+                            }
+                        )
                         .testTag(FRAME_TAG)
                 ) {
                     AndroidView(
@@ -163,6 +197,7 @@ fun ViewfinderScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                     FrameOverlays(manualUi)
+                    touchBox?.let { AfPoint(it) }
                     if (flash.value > 0f) {
                         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = flash.value)).testTag(SHUTTER_FLASH_TAG))
                     }
@@ -260,6 +295,39 @@ fun ViewfinderScreen(
                 }
             }
         }
+    }
+}
+
+/** B24b: the AF point (white while focusing or metering, green when focused, orange when focus failed) and its lock label. */
+@Composable
+private fun AfPoint(b: TouchBoxUi) {
+    val density = LocalDensity.current
+    val color = when (b.mode) {
+        "FOCUSED" -> AfFocused
+        "NOT_FOCUSED", "TIMED_OUT" -> AfMissed
+        else -> Color.White
+    }
+    val w = with(density) { (b.right - b.left).coerceAtLeast(1f).toDp() }
+    val h = with(density) { (b.bottom - b.top).coerceAtLeast(1f).toDp() }
+    Box(
+        modifier = Modifier
+            .offset { IntOffset(b.left.roundToInt(), b.top.roundToInt()) }
+            .size(w, h)
+            .border(2.dp, color)
+            .testTag(AF_POINT_TAG)
+    )
+    b.lockLabel?.let {
+        Text(
+            it,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color.Black,
+            modifier = Modifier
+                .offset { IntOffset(b.left.roundToInt(), (b.top - with(density) { 18.dp.toPx() }).roundToInt().coerceAtLeast(0)) }
+                .background(color)
+                .padding(horizontal = 3.dp)
+                .testTag(AF_LOCK_TAG)
+        )
     }
 }
 

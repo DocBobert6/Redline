@@ -14,6 +14,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
@@ -94,7 +95,9 @@ data class ViewfinderSetup(
     val rawSize: Dim? = null,
     val frontFacing: Boolean = false,
     /** B14 manual-control ranges; null when the characteristics could not be read. */
-    val manual: ManualCaps? = null
+    val manual: ManualCaps? = null,
+    /** B24b: touch focus / metering (CONTROL_MAX_REGIONS_AF / _AE > 0 only). */
+    val touch: TouchFocusCaps = TouchFocusCaps.NONE
 ) {
     val zoomApi: String get() = if (zoomRatioRange != null) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"
 
@@ -136,7 +139,15 @@ data class ViewfinderSetup(
                 jpegSize = largest(camera.outputSizes["JPEG"]),
                 rawSize = if (camera.has("RAW")) largest(camera.outputSizes["RAW_SENSOR"]) else null,
                 frontFacing = camera.facing == "FRONT",
-                manual = runCatching { manualCaps(ch, camera) }.getOrNull()
+                manual = runCatching { manualCaps(ch, camera) }.getOrNull(),
+                touch = runCatching {
+                    TouchFocusCaps.from(
+                        ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF),
+                        ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE),
+                        camera.afModes,
+                        ch.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
+                    )
+                }.getOrDefault(TouchFocusCaps.NONE)
             )
         }
 
@@ -226,6 +237,9 @@ class ViewfinderController(
 
         /** B22a: the merge workers (native threads, their nice value), once at start-up. */
         fun onMergeWorker(threads: Int, nice: Int) {}
+
+        /** B24b: touch focus changed (a tap, an AF result, a lock, a reset). */
+        fun onTouchFocus(report: TouchFocusReport) {}
     }
 
     /**
@@ -439,6 +453,18 @@ class ViewfinderController(
 
     /** B24.1: the press at the head of the queue is waiting for memory; cleared when buffers come back. */
     private var memoryBlocked = false
+
+    // B24b touch focus / metering (camera thread)
+    private var touch = TouchFocusSession(TouchFocusCaps.NONE)
+    private var touchCaps = TouchFocusCaps.NONE
+    private val scene = SceneChange()
+
+    /** The frame meter (log2 ISO x s x boost) when the tap was made: captures after it are never brighter (+1/3 EV). */
+    private var touchGuardCapEv: Double? = null
+    private var touchLastFrameNs = 0L
+    private var touchNotified: Triple<TouchMode, Boolean, NormRect?>? = null
+    private var guardedCaptures = 0
+    private var lastGuardCutEv: Double? = null
     private val memoryWatchdog = Runnable { checkMemoryWait() }
 
     private class PendingShot(
@@ -465,7 +491,9 @@ class ViewfinderController(
         /** B22b: press-to-file timings for the report. */
         val timeline: ShotTimeline,
         /** B23: the 50/70 mm super-resolution decision (null when it does not apply). */
-        val superRes: SuperResDecision? = null
+        val superRes: SuperResDecision? = null,
+        /** B24b: the tapped region at the press (the render meters with it), or null. */
+        val meterRegion: NormRect? = null
     ) {
         /** Sensor timestamp of the camera-JPEG frame (matches its JPEG image). */
         var timestamp: Long? = null
@@ -603,9 +631,26 @@ class ViewfinderController(
 
     fun setZoom(ratio: Float) {
         handler.post {
+            val changed = zoomRatio != ratio
             zoomRatio = ratio
             repeat()
+            // B24b: a plain tap keeps its place in the frame and focuses again on what is there at the new stop
+            if (changed && touch.active && !touch.locked) startAfCycle(refocus = true)
         }
+    }
+
+    /**
+     * B24b: a tap ([lock] = false) or long-press ([lock] = true) at frame point ([fx], [fy]) (normalised 3:2 frame, sensor
+     * orientation; [TouchMapping.viewToFov] + [TouchMapping.fovToFrame]). A plain tap on the current AF point clears it
+     * (back to continuous auto). Ignored on a camera without AF or AE regions.
+     */
+    fun tapFocus(fx: Double, fy: Double, lock: Boolean) {
+        handler.post { tapOnThread(fx, fy, lock) }
+    }
+
+    /** B24b: back to continuous auto focus and exposure. */
+    fun clearTouchFocus() {
+        handler.post { clearTouch(TouchReset.TAP_OFF) }
     }
 
     /** Applies [applied] (already clamped by ManualModel) to the repeating request and to every later still. */
@@ -653,6 +698,10 @@ class ViewfinderController(
     private fun openOnThread(setup: ViewfinderSetup, texture: SurfaceTexture, ratio: Float, stab: Boolean) {
         if (device != null || opening) return
         this.setup = setup
+        if (touchCaps != setup.touch) {
+            touchCaps = setup.touch
+            touch = TouchFocusSession(setup.touch)
+        }
         zoomRatio = ratio
         stabilization = stab
         firstCaptureSeen = false
@@ -939,11 +988,12 @@ class ViewfinderController(
             caps == null || !caps.manualExposure -> single("camera has no manual exposure control")
             else -> {
                 val m = manual
+                val g = guardedMetered()
                 BurstPlanner.plan(
                     BurstInputs(
                         enabled = true,
-                        meteredIso = meteredIso,
-                        meteredExposureNs = meteredExposureNs,
+                        meteredIso = g?.iso ?: meteredIso,
+                        meteredExposureNs = g?.exposureNs ?: meteredExposureNs,
                         manualIso = if (m?.aeOff == true) m.stillIso else null,
                         manualExposureNs = if (m?.aeOff == true) m.stillExposureNs else null,
                         isoRange = caps.isoRange!!,
@@ -988,6 +1038,13 @@ class ViewfinderController(
         // (nothing will free a buffer) takes no RAW at all.
         val lowMemory = sessionHasRaw && rawReader != null && systemLowOnMemory()
         var plan = planShot(su)
+        if (touch.active && manual?.aeOff != true) {
+            guardedMetered()?.takeIf { it.capped }?.let {
+                guardedCaptures++
+                lastGuardCutEv = it.cutEv
+                notifyTouch(force = true)
+            }
+        }
         if (plan?.isBurst == true && (lowMemory || q.hardFallback != null)) {
             plan = BurstPlan(frames = 0, singleReason = if (lowMemory) ShotRouter.WHY_LOW_MEMORY else "hard fallback", light = plan.light)
         }
@@ -1106,7 +1163,8 @@ class ViewfinderController(
             singlePath = singlePath,
             queuedBehind = inFlight,
             timeline = timeline,
-            superRes = srDecision.takeIf { it.applies }
+            superRes = srDecision.takeIf { it.applies },
+            meterRegion = touch.region
         )
         if (q.memoryWaitSinceMs != null) {
             handler.removeCallbacks(memoryWatchdog)
@@ -1131,7 +1189,10 @@ class ViewfinderController(
                 set(CaptureRequest.JPEG_ORIENTATION, orientation)
                 set(CaptureRequest.JPEG_QUALITY, StillSaver.JPEG_QUALITY.toByte())
                 applyZoom(this, su)
+                // B24b: the still keeps the tapped focus (AF AUTO, no trigger: the lens stays) and meters the region
+                applyTouch(this, su, ae = true)
                 applyManual(this, preview = false)
+                if (run == null && touch.active && manual?.aeOff != true) guardSingle(this, su)
                 if (run != null) {
                     // B22b: the burst's JPEG frame comes after its RAW frames and holds the metered exposure with AE off, so
                     // no frame of the burst waits for the JPEG stream's stall or for an AE on/off switch.
@@ -1169,8 +1230,9 @@ class ViewfinderController(
      * exactly as an AE-on still would be (it is the B21 exposure target) without an AE switch inside the burst.
      */
     private fun holdMeteredExposure(b: CaptureRequest.Builder) {
-        val iso = meteredIso ?: return
-        val exposure = meteredExposureNs ?: return
+        val g = guardedMetered() ?: return
+        val iso = g.iso
+        val exposure = g.exposureNs
         b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
         b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
         b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
@@ -1199,6 +1261,7 @@ class ViewfinderController(
             if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
             applyZoom(this, su)
+            applyTouch(this, su, ae = false)
             applyFocusAndWhiteBalance(this)
             setTag(BurstTag(shotId, index, manual))
         }.build()
@@ -1675,7 +1738,8 @@ class ViewfinderController(
             timeline = p.timeline,
             superRes = p.superRes,
             release = { buffers.releaseAll() },
-            releaseRaw = { k -> buffers.releaseExcept(k) }
+            releaseRaw = { k -> buffers.releaseExcept(k) },
+            meterRegion = p.meterRegion
         )
     }
 
@@ -1825,6 +1889,7 @@ class ViewfinderController(
                 result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { meteredExposureNs = it }
                 meteredBoost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
             }
+            if (touch.active) onTouchResult(result, now)
             if (previewResumePending) {
                 // B22b: the preview paused for a burst; that pause is neither a dropped frame nor a low fps reading.
                 previewResumePending = false
@@ -1866,6 +1931,7 @@ class ViewfinderController(
                 if (su.continuousAf) set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
                 applyZoom(this, su)
+                applyTouch(this, su, ae = true)
                 applyManual(this, preview = true)
             }
             val targetFps = su.aeFpsRange?.second ?: PreviewFps.TARGET
@@ -1884,6 +1950,210 @@ class ViewfinderController(
             // B23b.1: the re-issue after a burst is an optimisation; the running repeating request carries on without it.
             if (!afterBurst) listener.onError("preview request failed: ${e.javaClass.simpleName}")
         }
+    }
+
+    // ------------------------------------------------------------------------------------------ B24b touch focus
+
+    private fun tapOnThread(fx: Double, fy: Double, lock: Boolean) {
+        val su = setup ?: return
+        if (!su.touch.enabled || session == null) return
+        val active = su.activeArray ?: return
+        val r = touch.region
+        if (r != null && !lock && r.contains(fx, fy)) {
+            clearTouch(TouchReset.TAP_OFF)
+            return
+        }
+        val afOk = su.touch.af && manual?.focusDiopters == null
+        val aeOk = su.touch.ae && manual?.aeOff != true
+        if (!afOk && !aeOk) return
+        val side = colourPipeline?.spotModel?.regionShortSide ?: TouchMapping.DEFAULT_REGION_SHORT_SIDE
+        val region = TouchMapping.regionAround(fx, fy, active.width(), active.height(), side)
+        // the frame meter before the region steers auto exposure: the highlight guard's ceiling for this tap
+        if (!touch.active) touchGuardCapEv = meteredEv()
+        val now = SystemClock.elapsedRealtime()
+        if (!touch.tap(region, now, lock, af = afOk)) return
+        scene.start(now)
+        repeat()
+        startAfCycle(refocus = false)
+        notifyTouch(force = true)
+    }
+
+    /** One AF cycle at the tapped region: AF_TRIGGER_START on top of the repeating AUTO request (camera thread). */
+    private fun startAfCycle(refocus: Boolean) {
+        val su = setup ?: return
+        val s = session ?: return
+        val cam = device ?: return
+        val target = surface ?: return
+        val afOk = su.touch.af && manual?.focusDiopters == null
+        if (refocus) {
+            if (!afOk) return
+            touch.refocus(SystemClock.elapsedRealtime())
+        }
+        if (!afOk || !touch.awaitingTrigger) {
+            touch.triggerSubmitted()
+            return
+        }
+        try {
+            val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(target)
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                su.aeFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.second)) }
+                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, stabilizationMode())
+                applyZoom(this, su)
+                applyTouch(this, su, ae = true)
+                applyManual(this, preview = true)
+                set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            }.build()
+            s.capture(req, triggerCallback, handler)
+        } catch (e: Exception) {
+            Log.w(TAG, "AF trigger failed", e)
+            touch.triggerSubmitted()
+        }
+    }
+
+    private val triggerCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            touch.triggerSubmitted()
+            onTouchResult(result, SystemClock.elapsedRealtime())
+        }
+
+        override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+            touch.triggerSubmitted()
+        }
+    }
+
+    private fun clearTouch(why: TouchReset) {
+        if (!touch.active) return
+        touch.reset(why)
+        touchGuardCapEv = null
+        repeat()
+        notifyTouch(force = true)
+    }
+
+    /**
+     * B24b: the tapped region on a request: AF AUTO + AF regions (no trigger here, so the lens holds where the tap focused;
+     * not under a manual focus distance) and, when [ae], AE regions plus the long-press AE lock. Written only for what the
+     * camera reports (CONTROL_MAX_REGIONS_AF / _AE > 0); nothing at all without a tap.
+     */
+    private fun applyTouch(b: CaptureRequest.Builder, su: ViewfinderSetup, ae: Boolean) {
+        val region = touch.region ?: return
+        val rect = touchRect(su, region) ?: return
+        val mr = arrayOf(MeteringRectangle(rect.left, rect.top, rect.width, rect.height, TouchMapping.REGION_WEIGHT))
+        if (su.touch.af && manual?.focusDiopters == null) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+            b.set(CaptureRequest.CONTROL_AF_REGIONS, mr)
+        }
+        if (ae && su.touch.ae && manual?.aeOff != true) {
+            b.set(CaptureRequest.CONTROL_AE_REGIONS, mr)
+            if (touch.aeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+        }
+    }
+
+    /** The region as a Camera2 metering rectangle at the current zoom (through CONTROL_ZOOM_RATIO or the crop region). */
+    private fun touchRect(su: ViewfinderSetup, region: NormRect): PxRect? {
+        val active = su.activeArray ?: return null
+        val zoomApi = su.zoomRatioRange != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        val crop = if (zoomApi) {
+            null
+        } else {
+            TouchMapping.cropRegion(active.width(), active.height(), zoomRatio.coerceIn(1f, maxOf(1f, su.maxDigitalZoom)))
+        }
+        return TouchMapping.meteringRect(region, active.width(), active.height(), zoomApi, crop)
+    }
+
+    /** One preview (or trigger) result while a tap is active: AF progress, and a large scene change for a plain tap. */
+    private fun onTouchResult(result: TotalCaptureResult, now: Long) {
+        val af = when (result.get(CaptureResult.CONTROL_AF_STATE)) {
+            CameraMetadata.CONTROL_AF_STATE_INACTIVE -> AfState.INACTIVE
+            CameraMetadata.CONTROL_AF_STATE_ACTIVE_SCAN, CameraMetadata.CONTROL_AF_STATE_PASSIVE_SCAN -> AfState.SCANNING
+            CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED -> AfState.FOCUSED
+            CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> AfState.NOT_FOCUSED
+            else -> AfState.UNKNOWN
+        }
+        touch.onAfState(af, now)
+        if (touch.armLockIfDue(now)) {
+            repeat()
+            notifyTouch(force = true)
+        }
+        if (!touch.locked) {
+            val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
+            val dt = if (touchLastFrameNs in 1 until ts) (ts - touchLastFrameNs) / 1e9 else 0.0
+            touchLastFrameNs = ts
+            val ev = meteredEv() ?: Double.NaN
+            val reset = when {
+                scene.onExposure(ev, now) -> TouchReset.SCENE_EV
+                scene.onMotion(motionRadPerSec ?: 0.0, dt, stopHfovRad()) -> TouchReset.SCENE_PAN
+                else -> null
+            }
+            if (reset != null) {
+                clearTouch(reset)
+                return
+            }
+        }
+        notifyTouch(force = false)
+    }
+
+    /** log2(ISO x exposure s x boost) of the latest auto-exposure preview result, or null. */
+    private fun meteredEv(): Double? {
+        val iso = meteredIso ?: return null
+        val exposure = meteredExposureNs ?: return null
+        return TouchExposureGuard.ev(iso, exposure, meteredBoost)
+    }
+
+    /** Horizontal field of view of the current stop (3:2 full-frame width 36 mm at the reference lens x zoom). */
+    private fun stopHfovRad(): Double {
+        val ref = setup?.zoomPlan?.reference?.equivalent32Mm?.toDouble()?.takeIf { it > 0 } ?: ZoomStops.REFERENCE_EQ_MM.toDouble()
+        return 2.0 * Math.atan(18.0 / (ref * zoomRatio.coerceAtLeast(1f)))
+    }
+
+    /** The metered exposure under the highlight guard (unchanged without a tap); null without a metered reading. */
+    private fun guardedMetered(): TouchExposureGuard.Exposure? {
+        val iso = meteredIso ?: return null
+        val exposure = meteredExposureNs ?: return null
+        if (!touch.active) return TouchExposureGuard.Exposure(iso, exposure, false, 0.0)
+        val caps = setup?.manual
+        return TouchExposureGuard.cap(
+            iso,
+            exposure,
+            meteredBoost,
+            touchGuardCapEv,
+            caps?.isoRange?.first ?: iso,
+            caps?.exposureRangeNs?.first ?: exposure
+        )
+    }
+
+    /** A single (AE on) still after a tap: when the guard cuts the exposure, the still holds the guarded exposure instead. */
+    private fun guardSingle(b: CaptureRequest.Builder, su: ViewfinderSetup) {
+        if (su.manual?.manualExposure != true) return
+        if (guardedMetered()?.capped == true) holdMeteredExposure(b)
+    }
+
+    private fun notifyTouch(force: Boolean) {
+        val key = Triple(touch.mode, touch.locked, touch.region)
+        if (!force && key == touchNotified) return
+        touchNotified = key
+        val su = setup
+        listener.onTouchFocus(
+            TouchFocusReport(
+                caps = su?.touch ?: TouchFocusCaps.NONE,
+                region = touch.region,
+                meteringRect = touch.region?.let { r -> su?.let { touchRect(it, r) } },
+                zoomRatio = zoomRatio,
+                mode = touch.mode,
+                afState = touch.lastAfState,
+                locked = touch.locked,
+                aeLocked = touch.aeLock,
+                taps = touch.taps,
+                locks = touch.locks,
+                lastFocusMs = touch.lastFocusMs,
+                focusTimesMs = touch.focusTimesMs.toList(),
+                resets = touch.resets.mapKeys { it.key.name.lowercase() },
+                lastReset = touch.lastReset?.name?.lowercase(),
+                guardedCaptures = guardedCaptures,
+                lastGuardCutEv = lastGuardCutEv
+            )
+        )
     }
 
     private fun applyZoom(b: CaptureRequest.Builder, su: ViewfinderSetup) {
@@ -1940,6 +2210,11 @@ class ViewfinderController(
 
     private fun closeOnThread(f: CompletableFuture<Unit>) {
         generation++
+        if (touch.active) {
+            touch.reset(TouchReset.CAMERA_CLOSED)
+            touchGuardCapEv = null
+            notifyTouch(force = true)
+        }
         val cam = device
         runCatching { session?.close() }
         session = null

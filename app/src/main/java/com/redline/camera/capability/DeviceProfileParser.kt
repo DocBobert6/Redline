@@ -55,7 +55,9 @@ object DeviceProfileParser {
             cctWhiteBalance = m.bool("cct_white_balance") == true,
             lowLightBoost = m.bool("low_light_boost") == true,
             extensions = strings(m.list("extensions")),
-            colourCalibrationExposed = m.bool("colour_calibration_exposed") == true
+            colourCalibrationExposed = m.bool("colour_calibration_exposed") == true,
+            maxRegionsAf = m.int("max_regions_af"),
+            maxRegionsAe = m.int("max_regions_ae")
         )
     }
 

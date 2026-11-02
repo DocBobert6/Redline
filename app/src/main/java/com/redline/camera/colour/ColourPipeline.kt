@@ -17,6 +17,9 @@ import com.redline.camera.capture.RawCopy
 import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.look.CubeLut
 import com.redline.camera.nativebridge.RedlineNative
+import com.redline.camera.viewfinder.NormRect
+import com.redline.camera.viewfinder.PxRect
+import com.redline.camera.viewfinder.TouchMapping
 
 /**
  * B21 RAW colour pipeline on the phone (PLAN 6 steps 3-6, single frame): RAW_SENSOR -> normalise (levels, lens
@@ -158,7 +161,8 @@ class ColourPipeline(context: Context) {
         zoomRatio: Float,
         stopLongPx: Int,
         levelScale: Float = 1f,
-        stopMm: Int = 0
+        stopMm: Int = 0,
+        spot: NormRect? = null
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -180,10 +184,14 @@ class ColourPipeline(context: Context) {
             val m = ShotPlanner.floats(g.solve.matrix)
             val n = ShotPlanner.floats(g.solve.neutral)
             val st = RedlineNative.rawStats(frame, g.crop, m, n, ColourMath.STATS_STEP)
+            // B24b: the tapped region's stats over the same CFA cells (a few hundred samples), for the touch-metering shift;
+            // a region the native side refuses is no reason to lose the shot (no shift then)
+            val spotPx = spot?.let { TouchMapping.regionInCrop(it, PxRect(g.crop[0], g.crop[1], g.crop[2], g.crop[3]), even = true) }
+            val spotSt = spotPx?.let { runCatching { RedlineNative.rawStats(frame, it.toIntArray(), m, n, spotStep(it, 2)) }.getOrNull() }
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val met = metering ?: return fail("metering not loaded")
-            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction)
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction, spotSt?.medianY ?: Double.NaN)
             val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
@@ -215,6 +223,7 @@ class ColourPipeline(context: Context) {
                     p98Y = st.p98Y.takeIf { it.isFinite() },
                     sceneHiEv = sceneHi(st),
                     sceneSplitEv = sceneSplit(st),
+                    spot = spotShot(spotPx, spotSt, st, tn.exposure),
                     outSize = g.out,
                     timingsMs = timings,
                     iso = sensitivity(result),
@@ -241,7 +250,8 @@ class ColourPipeline(context: Context) {
         jpeg: ByteArray,
         outWidth: Int,
         outHeight: Int,
-        stopMm: Int = 0
+        stopMm: Int = 0,
+        spot: NormRect? = null
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -262,10 +272,12 @@ class ColourPipeline(context: Context) {
             val m = ShotPlanner.floats(solve.matrix)
             val n = ShotPlanner.floats(solve.neutral)
             val st = sr.stats(m, n, 2 * ColourMath.STATS_STEP)
+            val spotPx = spot?.let { TouchMapping.regionInCrop(it, PxRect(0, 0, outWidth, outHeight), even = false) }
+            val spotSt = spotPx?.let { runCatching { sr.stats(m, n, spotStep(it, 1), it.toIntArray()) }.getOrNull() }
             timings["stats"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val met = metering ?: return fail("metering not loaded")
-            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction)
+            val tn = ShotPlanner.meteredTone(t, st.medianY, st.p98Y, met, st.p25Y, st.clippedFraction, spotSt?.medianY ?: Double.NaN)
             val jpegEv = median?.let { ColourMath.solveExposure(t, st.medianY, it).ev }
             val table = tn.table
             timings["plan"] = SystemClock.elapsedRealtime() - t1
@@ -297,6 +309,7 @@ class ColourPipeline(context: Context) {
                     p98Y = st.p98Y.takeIf { it.isFinite() },
                     sceneHiEv = sceneHi(st),
                     sceneSplitEv = sceneSplit(st),
+                    spot = spotShot(spotPx, spotSt, st, tn.exposure),
                     outSize = Dim(outWidth, outHeight),
                     timingsMs = timings,
                     iso = sensitivity(result),
@@ -411,6 +424,22 @@ class ColourPipeline(context: Context) {
         return black to white
     }
 
+    /**
+     * B24b: sampling step for a tapped region so it gives ~24 samples per side ([pxPerSample] pixels per sample unit: 2 for
+     * CFA cells, 1 for the super-resolution grid), never coarser than the frame's own stats.
+     */
+    private fun spotStep(r: PxRect, pxPerSample: Int): Int =
+        (minOf(r.width, r.height) / pxPerSample / SPOT_SAMPLES_PER_SIDE).coerceIn(1, ColourMath.STATS_STEP)
+
+    private fun spotShot(px: PxRect?, st: RedlineNative.Stats?, frame: RedlineNative.Stats, e: ColourMath.Exposure): SpotShot? {
+        if (px == null || st == null) return null
+        val d = if (st.medianY > 0 && frame.medianY > 0) Math.log(frame.medianY / st.medianY) / Math.log(2.0) else null
+        return SpotShot(px.toList(), st.medianY, d, e.spotShiftEv, st.cells)
+    }
+
+    /** Touch-metering model (metering.json spot), or null when the asset has none. */
+    val spotModel: ColourMath.Spot? get() = metering?.spot
+
     /** True once the self-check passed (the burst merge renders through the same pipeline). */
     val isReady: Boolean get() = ready
 
@@ -453,6 +482,7 @@ class ColourPipeline(context: Context) {
         const val LOOK_NAME = "Redline Standard"
         const val TONE_ASSET = "colour/standard_tone.json"
         const val METERING_ASSET = "colour/metering.json"
+        private const val SPOT_SAMPLES_PER_SIDE = 24
         const val LUT_ASSET = "luts/redline_standard_preview_33.cube"
         const val SELF_CHECK_ASSET = "colour/self_check.json"
         const val DETAIL_ASSET = "colour/detail.json"

@@ -21,6 +21,7 @@ import com.redline.camera.capability.Dim
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourShot
 import com.redline.camera.nativebridge.RedlineNative
+import com.redline.camera.viewfinder.NormRect
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.OutputStream
@@ -70,7 +71,9 @@ class StillShot(
      * written). Called by the saver once the RAW render is done, before the upscale, the detail post-pass and the store,
      * so a busy queue gets its buffers back sooner. [release] still returns whatever is left, exactly once.
      */
-    val releaseRaw: (keep: ByteBuffer?) -> Unit = {}
+    val releaseRaw: (keep: ByteBuffer?) -> Unit = {},
+    /** B24b: the tapped region (frame-normalised, sensor orientation) the render meters with, or null (no tap). */
+    val meterRegion: NormRect? = null
 )
 
 /**
@@ -252,7 +255,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     shot.jpeg,
                     sr.outWidth,
                     sr.outHeight,
-                    shot.stopTargetMm
+                    shot.stopTargetMm,
+                    shot.meterRegion
                 )
                 srImage.close()
                 rendered = o.bitmap
@@ -271,7 +275,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.zoomRatio,
                         shot.stopLongPx,
                         b.mergedScale,
-                        shot.stopTargetMm
+                        shot.stopTargetMm,
+                        shot.meterRegion
                     )
                     rendered = o.bitmap
                     colour = o.shot
@@ -287,7 +292,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.jpeg,
                         shot.zoomRatio,
                         shot.stopLongPx,
-                        stopMm = shot.stopTargetMm
+                        stopMm = shot.stopTargetMm,
+                        spot = shot.meterRegion
                     )
                     rendered = o.bitmap
                     colour = o.shot
@@ -333,7 +339,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 shot.jpeg,
                 shot.zoomRatio,
                 shot.stopLongPx,
-                stopMm = shot.stopTargetMm
+                stopMm = shot.stopTargetMm,
+                spot = shot.meterRegion
             )
             rendered = o.bitmap
             colour = o.shot

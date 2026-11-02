@@ -50,7 +50,8 @@ class PreviewTextureView(context: Context) : TextureView(context) {
         super.onDetachedFromWindow()
     }
 
-    private fun displayRotationDegrees(): Int = when (display?.rotation ?: Surface.ROTATION_0) {
+    /** The display rotation in degrees (B24b maps taps through it). */
+    fun displayRotationDegrees(): Int = when (display?.rotation ?: Surface.ROTATION_0) {
         Surface.ROTATION_90 -> 90
         Surface.ROTATION_180 -> 180
         Surface.ROTATION_270 -> 270
