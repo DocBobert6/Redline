@@ -73,7 +73,11 @@ data class ColourShot(
     val sceneSplitEv: Double? = null,
     val outSize: Dim? = null,
     /** Stage timings in ms: jpeg_median, stats, plan, render, encode (filled by the saver), total. */
-    val timingsMs: Map<String, Long> = emptyMap()
+    val timingsMs: Map<String, Long> = emptyMap(),
+    /** B24: the shot's SENSOR_SENSITIVITY (the grain's ISO), the zoom stop the vignette used, and the detail stage. */
+    val iso: Int? = null,
+    val stopMm: Int? = null,
+    val detail: DetailShot? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "rendered" to rendered,
@@ -91,7 +95,10 @@ data class ColourShot(
         "scene_hi_ev" to sceneHiEv?.let { r3(it) },
         "scene_split_ev" to sceneSplitEv?.let { r3(it) },
         "out_size" to outSize?.toString(),
-        "timings_ms" to timingsMs
+        "timings_ms" to timingsMs,
+        "iso" to iso,
+        "picture_style" to detail?.pictureStyle,
+        "detail" to detail?.toMap()
     )
 }
 
@@ -141,7 +148,12 @@ data class ColourPipelineReport(
     val last: ColourShot? = null,
     val sessionRawUnavailable: String? = null,
     /** B23c: how stills are metered (the method of the last rendered shot, else the configured one). */
-    val meteringHoldoutMaeEv: Double? = null
+    val meteringHoldoutMaeEv: Double? = null,
+    /** B24: the detail toggles, the asset's Picture Style (Standard only) and why the asset is missing, if it is. */
+    val detailSettings: DetailSettings = DetailSettings(),
+    val pictureStyle: String? = null,
+    val pictureStylesNote: String? = null,
+    val detailError: String? = null
 ) {
     val exposureMethod: String get() = last?.exposureMethod?.takeIf { last.rendered } ?: ColourMath.METERING_METHOD
 
@@ -185,6 +197,15 @@ data class ColourPipelineReport(
         "exposure_method" to exposureMethod,
         "metering" to METERING_LABEL,
         "metering_holdout_mae_ev" to meteringHoldoutMaeEv,
+        "picture_style" to (pictureStyle ?: "Standard"),
+        "picture_styles_note" to pictureStylesNote,
+        "detail" to linkedMapOf(
+            "label" to DETAIL_LABEL,
+            "settings" to detailSettings.toMap(),
+            "asset_error" to detailError,
+            "params" to DETAIL_PARAMS,
+            "micro_contrast_gate" to MICRO_CONTRAST_GATE
+        ),
         "self_check" to selfCheck?.let {
             linkedMapOf(
                 "mean_de2000" to it.meanDe2000?.let { v -> r4(v) },
@@ -210,6 +231,19 @@ data class ColourPipelineReport(
 
     companion object {
         const val LABEL = "RAW colour pipeline (B21): phone matrices -> XYZ -> Standard"
+        const val DETAIL_LABEL = "B24: in-camera residual vignette (0.55 x lensfun EV, linear light), distortion (RAW feel, " +
+            "default off), Canon Standard luma sharpening, grain topped up to the R5 II JPEG noise at the shot ISO"
+
+        /** The fitted values in assets/colour/detail.json, for the report (the asset itself is what renders). */
+        val DETAIL_PARAMS: Map<String, Any?> = linkedMapOf(
+            "vignette_alpha" to 0.55,
+            "vignette_f_number" to 2.8,
+            "sharpen_4000" to "sigma 1.217 px, amount 0.707, threshold 8/255",
+            "sharpen_3000" to "sigma 0.933 px, amount 0.534, threshold 3/255",
+            "grain" to "ln sigma = c0 + c1 s + c2 s^2 (s = log2(ISO/100)) x luma-bin shape; [w, 1-2w, w] filtered luma noise"
+        )
+        const val MICRO_CONTRAST_GATE = "hold-out low-ISO R5 II pairs, amplitude-spectrum ratio ours/Canon per band within " +
+            "the train scene-to-scene spread: pass at 4000 and 3000 px (see BUILD_PLAN B24)"
         const val METERING_LABEL = "B23c: mid-tone target fitted from R5 II RAW + camera JPEG pairs " +
             "(log2(p98/median) of the frame), not the phone JPEG's median; B23c.1: + headroom lift when " +
             "log2(median/p25) is large and p98 sits below the R5 II's p98 floor (last.metering_headroom_lift_ev)"

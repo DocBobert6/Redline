@@ -54,6 +54,11 @@ struct RenderSpec {
     const float* lut = nullptr;
     int lutSize = 0;
     int threads = 1;
+    // B24: residual vignette, gain at r = 0 .. 1 in vignettePoints uniform steps (linear interpolation, clamped),
+    // r = distance of the output pixel centre from the frame centre / half-diagonal. Multiplies the linear values
+    // after the matrix (and the area downscale), before the curve. nullptr = off.
+    const float* vignette = nullptr;
+    int vignettePoints = 0;
 };
 
 struct RawStats {

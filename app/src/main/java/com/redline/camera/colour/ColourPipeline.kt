@@ -33,7 +33,11 @@ class ColourPipeline(context: Context) {
         val reason: String?,
         val nativeVersion: String?,
         val selfCheck: ColourSelfCheck?,
-        val metering: ColourMath.Metering? = null
+        val metering: ColourMath.Metering? = null,
+        /** B24: the detail asset (vignette, distortion, sharpening, grain), or why it did not load (the still is then
+         * rendered without the detail stage). */
+        val detail: DetailAsset? = null,
+        val detailError: String? = null
     )
 
     class Outcome(val bitmap: Bitmap?, val shot: ColourShot)
@@ -43,6 +47,11 @@ class ColourPipeline(context: Context) {
     @Volatile private var lut: CubeLut? = null
 
     @Volatile private var metering: ColourMath.Metering? = null
+
+    @Volatile private var detail: DetailAsset? = null
+
+    /** B24: the Info screen's detail toggles (read at the start of each render and post-pass). */
+    @Volatile var detailSettings: DetailSettings = DetailSettings()
 
     @Volatile private var bundled: List<BundledProfile> = emptyList()
 
@@ -61,10 +70,17 @@ class ColourPipeline(context: Context) {
         } catch (e: Exception) {
             return Prepared(false, "assets: ${e.javaClass.simpleName}: ${e.message}", native.version, null)
         }
+        // B24: the detail asset is optional; without it stills render as before (no vignette, sharpening or grain).
+        val detailError = try {
+            detail = DetailAsset.parse(JsonParse.parse(asset(DETAIL_ASSET)) as Map<*, *>)
+            null
+        } catch (e: Exception) {
+            "${e.javaClass.simpleName}: ${e.message}"
+        }
         val check = runSelfCheck()
         ready = check.passed
         val reason = if (check.passed) null else "self-check failed: " + (check.error ?: describe(check))
-        return Prepared(check.passed, reason, native.version, check, metering)
+        return Prepared(check.passed, reason, native.version, check, metering, detail, detailError)
     }
 
     private fun describe(c: ColourSelfCheck): String =
@@ -141,7 +157,8 @@ class ColourPipeline(context: Context) {
         jpeg: ByteArray,
         zoomRatio: Float,
         stopLongPx: Int,
-        levelScale: Float = 1f
+        levelScale: Float = 1f,
+        stopMm: Int = 0
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -174,7 +191,7 @@ class ColourPipeline(context: Context) {
             val out = Bitmap.createBitmap(g.out.width, g.out.height, Bitmap.Config.ARGB_8888)
             val err = RedlineNative.renderRaw(
                 frame, g.crop, m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(),
-                l, threads(), out
+                l, threads(), out, vignetteTable(stopMm)
             )
             timings["render"] = SystemClock.elapsedRealtime() - t1
             timings["total"] = SystemClock.elapsedRealtime() - t0
@@ -199,7 +216,9 @@ class ColourPipeline(context: Context) {
                     sceneHiEv = sceneHi(st),
                     sceneSplitEv = sceneSplit(st),
                     outSize = g.out,
-                    timingsMs = timings
+                    timingsMs = timings,
+                    iso = sensitivity(result),
+                    stopMm = stopMm
                 )
             )
         } catch (e: Exception) {
@@ -221,7 +240,8 @@ class ColourPipeline(context: Context) {
         cameraId: String,
         jpeg: ByteArray,
         outWidth: Int,
-        outHeight: Int
+        outHeight: Int,
+        stopMm: Int = 0
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -252,7 +272,8 @@ class ColourPipeline(context: Context) {
             t1 = SystemClock.elapsedRealtime()
             val out = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
             val err = sr.render(
-                m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), l, threads(), out
+                m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), l, threads(), out,
+                vignetteTable(stopMm)
             )
             timings["render"] = SystemClock.elapsedRealtime() - t1
             timings["total"] = SystemClock.elapsedRealtime() - t0
@@ -277,13 +298,85 @@ class ColourPipeline(context: Context) {
                     sceneHiEv = sceneHi(st),
                     sceneSplitEv = sceneSplit(st),
                     outSize = Dim(outWidth, outHeight),
-                    timingsMs = timings
+                    timingsMs = timings,
+                    iso = sensitivity(result),
+                    stopMm = stopMm
                 )
             )
         } catch (e: Exception) {
             fail("${e.javaClass.simpleName}: ${e.message}")
         } catch (e: OutOfMemoryError) {
             fail("out of memory")
+        }
+    }
+
+    /** B24: the stop's residual vignette table when the toggle is on and the asset loaded (0 mm = no stop: none). */
+    private fun vignetteTable(stopMm: Int): FloatArray? {
+        val d = detail ?: return null
+        return if (detailSettings.vignette && stopMm > 0) d.vignetteFor(stopMm) else null
+    }
+
+    private fun sensitivity(result: TotalCaptureResult): Int? = runCatching { result.get(CaptureResult.SENSOR_SENSITIVITY) }.getOrNull()
+
+    /**
+     * B24: the detail post-pass on the finished still (after the 50/70 upscale), in place: distortion (RAW feel
+     * toggle), Canon Standard sharpening, grain topped up to the R5 II camera JPEG's noise at the shot's [iso].
+     * Returns what it did (null when the asset is missing or every post-pass toggle is off). Never throws.
+     */
+    fun applyDetail(bitmap: Bitmap, iso: Int?, stopMm: Int, seed: Int): DetailShot? {
+        val d = detail ?: return null
+        val set = detailSettings
+        val vig = if (set.vignette && stopMm > 0) d.cornerEv(stopMm) else null
+        if (!set.sharpen && !set.grain && !set.distortion) {
+            return vig?.let {
+                DetailShot(d.pictureStyle, stopMm, it, d.vignetteAlpha, false, null, null, null, null, null, null, emptyMap())
+            }
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        val usm = if (set.sharpen) d.usmFor(bitmap.width) else null
+        val grainIso = if (set.grain && iso != null && iso > 0) iso.toDouble() else null
+        val target = grainIso?.let { d.grainTarget(it, bitmap.width) }
+        val g = d.grainFor(bitmap.width)
+        return try {
+            val st = RedlineNative.applyDetail(
+                bitmap,
+                set.distortion && stopMm > 0,
+                if (stopMm > 0) d.distortionFor(stopMm) else FloatArray(3),
+                (usm?.sigma ?: 1.0).toFloat(),
+                (usm?.amount ?: 0.0).toFloat(),
+                (usm?.threshold ?: 0.0).toFloat(),
+                target,
+                g.kernelW.toFloat(),
+                g.kappa.toFloat(),
+                seed,
+                threads()
+            )
+            val timings = linkedMapOf(
+                "total" to SystemClock.elapsedRealtime() - t0,
+                "distortion" to Math.round(st.distortMs),
+                "sharpen" to Math.round(st.sharpenMs),
+                "noise_estimate" to Math.round(st.noiseMs),
+                "grain" to Math.round(st.grainMs)
+            )
+            DetailShot(
+                pictureStyle = d.pictureStyle,
+                stopMm = stopMm,
+                vignetteCornerEv = vig,
+                vignetteAlpha = vig?.let { d.vignetteAlpha },
+                distortion = set.distortion && stopMm > 0,
+                distortScale = if (set.distortion && stopMm > 0) st.distortScale else null,
+                sharpen = usm,
+                grainIso = grainIso,
+                grainTarget = target?.map { it.toDouble() },
+                grainMeasured = if (target != null) st.measured else null,
+                grainAdded = if (target != null) st.added else null,
+                timingsMs = timings
+            )
+        } catch (e: Exception) {
+            DetailShot(
+                d.pictureStyle, stopMm, vig, d.vignetteAlpha, false, null, null, null, null, null, null,
+                mapOf("total" to SystemClock.elapsedRealtime() - t0), error = "${e.javaClass.simpleName}: ${e.message}"
+            )
         }
     }
 
@@ -359,6 +452,7 @@ class ColourPipeline(context: Context) {
         const val METERING_ASSET = "colour/metering.json"
         const val LUT_ASSET = "luts/redline_standard_preview_33.cube"
         const val SELF_CHECK_ASSET = "colour/self_check.json"
+        const val DETAIL_ASSET = "colour/detail.json"
         val PROFILE_ASSETS = listOf("colour/baseline_profile.json")
         private const val MAX_THREADS = 8
 

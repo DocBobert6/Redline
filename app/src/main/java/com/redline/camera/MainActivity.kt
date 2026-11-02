@@ -52,6 +52,7 @@ import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourPipelineReport
+import com.redline.camera.colour.DetailSettings
 import com.redline.camera.colour.ProfileChoice
 import com.redline.camera.look.CubeLut
 import com.redline.camera.look.LookPreviewRenderer
@@ -64,6 +65,10 @@ import com.redline.camera.manual.ManualSettings
 import com.redline.camera.manual.ShootMode
 import com.redline.camera.nativebridge.RedlineNative
 import com.redline.camera.ui.CapabilityScreen
+import com.redline.camera.ui.DETAIL_DISTORTION
+import com.redline.camera.ui.DETAIL_GRAIN
+import com.redline.camera.ui.DETAIL_SHARPEN
+import com.redline.camera.ui.DETAIL_VIGNETTE
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
 import com.redline.camera.ui.ViewfinderScreen
@@ -185,6 +190,9 @@ class MainActivity : ComponentActivity() {
     // worker; stills are rendered from RAW while it is enabled, else they come from the camera JPEG.
     private lateinit var colourPipeline: ColourPipeline
     private var colourSetting = true
+
+    /** B24: the detail toggles (vignette, sharpening, grain on; distortion off), persisted like the other settings. */
+    private var detailSetting = DetailSettings()
     private var colourPrepared: ColourPipeline.Prepared? = null
     private var colourChoice: ProfileChoice? = null
 
@@ -415,6 +423,13 @@ class MainActivity : ComponentActivity() {
         superResSetting = prefs.getBoolean(PREF_SUPER_RES, true)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
+        detailSetting = DetailSettings(
+            vignette = prefs.getBoolean(PREF_DETAIL_VIGNETTE, true),
+            sharpen = prefs.getBoolean(PREF_DETAIL_SHARPEN, true),
+            grain = prefs.getBoolean(PREF_DETAIL_GRAIN, true),
+            distortion = prefs.getBoolean(PREF_DETAIL_DISTORTION, false)
+        )
+        colourPipeline.detailSettings = detailSetting
         lookRenderer = LookPreviewRenderer(lookListener)
         lookRenderer.setStrength(lookStrength)
         // Start-up checks run in parallel with the profile load, so the camera can open on the right path at once.
@@ -448,7 +463,11 @@ class MainActivity : ComponentActivity() {
                 status = "starting"
             ),
             lookPreview = LookPreviewReport(userSetting = lookSetting, strength = lookStrength, lutName = LOOK_LUT_ASSET),
-            colourPipeline = ColourPipelineReport(userSetting = colourSetting, lookName = ColourPipeline.LOOK_NAME),
+            colourPipeline = ColourPipelineReport(
+                userSetting = colourSetting,
+                lookName = ColourPipeline.LOOK_NAME,
+                detailSettings = detailSetting
+            ),
             burst = BurstReport(userSetting = burstSetting),
             superRes = SuperResReport(userSetting = superResSetting)
         )
@@ -460,7 +479,10 @@ class MainActivity : ComponentActivity() {
                     it.copy(
                         nativeVersion = prepared.nativeVersion,
                         selfCheck = prepared.selfCheck,
-                        meteringHoldoutMaeEv = prepared.metering?.holdoutMaeEv
+                        meteringHoldoutMaeEv = prepared.metering?.holdoutMaeEv,
+                        pictureStyle = prepared.detail?.pictureStyle,
+                        pictureStylesNote = prepared.detail?.stylesNote,
+                        detailError = prepared.detailError
                     )
                 }
                 refreshColourAvailability()
@@ -696,6 +718,7 @@ class MainActivity : ComponentActivity() {
                 },
                 onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
                 onToggleColourPipeline = if (state.value.colourPipeline.available == true) ::toggleColourPipeline else null,
+                onToggleDetail = if (state.value.colourPipeline.available == true) ::toggleDetail else null,
                 onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
                 onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
@@ -1326,6 +1349,26 @@ class MainActivity : ComponentActivity() {
         syncColourPipeline()
     }
 
+    /** B24: flips one detail toggle; applies to the next still the saver renders. */
+    private fun toggleDetail(which: String) {
+        val d = detailSetting
+        detailSetting = when (which) {
+            DETAIL_VIGNETTE -> d.copy(vignette = !d.vignette)
+            DETAIL_SHARPEN -> d.copy(sharpen = !d.sharpen)
+            DETAIL_GRAIN -> d.copy(grain = !d.grain)
+            DETAIL_DISTORTION -> d.copy(distortion = !d.distortion)
+            else -> d
+        }
+        prefs.edit {
+            putBoolean(PREF_DETAIL_VIGNETTE, detailSetting.vignette)
+            putBoolean(PREF_DETAIL_SHARPEN, detailSetting.sharpen)
+            putBoolean(PREF_DETAIL_GRAIN, detailSetting.grain)
+            putBoolean(PREF_DETAIL_DISTORTION, detailSetting.distortion)
+        }
+        colourPipeline.detailSettings = detailSetting
+        state.value = state.value.copy(colourPipeline = state.value.colourPipeline.copy(detailSettings = detailSetting))
+    }
+
     private fun updateColour(change: (ColourPipelineReport) -> ColourPipelineReport) {
         update { s -> s.copy(colourPipeline = change(s.colourPipeline)) }
     }
@@ -1558,6 +1601,10 @@ class MainActivity : ComponentActivity() {
         private const val PREF_COLOUR_PIPELINE = "colour_pipeline"
         private const val PREF_BURST_MERGE = "burst_merge"
         private const val PREF_SUPER_RES = "super_resolution"
+        private const val PREF_DETAIL_VIGNETTE = "detail_vignette"
+        private const val PREF_DETAIL_SHARPEN = "detail_sharpen"
+        private const val PREF_DETAIL_GRAIN = "detail_grain"
+        private const val PREF_DETAIL_DISTORTION = "detail_distortion"
         private const val GYRO_SMOOTHING = 0.1
         private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
         private const val LOOK_BADGE = "Look preview (approx.)"

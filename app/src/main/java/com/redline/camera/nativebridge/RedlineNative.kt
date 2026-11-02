@@ -94,7 +94,8 @@ object RedlineNative {
 
     /**
      * Renders [crop] of the frame into [out] (ARGB_8888, the output size) through the B21 pipeline. Returns null on
-     * success, else the native error (nothing useful is in the bitmap then).
+     * success, else the native error (nothing useful is in the bitmap then). B24: [vignette] is the residual vignette
+     * gain table (r = 0..1, applied in linear light before the curve), or null for none.
      */
     fun renderRaw(
         f: RawFrame,
@@ -107,14 +108,73 @@ object RedlineNative {
         curveHi: Float,
         lut: CubeLut,
         threads: Int,
-        out: Bitmap
+        out: Bitmap,
+        vignette: FloatArray? = null
     ): String? {
         val loaded = load()
         if (!loaded.loaded) return "native library not loaded: ${loaded.error}"
         return nativeRenderRaw(
             f.buffer, f.width, f.height, f.rowStrideBytes, f.cfa, f.black, f.white, f.shading, f.shadingRows, f.shadingCols,
-            crop, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out
+            crop, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette
         )
+    }
+
+    // ------------------------------------------------------------------------------------------- B24 detail post-pass
+
+    /** What [applyDetail] did: stage timings (ms), the distortion fill scale, and per luma bin the measured noise
+     * (null = too few flat blocks) and the grain sigma added (encoded 0..1 units). */
+    class DetailStats(
+        val totalMs: Double,
+        val distortMs: Double,
+        val sharpenMs: Double,
+        val noiseMs: Double,
+        val grainMs: Double,
+        val distortScale: Double,
+        val measured: List<Double?>,
+        val added: List<Double>
+    ) {
+        companion object {
+            const val BINS = 7
+
+            fun of(r: FloatArray): DetailStats = DetailStats(
+                r[0].toDouble(),
+                r[1].toDouble(),
+                r[2].toDouble(),
+                r[3].toDouble(),
+                r[4].toDouble(),
+                r[5].toDouble(),
+                (0 until BINS).map { r[6 + it].toDouble().takeIf { v -> v >= 0.0 } },
+                (0 until BINS).map { r[6 + BINS + it].toDouble() }
+            )
+        }
+    }
+
+    /**
+     * B24: the detail post-pass in place on [bitmap] (ARGB_8888): distortion when [distort] (lensfun ptlens a, b, c),
+     * luma unsharp mask ([sharpenAmount] 0 = off), then grain up to [grainTarget] (7 luma bins; null = off).
+     * Throws IllegalArgumentException / IllegalStateException on bad input or when the library is not loaded.
+     */
+    fun applyDetail(
+        bitmap: Bitmap,
+        distort: Boolean,
+        distortion: FloatArray,
+        sharpenSigma: Float,
+        sharpenAmount: Float,
+        sharpenThreshold: Float,
+        grainTarget: FloatArray?,
+        grainKernelW: Float,
+        grainKappa: Float,
+        seed: Int,
+        threads: Int
+    ): DetailStats {
+        val loaded = load()
+        check(loaded.loaded) { "native library not loaded: ${loaded.error}" }
+        require(distortion.size == 3) { "distortion needs a, b, c" }
+        val r = nativeApplyDetail(
+            bitmap, distort, distortion[0], distortion[1], distortion[2], sharpenSigma, sharpenAmount, sharpenThreshold,
+            grainTarget, grainKernelW, grainKappa, seed, threads
+        )
+        return DetailStats.of(r)
     }
 
     // ------------------------------------------------------------------------------------------- B22 burst merge
@@ -367,10 +427,11 @@ object RedlineNative {
             curveHi: Float,
             lut: CubeLut,
             threads: Int,
-            out: Bitmap
+            out: Bitmap,
+            vignette: FloatArray? = null
         ): String? {
             if (handle == 0L) return "merger closed"
-            return nativeSrRender(handle, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out)
+            return nativeSrRender(handle, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette)
         }
 
         override fun close() {
@@ -461,7 +522,8 @@ object RedlineNative {
         lut: FloatArray,
         lutSize: Int,
         threads: Int,
-        out: Bitmap
+        out: Bitmap,
+        vignette: FloatArray?
     ): String?
 
     @JvmStatic
@@ -572,8 +634,26 @@ object RedlineNative {
         lut: FloatArray,
         lutSize: Int,
         threads: Int,
-        out: Bitmap
+        out: Bitmap,
+        vignette: FloatArray?
     ): String?
+
+    @JvmStatic
+    private external fun nativeApplyDetail(
+        bitmap: Bitmap,
+        distort: Boolean,
+        distA: Float,
+        distB: Float,
+        distC: Float,
+        sharpenSigma: Float,
+        sharpenAmount: Float,
+        sharpenThreshold: Float,
+        grainTarget: FloatArray?,
+        grainKernelW: Float,
+        grainKappa: Float,
+        seed: Int,
+        threads: Int
+    ): FloatArray
 
     @JvmStatic
     private external fun nativeParseCube(bytes: ByteArray): FloatArray

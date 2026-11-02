@@ -295,6 +295,34 @@ private:
     float lo_, hi_, gain_, floor_ = 0, step_ = 1;
 };
 
+// B24: the vignette gain of output pixel (x, y) (detail.vignette_gain); 1 when the spec has no table.
+class Vignette {
+public:
+    explicit Vignette(const RenderSpec& s) : t_(s.vignette), n_(s.vignettePoints) {
+        if (t_ != nullptr && n_ >= 2) {
+            cx_ = s.outWidth / 2.0f;
+            cy_ = s.outHeight / 2.0f;
+            inv_ = 1.0f / std::sqrt(cx_ * cx_ + cy_ * cy_);
+        } else {
+            t_ = nullptr;
+        }
+    }
+    bool on() const { return t_ != nullptr; }
+    float operator()(int x, int y) const {
+        const float dx = static_cast<float>(x) + 0.5f - cx_;
+        const float dy = static_cast<float>(y) + 0.5f - cy_;
+        float f = std::min(std::sqrt(dx * dx + dy * dy) * inv_, 1.0f) * static_cast<float>(n_ - 1);
+        const int i = std::min(static_cast<int>(f), n_ - 2);
+        const float u = f - static_cast<float>(i);
+        return t_[i] + (t_[i + 1] - t_[i]) * u;
+    }
+
+private:
+    const float* t_;
+    int n_;
+    float cx_ = 0, cy_ = 0, inv_ = 0;
+};
+
 inline void lutSample(const float* lut, int n, const float in[3], float out[3]) {
     float x[3];
     int i0[3];
@@ -342,6 +370,7 @@ std::string validateSpec(const RawInput& in, const RenderSpec& s) {
     if (!(s.gain > 0.0f) || !std::isfinite(s.gain)) return "gain must be positive";
     if (s.curve == nullptr || s.curvePoints < 2 || !(s.curveHi > s.curveLo)) return "bad tone curve";
     if (s.lut == nullptr || s.lutSize < 2 || s.lutSize > 256) return "bad LUT";
+    if (s.vignette != nullptr && (s.vignettePoints < 2 || s.vignettePoints > 4096)) return "bad vignette table";
     return "";
 }
 
@@ -372,6 +401,7 @@ void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty,
                  int o0, int o1, const Writer& out) {
     LinearRows rows(in, spec);
     const Curve curve(spec);
+    const Vignette vig(spec);
     const int cw = spec.crop.width;
     const int ow = spec.outWidth;
     std::vector<float> line(static_cast<std::size_t>(cw) * 3);
@@ -407,7 +437,8 @@ void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty,
         }
         for (int ox = 0; ox < ow; ++ox) {
             const float* l = lin + static_cast<std::size_t>(ox) * 3;
-            const float toned[3] = {curve(l[0]), curve(l[1]), curve(l[2])};
+            const float g = vig.on() ? vig(ox, oy) : 1.0f;
+            const float toned[3] = {curve(g * l[0]), curve(g * l[1]), curve(g * l[2])};
             float o[3];
             lutSample(spec.lut, spec.lutSize, toned, o);
             out.put(ox, oy, o);
@@ -575,12 +606,14 @@ std::string validateLinear(const LinearRgb& in, const RenderSpec& s) {
     if (!(s.gain > 0.0f) || !std::isfinite(s.gain)) return "gain must be positive";
     if (s.curve == nullptr || s.curvePoints < 2 || !(s.curveHi > s.curveLo)) return "bad tone curve";
     if (s.lut == nullptr || s.lutSize < 2 || s.lutSize > 256) return "bad LUT";
+    if (s.vignette != nullptr && (s.vignettePoints < 2 || s.vignettePoints > 4096)) return "bad vignette table";
     return "";
 }
 
 template <typename Writer>
 void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y1, const Writer& out) {
     const Curve curve(spec);
+    const Vignette vig(spec);
     const float* m = spec.colour.matrix;
     const float inv[3] = {1.0f / spec.colour.neutral[0], 1.0f / spec.colour.neutral[1], 1.0f / spec.colour.neutral[2]};
     for (int y = y0; y < y1; ++y) {
@@ -591,8 +624,9 @@ void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y
         for (int x = 0; x < in.width; ++x) {
             const float c[3] = {std::min(std::max(r[x] * inv[0], 0.0f), 1.0f), std::min(std::max(g[x] * inv[1], 0.0f), 1.0f),
                                 std::min(std::max(b[x] * inv[2], 0.0f), 1.0f)};
+            const float gv = vig.on() ? vig(x, y) : 1.0f;
             float toned[3];
-            for (int k = 0; k < 3; ++k) toned[k] = curve(m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2]);
+            for (int k = 0; k < 3; ++k) toned[k] = curve(gv * (m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2]));
             float o[3];
             lutSample(spec.lut, spec.lutSize, toned, o);
             out.put(x, y, o);

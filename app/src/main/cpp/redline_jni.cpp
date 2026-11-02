@@ -10,6 +10,7 @@
 
 #include "burst_merge.h"
 #include "cube_parser.h"
+#include "detail.h"
 #include "raw_pipeline.h"
 #include "superres.h"
 
@@ -153,8 +154,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     JNIEnv* env, jclass, jobject buffer, jint width, jint height, jint rowStrideBytes, jint cfa, jfloatArray black,
     jfloat white, jfloatArray shading, jint shadingRows, jint shadingCols, jintArray crop, jfloatArray matrix,
     jfloatArray neutral, jfloat gain, jfloatArray curve, jfloat curveLo, jfloat curveHi, jfloatArray lut, jint lutSize,
-    jint threads, jobject bitmap) {
-    const Floats b(env, black), sh(env, shading), m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut);
+    jint threads, jobject bitmap, jfloatArray vignette) {
+    const Floats b(env, black), sh(env, shading), m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut), vg(env, vignette);
     redline::RawInput in;
     redline::RenderSpec spec;
     std::string err = rawInput(env, buffer, width, height, rowStrideBytes, cfa, b, white, sh, shadingRows, shadingCols, in);
@@ -178,6 +179,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     spec.lut = lt.get();
     spec.lutSize = lutSize;
     spec.threads = threads;
+    if (vg.get() != nullptr) {  // B24 residual vignette
+        spec.vignette = vg.get();
+        spec.vignettePoints = vg.size();
+    }
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
         return env->NewStringUTF("could not lock the bitmap");
@@ -552,10 +557,10 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
 // Renders the finished merge into `bitmap` (ARGB_8888 at the output size) through B21 stages 4-8.
 extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeSrRender(
     JNIEnv* env, jclass, jlong handle, jfloatArray matrix, jfloatArray neutral, jfloat gain, jfloatArray curve, jfloat curveLo,
-    jfloat curveHi, jfloatArray lut, jint lutSize, jint threads, jobject bitmap) {
+    jfloat curveHi, jfloatArray lut, jint lutSize, jint threads, jobject bitmap, jfloatArray vignette) {
     auto* h = reinterpret_cast<SrHandle*>(handle);
     if (h == nullptr || !h->finished) return env->NewStringUTF("no finished merge");
-    const Floats m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut);
+    const Floats m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut), vg(env, vignette);
     redline::RenderSpec spec;
     if (m.size() != 9 || n.size() != 3) return env->NewStringUTF("matrix needs 9 values and neutral 3");
     for (int i = 0; i < 9; ++i) spec.colour.matrix[i] = m.get()[i];
@@ -578,6 +583,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     spec.lut = lt.get();
     spec.lutSize = lutSize;
     spec.threads = threads;
+    if (vg.get() != nullptr) {  // B24 residual vignette
+        spec.vignette = vg.get();
+        spec.vignettePoints = vg.size();
+    }
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
         return env->NewStringUTF("could not lock the bitmap");
@@ -634,4 +643,73 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
                          static_cast<jfloat>(c.rmseSingle), static_cast<jfloat>(c.gain), static_cast<jfloat>(c.ms)};
     env->SetFloatArrayRegion(res, 0, 6, v);
     return res;
+}
+
+// ---------------------------------------------------------------------------------------------------- B24 detail post-pass
+
+// In place on an ARGB_8888 bitmap: distortion (optional), sharpening, grain. Returns
+// [total, distort, sharpen, noise, grain ms, distortScale, measured x7 (-1 = no estimate), added x7]; throws
+// IllegalArgumentException on bad input.
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeApplyDetail(
+    JNIEnv* env, jclass, jobject bitmap, jboolean distort, jfloat distA, jfloat distB, jfloat distC, jfloat sharpenSigma,
+    jfloat sharpenAmount, jfloat sharpenThreshold, jfloatArray grainTarget, jfloat grainKernelW, jfloat grainKappa, jint seed,
+    jint threads) {
+    const Floats gt(env, grainTarget);
+    redline::DetailSpec s;
+    s.distort = distort == JNI_TRUE;
+    s.distA = distA;
+    s.distB = distB;
+    s.distC = distC;
+    s.sharpenSigma = sharpenSigma;
+    s.sharpenAmount = sharpenAmount;
+    s.sharpenThreshold = sharpenThreshold;
+    std::string err;
+    if (gt.get() != nullptr) {
+        if (gt.size() != redline::kNoiseBins) {
+            err = "grain target needs 7 values";
+        } else {
+            s.grain = true;
+            for (int i = 0; i < redline::kNoiseBins; ++i) s.grainTarget[i] = gt.get()[i];
+        }
+    }
+    s.grainKernelW = grainKernelW;
+    s.grainKappa = grainKappa;
+    s.seed = static_cast<std::uint32_t>(seed);
+    s.threads = threads;
+    AndroidBitmapInfo info{};
+    if (err.empty() && (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+                        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888)) {
+        err = "detail needs an ARGB_8888 bitmap";
+    }
+    void* pixels = nullptr;
+    if (err.empty() && (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr)) {
+        err = "could not lock the bitmap";
+        pixels = nullptr;
+    }
+    redline::DetailStats st;
+    if (err.empty()) {
+        err = redline::applyDetail(static_cast<std::uint8_t*>(pixels), static_cast<int>(info.width), static_cast<int>(info.height),
+                                   info.stride, s, st);
+        AndroidBitmap_unlockPixels(env, bitmap);
+    }
+    if (!err.empty()) {
+        throwIllegalArgument(env, err);
+        return nullptr;
+    }
+    constexpr int kN = 6 + 2 * redline::kNoiseBins;
+    jfloat v[kN];
+    v[0] = static_cast<jfloat>(st.totalMs);
+    v[1] = static_cast<jfloat>(st.distortMs);
+    v[2] = static_cast<jfloat>(st.sharpenMs);
+    v[3] = static_cast<jfloat>(st.noiseMs);
+    v[4] = static_cast<jfloat>(st.grainMs);
+    v[5] = st.distortScale;
+    for (int i = 0; i < redline::kNoiseBins; ++i) {
+        v[6 + i] = st.measured[i];
+        v[6 + redline::kNoiseBins + i] = st.added[i];
+    }
+    jfloatArray out = env->NewFloatArray(kN);
+    if (out == nullptr) return nullptr;
+    env->SetFloatArrayRegion(out, 0, kN, v);
+    return out;
 }

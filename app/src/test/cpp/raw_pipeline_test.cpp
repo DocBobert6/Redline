@@ -182,6 +182,26 @@ void testShading() {
     check(std::fabs(st.medianY - 0.2f) < 2e-3f, "shading gain applied");
 }
 
+// B24: the vignette table darkens the corners only, symmetrically, and is applied before the curve.
+void testVignette() {
+    Fixture f;
+    const float v[3] = {0.18f, 0.18f, 0.18f};
+    f.fill(v);
+    const float table[3] = {1.0f, 1.0f, 0.5f};  // gain 1 out to r = 0.5, then down to 0.5 at the corner
+    f.spec.vignette = table;
+    f.spec.vignettePoints = 3;
+    std::string err;
+    const auto out = f.render(err);
+    check(err.empty(), "vignette render ok");
+    auto at = [&](int x, int y) { return static_cast<int>(out[(static_cast<std::size_t>(y) * f.w + x) * 4 + 1]); };
+    check(std::abs(at(f.w / 2, f.h / 2) - 46) <= 1, "centre untouched");
+    check(at(0, 0) < 40 && at(0, 0) > 20, "corner darkened");
+    check(std::abs(at(0, 0) - at(f.w - 1, f.h - 1)) <= 1 && std::abs(at(0, f.h - 1) - at(f.w - 1, 0)) <= 1, "symmetric");
+    f.spec.vignettePoints = 1;
+    f.render(err);
+    check(!err.empty(), "one-point vignette table refused");
+}
+
 }  // namespace
 
 int main() {
@@ -190,6 +210,7 @@ int main() {
     testThreadsDeterministic();
     testStats();
     testShading();
+    testVignette();
     if (failures == 0) std::printf("raw_pipeline_test: all passed\n");
     return failures == 0 ? 0 : 1;
 }

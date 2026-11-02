@@ -169,3 +169,21 @@ python calibration/tools/burst_quality.py --tool build/native-host/burst_merge_t
 ```
 
 Parity: identical reference frame and tile displacements, merged RAW within 0.05 RAW units.
+
+## B24: detail (vignette, distortion, sharpening, grain)
+
+```bash
+cd calibration
+python -m redline_cal.detail data/lensfun/mil-canon.xml out/detail_report.json --out ../app/src/main/assets/colour/detail.json
+```
+
+`redline_cal/detail.py` is the reference the native code follows (`app/src/main/cpp/detail.cpp`, and the vignette step inside `raw_pipeline.cpp`); `tests/test_detail.py` checks parity through `detail_tool` and `raw_pipeline_tool`. What the asset holds and where each value comes from:
+
+| Part | Model | Fitted from |
+| --- | --- | --- |
+| Vignette | Linear light, before the tone curve: gain(r) = 2^(alpha x lensfun EV), table per zoom stop at f/2.8 | alpha = 0.55: the R5 II camera JPEG (Peripheral Illumination Correction on) keeps 0.55 of the lens's measured falloff in EV. Hold-out outer-frame median abs error 0.062 EV (plan estimate 0.3: 0.110; no residual: 0.165) |
+| Distortion | lensfun ptlens forward model, inverse-mapped, bilinear; **off by default** ("RAW feel" toggle) | lensfun coefficients interpolated by focal length. Default off per the plan (section 5: corrected, near zero). Note: 90 of the dataset's 92 R5 II pairs were shot with in-camera distortion correction off, so those JPEGs do carry the lens's distortion; the toggle reproduces that |
+| Sharpening | Luma unsharp mask with soft coring d * d^2 / (d^2 + t^2) on the final 8-bit image | Matched-scale renders (ours, no sharpening, vs the camera JPEG, both area-downscaled in linear light to 4000 and 3000 px), per-band amplitude-spectrum ratio on 256 px tiles at r < 0.6, low-ISO (<= 400) train pairs |
+| Grain | Luma noise topped up to the camera JPEG's noise: sqrt(max(0, target^2 - measured^2)) per luma bin, hash-based normal deviates filtered by [w, 1-2w, w] | Camera JPEG noise (Immerkaer estimate, flattest decile of 16 px blocks per luma bin) vs ISO, quadratic in log2 ISO; w reproduces the JPEG noise's coarse/fine estimator ratio |
+
+Only Picture Style Standard is fitted: every R5 II pair in the dataset is Standard (sharpness 4, fineness 2, threshold 3). Other styles need R5 II CR3 + JPEG pairs shot in that style. The vignette and distortion tables are adapted from the lensfun database and keep its CC BY-SA 3.0 attribution in the asset.
