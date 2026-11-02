@@ -97,7 +97,7 @@ class RapidFireTest {
 
     @Test
     fun aCameraJpegInAFifteenTapRunFailsTheGateWithItsReason() {
-        val why = ShotRouter.whyQueueFull(16)
+        val why = ShotRouter.hard("render error: native")
         val r = RapidFire().queue(3).taps(14).taps(1, BurstShot.PATH_JPEG, why)
         assertEquals(false, r.noCameraJpegGate)
         assertEquals(1, r.cameraJpegFallbacks)
@@ -110,7 +110,7 @@ class RapidFireTest {
 
     @Test
     fun aJpegInAShortRunDoesNotCountAgainstTheGate() {
-        var r = RapidFire().queue(1).taps(3, BurstShot.PATH_JPEG, ShotRouter.WHY_NO_BUFFER).queue(0)
+        var r = RapidFire().queue(1).taps(3, BurstShot.PATH_JPEG, ShotRouter.hard("x")).queue(0)
         r = r.queue(1).taps(15).queue(0)
         assertEquals(2, r.runs)
         assertEquals(true, r.noCameraJpegGate)
@@ -196,15 +196,19 @@ class RapidFireTest {
     fun burstReportFeedsRapidFireAndMirrorsItsGates() {
         val single = BurstShot(plan = BurstPlan(frames = 0, singleReason = "presses waiting"), stopMm = 24, saveWaitMs = 300)
         val jpeg = BurstShot(
-            plan = BurstPlan(frames = 0, singleReason = "presses waiting; ${ShotRouter.WHY_LOW_MEMORY}"),
+            plan = BurstPlan(frames = 0, singleReason = "presses waiting"),
             stopMm = 24,
-            path = BurstShot.PATH_JPEG
+            path = BurstShot.PATH_JPEG,
+            hardJpegReason = "render error: native"
         )
         var b = BurstReport().queue(1)
         repeat(14) { b = b.record(single, 1000, true) }
         b = b.record(jpeg, 1000, true).preview(30.0, null)
         assertEquals(1, b.rapidFire.cameraJpegFallbacks)
-        assertEquals(mapOf(ShotRouter.WHY_LOW_MEMORY to 1), b.rapidFire.jpegReasons)
+        assertEquals(mapOf("render error: native" to 1), b.rapidFire.jpegReasons)
+        assertEquals(1, b.hardJpegShots)
+        assertEquals(mapOf("render error: native" to 1), b.hardJpegReasons)
+        assertEquals(1, b.cameraJpegShots)
         assertEquals(300L, b.rapidFire.maxSaveWaitMs)
         @Suppress("UNCHECKED_CAST")
         val gate = b.toMap()["gate"] as Map<String, Any?>
@@ -307,5 +311,23 @@ class RapidFireTest {
         assertEquals(32, m["tail_splits_for_adds"])
         assertEquals(10, m["render_thread_nice_seen"])
         assertEquals(m, BurstReport().nativeWorkers(intArrayOf(10, 13, 4, 120, 32, 10)).rapidFire.nativeWorkers)
+    }
+
+    @Test
+    fun memoryWaitsAreCountedNotTurnedIntoCameraJpeg() {
+        var b = BurstReport().pool(5, 22.89).pool(9, 22.89)
+        b = b.press(1200, true, false, memoryWaitMs = 900, memoryWaitReason = ShotRouter.WAIT_NO_BUFFER)
+        b = b.press(0, false, false)
+        b = b.press(300, false, false, memoryWaitMs = 250, memoryWaitReason = ShotRouter.WAIT_NO_BUFFER)
+        assertEquals(2, b.memoryWaits)
+        assertEquals(900L, b.memoryWaitMaxMs)
+        assertEquals(mapOf(ShotRouter.WAIT_NO_BUFFER to 2), b.memoryWaitReasons)
+        assertEquals(5, b.poolFramesMin)
+        assertEquals(9, b.poolFrames)
+        @Suppress("UNCHECKED_CAST")
+        val waits = b.toMap()["memory_waits"] as Map<String, Any?>
+        assertEquals(2, waits["delayed_for_memory"])
+        assertEquals(575L, waits["avg_wait_ms"])
+        assertEquals(0, b.cameraJpegShots)
     }
 }

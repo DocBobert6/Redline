@@ -126,20 +126,19 @@ class BurstPlannerTest {
     }
 
     @Test
-    fun busyShotsTakeARawFrameAndTheCameraJpegOnlyAsTheLastResort() {
+    fun busyShotsTakeARawFrameOrWaitAndNeverTheCameraJpegForPressure() {
         // B23b: a busy shot is a single RAW frame while the holding queue has room; no fixed two-single limit.
         assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3, capacity = 8))
         assertEquals(ShotRouter.Path.SINGLE_RAW to null, ShotRouter.route(wantsRaw = true, pendingSingles = 5, poolFree = 3, capacity = 8))
+        // B24.1: queue full or no buffer: the press waits (busy shutter), it is not saved as the camera JPEG.
         val full = ShotRouter.route(wantsRaw = true, pendingSingles = 8, poolFree = 3, capacity = 8)
-        assertEquals(ShotRouter.Path.CAMERA_JPEG, full.first)
-        assertEquals(ShotRouter.whyQueueFull(8), full.second)
-        assertTrue(full.second!!.contains("queue full"))
+        assertEquals(ShotRouter.Path.WAIT to ShotRouter.waitQueueFull(8), full)
         val noMemory = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 0, capacity = 8)
-        assertEquals(ShotRouter.Path.CAMERA_JPEG to ShotRouter.WHY_NO_BUFFER, noMemory)
+        assertEquals(ShotRouter.Path.WAIT to ShotRouter.WAIT_NO_BUFFER, noMemory)
+        // Low system memory: still a RAW single through our pipeline (it only rules out a burst).
         val low = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 3, capacity = 8, lowMemory = true)
-        assertEquals(ShotRouter.Path.CAMERA_JPEG to ShotRouter.WHY_LOW_MEMORY, low)
-        // Every fallback reason names the camera JPEG (the burst report keys rapid-fire reasons on it).
-        listOf(full.second!!, noMemory.second!!, low.second!!).forEach { assertTrue(it, it.endsWith("camera JPEG")) }
+        assertEquals(ShotRouter.Path.SINGLE_RAW to ShotRouter.WHY_LOW_MEMORY, low)
+        listOf(full.second!!, noMemory.second!!, low.second!!).forEach { assertFalse(it, it.contains("camera JPEG")) }
         // RAW not wanted: the camera JPEG with no fallback reason (it is not a fallback).
         assertEquals(
             ShotRouter.Path.CAMERA_JPEG to null,
@@ -149,12 +148,17 @@ class BurstPlannerTest {
             ShotRouter.Path.CAMERA_JPEG to null,
             ShotRouter.route(wantsRaw = false, pendingSingles = 0, poolFree = 0, capacity = 0, lowMemory = true)
         )
+        // A hard fallback names itself.
+        assertTrue(ShotRouter.hard("x").startsWith(ShotRouter.HARD_PREFIX))
+        assertTrue(ShotRouter.hard("x").endsWith("camera JPEG"))
     }
 
     @Test
-    fun lowMemoryWinsOverAFreeBufferAndAnEmptyQueue() {
-        val r = ShotRouter.route(wantsRaw = true, pendingSingles = 0, poolFree = 20, capacity = 16, lowMemory = true)
-        assertEquals(ShotRouter.Path.CAMERA_JPEG, r.first)
+    fun aMemoryWaitIsTakenAnywayOnlyWhenNothingCanFreeOrAfterTheMaximum() {
+        assertNull(MemoryWait.hardReason(waitedMs = 100, shotsAhead = 2, poolCapacity = 5, poolFree = 0))
+        assertNull(MemoryWait.hardReason(waitedMs = MemoryWait.MAX_WAIT_MS - 1, shotsAhead = 1, poolCapacity = 5, poolFree = 0))
+        assertTrue(MemoryWait.hardReason(0, 0, 2, 0)!!.contains("nothing in flight"))
+        assertTrue(MemoryWait.hardReason(MemoryWait.MAX_WAIT_MS, 3, 5, 0)!!.startsWith("waited"))
     }
 
     @Test
@@ -171,7 +175,12 @@ class BurstPlannerTest {
         // 1.2 GB available: (400 MB - 192 MB) / 24 MB = 9 frames.
         assertEquals(9, MemoryBudget.poolFrames(1_200L * 1024 * 1024, false, frame))
         assertEquals(4, MemoryBudget.poolFrames(1_200L * 1024 * 1024, true, frame))
-        assertEquals(0, MemoryBudget.poolFrames(300L * 1024 * 1024, false, frame))
+        // B24.1: never fewer than MIN_POOL_FRAMES (a press waits for a buffer instead of taking the camera JPEG).
+        assertEquals(MemoryBudget.MIN_POOL_FRAMES, MemoryBudget.poolFrames(300L * 1024 * 1024, false, frame))
         assertEquals(0, MemoryBudget.poolFrames(4_000L * 1024 * 1024, false, 0))
+        // B24.1: the pool's own buffers count back in: re-sizing a pool that holds 10 frames does not shrink it by itself.
+        // (The B24 device report: ~0.95 GB available gave 5 frames; with its 10 frames held added back it is 8.)
+        assertEquals(5, MemoryBudget.poolFrames(950L * 1024 * 1024, false, frame))
+        assertEquals(8, MemoryBudget.poolFrames(950L * 1024 * 1024, false, frame, ownBytes = 10 * frame))
     }
 }

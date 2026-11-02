@@ -122,7 +122,7 @@ object RedlineNative {
     // ------------------------------------------------------------------------------------------- B24 detail post-pass
 
     /** What [applyDetail] did: stage timings (ms), the distortion fill scale, and per luma bin the measured noise
-     * (null = too few flat blocks) and the grain sigma added (encoded 0..1 units). */
+     * (null = too few flat blocks), the grain sigma added (encoded 0..1 units) and the peak working memory. */
     class DetailStats(
         val totalMs: Double,
         val distortMs: Double,
@@ -131,7 +131,9 @@ object RedlineNative {
         val grainMs: Double,
         val distortScale: Double,
         val measured: List<Double?>,
-        val added: List<Double>
+        val added: List<Double>,
+        /** B24.1: the most working memory the pass held at once (strip buffers), MB; null from an older library. */
+        val peakMb: Double? = null
     ) {
         companion object {
             const val BINS = 7
@@ -144,7 +146,8 @@ object RedlineNative {
                 r[4].toDouble(),
                 r[5].toDouble(),
                 (0 until BINS).map { r[6 + it].toDouble().takeIf { v -> v >= 0.0 } },
-                (0 until BINS).map { r[6 + BINS + it].toDouble() }
+                (0 until BINS).map { r[6 + BINS + it].toDouble() },
+                r.getOrNull(6 + 2 * BINS)?.toDouble()
             )
         }
     }

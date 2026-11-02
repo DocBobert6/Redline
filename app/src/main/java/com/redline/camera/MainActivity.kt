@@ -385,7 +385,11 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onPool(frames: Int, frameMb: Double) {
-            updateBurst { it.copy(poolFrames = frames, frameMb = frameMb) }
+            updateBurst { it.pool(frames, frameMb) }
+        }
+
+        override fun onMemoryWait(waiting: Boolean) {
+            runOnUiThread { memoryWaiting.value = waiting }
         }
 
         override fun onMergeWorker(threads: Int, nice: Int) {
@@ -1006,7 +1010,13 @@ class MainActivity : ComponentActivity() {
                 val b13Stress = !keep && !stress
                 val colour =
                     result.colour?.let { state.value.colourPipeline.record(it, result.shutterToSavedMs) } ?: state.value.colourPipeline
-                var burst = state.value.burst.press(result.shutterWaitMs, result.shutterBlocked, stress)
+                var burst = state.value.burst.press(
+                    result.shutterWaitMs,
+                    result.shutterBlocked,
+                    stress,
+                    result.memoryWaitMs,
+                    result.memoryWaitReason
+                )
                 result.dropped?.let { burst = burst.drop(it, refused = result.shutterBlocked) }
                 result.burst?.let {
                     burst = burst.record(it, result.shutterToSavedMs, result.ok).nativeWorkers(RedlineNative.workerStats())
@@ -1059,7 +1069,11 @@ class MainActivity : ComponentActivity() {
     }
 
     /** B22b: Capturing / N queued / Processing N, so a press never looks ignored. */
-    private fun burstOverlay(): String? = PressPolicy.indicator(pressesOutstanding.intValue, state.value.burst.queueDepth)
+    private fun burstOverlay(): String? =
+        PressPolicy.indicator(pressesOutstanding.intValue, state.value.burst.queueDepth, memoryWaiting.value)
+
+    /** B24.1: a press is waiting for memory (shown on the capture line as busy). */
+    private val memoryWaiting = mutableStateOf(false)
 
     /**
      * B13 gate: 500 consecutive captures through the full save path (files written via MediaStore, then

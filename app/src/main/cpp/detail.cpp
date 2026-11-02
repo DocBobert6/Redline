@@ -17,6 +17,7 @@ namespace {
 constexpr int kMaxSide = 16384;
 constexpr int kMaxThreads = 16;
 constexpr int kDistortTable = 2048;
+constexpr int kDistortChunk = 32;  // rows per sweep step (B24.1)
 constexpr int kBorderSamples = 1024;
 constexpr int kNoiseBlock = 16;
 constexpr int kNoiseBlockStep = 2;
@@ -96,13 +97,26 @@ float lookup(const std::vector<float>& table, float u) {  // u in 0..1 over the 
 
 // ----------------------------------------------------------------------------------------------- 1. distortion
 
-void distortion(const Image& im, const DetailSpec& s, int threads, DetailStats& st) {
-    const int w = im.width, h = im.height;
+// B24.1: in place without a copy of the frame. Each output pixel reads a 2x2 neighbourhood at a radially scaled
+// position; k = ratio(r) * scale stays in [kLo, kHi], so output row y reads only source rows within readRows(y). Rows are
+// produced in two sweeps from the top and bottom edges towards the centre, in chunks, into a small set of pending row
+// buffers; a pending row is written back once no row still to be produced (in either sweep) can read it. Every output
+// value is the same expression on the same source values as the B24 full-copy version (bit-identical; detail_test).
+struct DistortMap {
+    std::vector<float> ratio;
+    float scale = 1.0f;
+    float invHalf = 1.0f;
+    float invRMax = 1.0f;
+    float kLo = 1.0f, kHi = 1.0f;
+};
+
+DistortMap distortMap(int w, int h, const DetailSpec& s) {
+    DistortMap m;
     const double a = s.distA, b = s.distB, c = s.distC, d = 1.0 - a - b - c;
     const double half = std::min(w, h) / 2.0;
     const double rMax = std::hypot(w / 2.0, h / 2.0) / half;
-    std::vector<float> ratio(kDistortTable);
-    ratio[0] = static_cast<float>(1.0 / d);
+    m.ratio.resize(kDistortTable);
+    m.ratio[0] = static_cast<float>(1.0 / d);
     for (int i = 1; i < kDistortTable; ++i) {
         const double rd = rMax * i / (kDistortTable - 1);
         double r = rd;
@@ -111,7 +125,7 @@ void distortion(const Image& im, const DetailSpec& s, int threads, DetailStats& 
             const double fp = 4 * a * r * r * r + 3 * b * r * r + 2 * c * r + d;
             r -= f / fp;
         }
-        ratio[i] = static_cast<float>(r / rd);
+        m.ratio[i] = static_cast<float>(r / rd);
     }
     float kMax = 0.0f;
     for (int i = 0; i < kBorderSamples; ++i) {
@@ -120,58 +134,210 @@ void distortion(const Image& im, const DetailSpec& s, int threads, DetailStats& 
         const double ys[2] = {h / 2.0 / half, t * h / 2.0 / half};
         for (int e = 0; e < 2; ++e) {
             const double rd = std::sqrt(xs[e] * xs[e] + ys[e] * ys[e]);
-            kMax = std::max(kMax, lookup(ratio, static_cast<float>(rd / rMax)));
+            kMax = std::max(kMax, lookup(m.ratio, static_cast<float>(rd / rMax)));
         }
     }
-    const float scale = std::min(1.0f, 1.0f / kMax);
+    m.scale = std::min(1.0f, 1.0f / kMax);
+    m.invHalf = static_cast<float>(1.0 / half);
+    m.invRMax = static_cast<float>(1.0 / rMax);
+    const auto mm = std::minmax_element(m.ratio.begin(), m.ratio.end());
+    // lookup() interpolates between table entries, so k lies between the extremes (widened for rounding).
+    m.kLo = *mm.first * m.scale * (1.0f - 1e-4f);
+    m.kHi = *mm.second * m.scale * (1.0f + 1e-4f);
+    return m;
+}
+
+// The source rows output row y can read (bilinear rows yi and yi + 1), conservatively, clamped to the image.
+void readRows(const DistortMap& m, int y, int h, int& lo, int& hi) {
+    const float yy = static_cast<float>(y) + 0.5f - h / 2.0f;
+    const float s0 = yy * m.kLo + h / 2.0f - 0.5f, s1 = yy * m.kHi + h / 2.0f - 0.5f;
+    const float a = std::min(s0, s1), b = std::max(s0, s1);
+    lo = std::max(0, static_cast<int>(std::floor(a)) - 2);
+    hi = std::min(h - 1, static_cast<int>(std::floor(b)) + 3);
+}
+
+void distortion(const Image& im, const DetailSpec& s, int threads, DetailStats& st) {
+    const int w = im.width, h = im.height;
+    const DistortMap m = distortMap(w, h, s);
+    const float scale = m.scale;
     st.distortScale = scale;
-    // Source copy in the image's own format (RGBA8 bytes on the phone: no float copy of a 10 MP frame).
-    std::vector<std::uint8_t> src8;
-    std::vector<float> srcF;
-    if (im.rgba != nullptr) {
-        src8.resize(static_cast<std::size_t>(w) * h * 4);
-        for (int y = 0; y < h; ++y) {
-            std::copy(im.rgba + static_cast<std::size_t>(y) * im.stride, im.rgba + static_cast<std::size_t>(y) * im.stride + w * 4,
-                      src8.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(y) * w * 4));
+    const std::vector<float>& ratio = m.ratio;
+    const float invHalf = m.invHalf;
+    const float invRMax = m.invRMax;
+    const bool rgba = im.rgba != nullptr;
+    const std::size_t rowElems = rgba ? static_cast<std::size_t>(w) * 4 : static_cast<std::size_t>(w) * 3;
+    const std::size_t rowBytes = rowElems * (rgba ? 1 : sizeof(float));
+    // Pending output rows: row index -> buffer (bytes for RGBA8, floats for RGB), recycled through a free list.
+    std::vector<std::vector<std::uint8_t>> bufs8;
+    std::vector<std::vector<float>> bufsF;
+    std::vector<int> freeSlots;
+    std::vector<int> slotOf(static_cast<std::size_t>(h), -1);
+    std::vector<int> pending;
+    std::size_t peakRows = 0;
+    auto takeSlot = [&]() -> int {
+        if (!freeSlots.empty()) {
+            const int k = freeSlots.back();
+            freeSlots.pop_back();
+            return k;
         }
-    } else {
-        srcF.resize(static_cast<std::size_t>(w) * h * 3);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) im.get(x, y, &srcF[(static_cast<std::size_t>(y) * w + x) * 3]);
+        if (rgba) {
+            bufs8.emplace_back(rowElems);
+            return static_cast<int>(bufs8.size()) - 1;
         }
-    }
-    auto px = [&](int x, int y, int ch) -> float {
-        const std::size_t i = static_cast<std::size_t>(y) * w + x;
-        return im.rgba != nullptr ? src8[i * 4 + ch] * (1.0f / 255.0f) : srcF[i * 3 + ch];
+        bufsF.emplace_back(rowElems);
+        return static_cast<int>(bufsF.size()) - 1;
     };
-    const float invHalf = static_cast<float>(1.0 / half);
-    const float invRMax = static_cast<float>(1.0 / rMax);
-    parallelRows(h, threads, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y) {
-            const float yy = static_cast<float>(y) + 0.5f - h / 2.0f;
-            for (int x = 0; x < w; ++x) {
-                const float xx = static_cast<float>(x) + 0.5f - w / 2.0f;
-                const float rd = std::sqrt(xx * xx + yy * yy) * invHalf;
-                const float k = lookup(ratio, rd * invRMax) * scale;
-                const float sx = std::min(std::max(xx * k + w / 2.0f - 0.5f, 0.0f), static_cast<float>(w - 1));
-                const float sy = std::min(std::max(yy * k + h / 2.0f - 0.5f, 0.0f), static_cast<float>(h - 1));
-                const int x0 = std::min(static_cast<int>(sx), w - 2);
-                const int yi = std::min(static_cast<int>(sy), h - 2);
-                const float fx = sx - static_cast<float>(x0), fy = sy - static_cast<float>(yi);
-                float o[3];
-                for (int ch = 0; ch < 3; ++ch) {
-                    o[ch] = (px(x0, yi, ch) * (1 - fx) + px(x0 + 1, yi, ch) * fx) * (1 - fy) +
-                            (px(x0, yi + 1, ch) * (1 - fx) + px(x0 + 1, yi + 1, ch) * fx) * fy;
+    auto px = [&](int x, int y, int ch) -> float {
+        if (rgba) return im.rgba[static_cast<std::size_t>(y) * im.stride + static_cast<std::size_t>(x) * 4 + ch] * (1.0f / 255.0f);
+        return im.rgb[static_cast<std::size_t>(y) * im.stride + static_cast<std::size_t>(x) * 3 + ch];
+    };
+    // One output row into its pending buffer, with k for the row given (k is symmetric in x and in y about the centre).
+    auto produce = [&](int y, const float* kRow) {
+        const int slot = slotOf[static_cast<std::size_t>(y)];
+        std::uint8_t* d8 = rgba ? bufs8[static_cast<std::size_t>(slot)].data() : nullptr;
+        float* dF = rgba ? nullptr : bufsF[static_cast<std::size_t>(slot)].data();
+        if (rgba) std::copy(im.rgba + static_cast<std::size_t>(y) * im.stride, im.rgba + static_cast<std::size_t>(y) * im.stride + rowElems, d8);
+        const float yy = static_cast<float>(y) + 0.5f - h / 2.0f;
+        for (int x = 0; x < w; ++x) {
+            const float xx = static_cast<float>(x) + 0.5f - w / 2.0f;
+            const float k = kRow[x];
+            const float sx = std::min(std::max(xx * k + w / 2.0f - 0.5f, 0.0f), static_cast<float>(w - 1));
+            const float sy = std::min(std::max(yy * k + h / 2.0f - 0.5f, 0.0f), static_cast<float>(h - 1));
+            const int x0 = std::min(static_cast<int>(sx), w - 2);
+            const int yi = std::min(static_cast<int>(sy), h - 2);
+            const float fx = sx - static_cast<float>(x0), fy = sy - static_cast<float>(yi);
+            float o[3];
+            for (int ch = 0; ch < 3; ++ch) {
+                o[ch] = (px(x0, yi, ch) * (1 - fx) + px(x0 + 1, yi, ch) * fx) * (1 - fy) +
+                        (px(x0, yi + 1, ch) * (1 - fx) + px(x0 + 1, yi + 1, ch) * fx) * fy;
+            }
+            if (rgba) {
+                std::uint8_t* p = d8 + static_cast<std::size_t>(x) * 4;
+                for (int c = 0; c < 3; ++c) {
+                    const float v = std::min(std::max(o[c], 0.0f), 1.0f) * 255.0f + 0.5f;
+                    p[c] = static_cast<std::uint8_t>(v);
                 }
-                im.put(x, y, o);
+            } else {
+                float* p = dF + static_cast<std::size_t>(x) * 3;
+                for (int c = 0; c < 3; ++c) p[c] = std::min(std::max(o[c], 0.0f), 1.0f);
             }
         }
-    });
+    };
+    auto kRowFor = [&](int y, float* kRow) {
+        const float yy = static_cast<float>(y) + 0.5f - h / 2.0f;
+        const int halfW = (w + 1) / 2;
+        for (int x = 0; x < halfW; ++x) {
+            const float xx = static_cast<float>(x) + 0.5f - w / 2.0f;
+            const float rd = std::sqrt(xx * xx + yy * yy) * invHalf;
+            kRow[x] = lookup(ratio, rd * invRMax) * scale;
+        }
+        for (int x = halfW; x < w; ++x) kRow[x] = kRow[w - 1 - x];  // xx(w - 1 - x) == -xx(x) exactly
+    };
+    auto commit = [&](int y) {
+        const int slot = slotOf[static_cast<std::size_t>(y)];
+        if (rgba) {
+            std::copy(bufs8[static_cast<std::size_t>(slot)].begin(), bufs8[static_cast<std::size_t>(slot)].end(),
+                      im.rgba + static_cast<std::size_t>(y) * im.stride);
+        } else {
+            std::copy(bufsF[static_cast<std::size_t>(slot)].begin(), bufsF[static_cast<std::size_t>(slot)].end(),
+                      im.rgb + static_cast<std::size_t>(y) * im.stride);
+        }
+        freeSlots.push_back(slot);
+        slotOf[static_cast<std::size_t>(y)] = -1;
+    };
+    const int mid = h / 2;  // top sweep rows [0, mid), bottom sweep rows [mid, h), bottom from h - 1 down
+    const int chunk = std::max(8, std::min(kDistortChunk, mid));
+    int top = 0, bot = h - 1;
+    std::vector<std::vector<float>> kRows(static_cast<std::size_t>(std::max(1, std::min(kMaxThreads, std::max(threads, 1)))),
+                                          std::vector<float>(static_cast<std::size_t>(w)));
+    while (top < mid || bot >= mid) {
+        // This step: top rows [top, tEnd) and bottom rows (bEnd, bot]; row y pairs with h - 1 - y (same k row).
+        const int tEnd = std::min(mid, top + chunk);
+        const int bEnd = std::max(mid - 1, bot - chunk);
+        std::vector<int> rows;
+        for (int y = top; y < tEnd; ++y) rows.push_back(y);
+        for (int y = bot; y > bEnd; --y) rows.push_back(y);
+        for (int y : rows) {
+            slotOf[static_cast<std::size_t>(y)] = takeSlot();
+            pending.push_back(y);
+        }
+        peakRows = std::max(peakRows, pending.size());
+        // Jobs: a top row with its mirror (when the mirror is in this step), and any unpaired row.
+        std::vector<std::pair<int, int>> jobs;
+        std::vector<char> done(rows.size(), 0);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (done[i]) continue;
+            const int y = rows[i];
+            const int mirror = h - 1 - y;
+            int partner = -1;
+            for (std::size_t j = i + 1; j < rows.size(); ++j) {
+                if (!done[j] && rows[j] == mirror && mirror != y) {
+                    partner = mirror;
+                    done[j] = 1;
+                    break;
+                }
+            }
+            done[i] = 1;
+            jobs.emplace_back(y, partner);
+        }
+        const int nt = static_cast<int>(kRows.size());
+        const int nj = static_cast<int>(jobs.size());
+        parallelRows(std::min(nt, nj), nt, [&](int t0, int t1) {
+            for (int t = t0; t < t1; ++t) {
+                float* kRow = kRows[static_cast<std::size_t>(t)].data();
+                const int parts = std::min(nt, nj);
+                const int a = static_cast<int>(static_cast<long long>(nj) * t / parts);
+                const int b = static_cast<int>(static_cast<long long>(nj) * (t + 1) / parts);
+                for (int j = a; j < b; ++j) {
+                    kRowFor(jobs[static_cast<std::size_t>(j)].first, kRow);
+                    produce(jobs[static_cast<std::size_t>(j)].first, kRow);
+                    if (jobs[static_cast<std::size_t>(j)].second >= 0) produce(jobs[static_cast<std::size_t>(j)].second, kRow);
+                }
+            }
+        });
+        top = tEnd;
+        bot = bEnd;
+        // Source rows any row still to be produced may read (read ranges grow monotonically along each sweep).
+        int fLoT = h, fHiT = -1, fLoB = h, fHiB = -1;
+        if (top < mid) {
+            int lo, hi;
+            readRows(m, top, h, fLoT, hi);
+            readRows(m, mid - 1, h, lo, fHiT);
+            fLoT = std::min(fLoT, lo);
+            fHiT = std::max(fHiT, hi);
+        }
+        if (bot >= mid) {
+            int lo, hi;
+            readRows(m, mid, h, fLoB, hi);
+            readRows(m, bot, h, lo, fHiB);
+            fLoB = std::min(fLoB, lo);
+            fHiB = std::max(fHiB, hi);
+        }
+        std::vector<int> keep;
+        for (int y : pending) {
+            const bool readT = y >= fLoT && y <= fHiT;
+            const bool readB = y >= fLoB && y <= fHiB;
+            if (readT || readB) {
+                keep.push_back(y);
+            } else {
+                commit(y);
+            }
+        }
+        pending.swap(keep);
+    }
+    for (int y : pending) commit(y);
+    const std::size_t slots = rgba ? bufs8.size() : bufsF.size();
+    st.peakBytes = std::max(st.peakBytes, static_cast<double>(slots * rowBytes + kRows.size() * w * sizeof(float) +
+                                                              ratio.size() * sizeof(float) + h * sizeof(int)));
+    (void)peakRows;
 }
 
 // ----------------------------------------------------------------------------------------------- 2. sharpening
 
-void sharpen(const Image& im, const DetailSpec& s, int threads) {
+// B24.1: in place without a full-size plane. The horizontal Gaussian of the luma is kept for a ring of 2r + 1 rows per
+// band; the rows just outside each band (which the neighbouring band rewrites) are blurred first, before any band
+// writes. Same arithmetic, in the same order, as the B24 full-plane version (bit-identical; detail_test).
+void sharpen(const Image& im, const DetailSpec& s, int threads, DetailStats& st) {
     const int w = im.width, h = im.height;
     const int rad = static_cast<int>(3.0f * s.sharpenSigma + 0.5f);
     std::vector<float> k(2 * rad + 1);
@@ -182,54 +348,90 @@ void sharpen(const Image& im, const DetailSpec& s, int threads) {
         sum += v;
     }
     for (float& v : k) v = static_cast<float>(v / sum);
-    // Horizontal pass of the luma for every row (read-only on the image).
-    std::vector<float> t(static_cast<std::size_t>(w) * h);
-    parallelRows(h, threads, [&](int y0, int y1) {
-        std::vector<float> row(static_cast<std::size_t>(w) + 2 * rad);
-        for (int y = y0; y < y1; ++y) {
-            for (int x = 0; x < w; ++x) row[x + rad] = im.luma(x, y);
-            for (int i = 0; i < rad; ++i) {
-                row[i] = row[rad];
-                row[w + rad + i] = row[w + rad - 1];
-            }
-            float* o = &t[static_cast<std::size_t>(y) * w];
-            for (int x = 0; x < w; ++x) {
-                float acc = 0.0f;
-                for (int i = 0; i <= 2 * rad; ++i) acc += k[i] * row[x + i];
-                o[x] = acc;
-            }
+    const int taps = 2 * rad + 1;
+    // Horizontal pass of one row's luma into o (row: scratch of w + 2 rad).
+    auto hpass = [&](int y, float* row, float* o) {
+        for (int x = 0; x < w; ++x) row[x + rad] = im.luma(x, y);
+        for (int i = 0; i < rad; ++i) {
+            row[i] = row[rad];
+            row[w + rad + i] = row[w + rad - 1];
+        }
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            for (int i = 0; i < taps; ++i) acc += k[i] * row[x + i];
+            o[x] = acc;
+        }
+    };
+    const int bands = std::min(std::max(threads, 1), std::min(kMaxThreads, std::max(h, 1)));
+    std::vector<int> a(bands), b(bands);
+    for (int t = 0; t < bands; ++t) {
+        a[t] = static_cast<int>(static_cast<long long>(h) * t / bands);
+        b[t] = static_cast<int>(static_cast<long long>(h) * (t + 1) / bands);
+    }
+    const std::size_t W = static_cast<std::size_t>(w);
+    // Per band: halo rows (outside the band, inside the image) blurred from the untouched image.
+    std::vector<std::vector<int>> haloRows(bands);
+    std::vector<std::vector<float>> halo(bands);
+    for (int t = 0; t < bands; ++t) {
+        const int lo = std::max(0, a[t] - rad), hi = std::min(h - 1, b[t] - 1 + rad);
+        for (int y = lo; y <= hi; ++y) {
+            if (y < a[t] || y >= b[t]) haloRows[t].push_back(y);
+        }
+        halo[t].resize(haloRows[t].size() * W);
+    }
+    std::vector<std::vector<float>> scratch(bands, std::vector<float>(W + 2 * rad));
+    parallelRows(bands, bands, [&](int t0, int t1) {
+        for (int t = t0; t < t1; ++t) {
+            for (std::size_t i = 0; i < haloRows[t].size(); ++i) hpass(haloRows[t][i], scratch[t].data(), &halo[t][i * W]);
         }
     });
     const float thr2 = s.sharpenThreshold * s.sharpenThreshold;
     const float amount = s.sharpenAmount;
-    // Vertical pass (row accumulation, vectorisable) + apply: each thread writes only its own rows and reads only its
-    // own pixels.
-    parallelRows(h, threads, [&](int y0, int y1) {
-        std::vector<float> acc(static_cast<std::size_t>(w));
-        for (int y = y0; y < y1; ++y) {
-            std::fill(acc.begin(), acc.end(), 0.0f);
-            for (int i = -rad; i <= rad; ++i) {
-                const int yy = std::min(std::max(y + i, 0), h - 1);
-                const float ki = k[i + rad];
-                const float* tr = &t[static_cast<std::size_t>(yy) * w];
-                float* a = acc.data();
-                for (int x = 0; x < w; ++x) a[x] += ki * tr[x];
-            }
-            for (int x = 0; x < w; ++x) {
-                float v[3];
-                im.get(x, y, v);
-                const float yl = kLr * v[0] + kLg * v[1] + kLb * v[2];
-                float dd = yl - acc[x];
-                if (thr2 > 0.0f) {
-                    const float d2 = dd * dd;
-                    dd = d2 + thr2 > 0.0f ? dd * d2 / (d2 + thr2) : 0.0f;
+    std::vector<std::vector<float>> ring(bands, std::vector<float>(static_cast<std::size_t>(taps) * W));
+    std::vector<std::vector<float>> accs(bands, std::vector<float>(W));
+    parallelRows(bands, bands, [&](int t0, int t1) {
+        for (int t = t0; t < t1; ++t) {
+            const int ya = a[t], yb = b[t];
+            float* rg = ring[t].data();
+            float* acc = accs[t].data();
+            float* row = scratch[t].data();
+            auto rowPtr = [&](int yy) -> const float* {
+                if (yy >= ya && yy < yb) return rg + static_cast<std::size_t>(yy % taps) * W;
+                const auto& hr = haloRows[t];
+                const std::size_t i = static_cast<std::size_t>(std::lower_bound(hr.begin(), hr.end(), yy) - hr.begin());
+                return &halo[t][i * W];
+            };
+            int next = ya;  // next band row whose blur is not in the ring yet
+            for (int y = ya; y < yb; ++y) {
+                // Rows up to y + rad are still untouched (this band writes row y only now).
+                const int need = std::min(yb - 1, y + rad);
+                for (; next <= need; ++next) hpass(next, row, rg + static_cast<std::size_t>(next % taps) * W);
+                std::fill(acc, acc + w, 0.0f);
+                for (int i = -rad; i <= rad; ++i) {
+                    const int yy = std::min(std::max(y + i, 0), h - 1);
+                    const float ki = k[i + rad];
+                    const float* tr = rowPtr(yy);
+                    for (int x = 0; x < w; ++x) acc[x] += ki * tr[x];
                 }
-                const float add = amount * dd;
-                const float o[3] = {v[0] + add, v[1] + add, v[2] + add};
-                im.put(x, y, o);
+                for (int x = 0; x < w; ++x) {
+                    float v[3];
+                    im.get(x, y, v);
+                    const float yl = kLr * v[0] + kLg * v[1] + kLb * v[2];
+                    float dd = yl - acc[x];
+                    if (thr2 > 0.0f) {
+                        const float d2 = dd * dd;
+                        dd = d2 + thr2 > 0.0f ? dd * d2 / (d2 + thr2) : 0.0f;
+                    }
+                    const float add = amount * dd;
+                    const float o[3] = {v[0] + add, v[1] + add, v[2] + add};
+                    im.put(x, y, o);
+                }
             }
         }
     });
+    std::size_t floats = 0;
+    for (int t = 0; t < bands; ++t) floats += halo[t].size() + ring[t].size() + accs[t].size() + scratch[t].size();
+    st.peakBytes = std::max(st.peakBytes, static_cast<double>(floats * sizeof(float)));
 }
 
 // ----------------------------------------------------------------------------------------------- 3. noise + grain
@@ -369,7 +571,7 @@ std::string run(const Image& im, const DetailSpec& s, DetailStats& st) {
     }
     t = Clock::now();
     if (s.sharpenAmount > 0.0f) {
-        sharpen(im, s, s.threads);
+        sharpen(im, s, s.threads, st);
         st.sharpenMs = msSince(t);
     }
     if (s.grain) {

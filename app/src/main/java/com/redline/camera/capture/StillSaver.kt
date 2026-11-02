@@ -24,6 +24,7 @@ import com.redline.camera.nativebridge.RedlineNative
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.OutputStream
+import java.nio.ByteBuffer
 import kotlin.math.abs
 
 /** Everything one still capture produced, handed from the camera thread to the saver. */
@@ -63,7 +64,13 @@ class StillShot(
     /** B23: the 50/70 mm super-resolution decision (applies: saved at its output size, merged or upscaled). */
     val superRes: SuperResDecision? = null,
     /** Returns the shot's pool buffers; called exactly once by the saver when it is done. */
-    val release: () -> Unit = {}
+    val release: () -> Unit = {},
+    /**
+     * B24.1: returns the shot's pool buffers early, all but [keep] (the DNG's source frame, when one is still to be
+     * written). Called by the saver once the RAW render is done, before the upscale, the detail post-pass and the store,
+     * so a busy queue gets its buffers back sooner. [release] still returns whatever is left, exactly once.
+     */
+    val releaseRaw: (keep: ByteBuffer?) -> Unit = {}
 )
 
 /**
@@ -334,6 +341,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
             colour =
                 ColourShot(rendered = false, fallbackReason = if (shot.raw == null) "no RAW frame in this shot" else "pipeline unavailable")
         }
+        // B24.1: the RAW frames are no longer needed past this point (only the DNG's own frame, written by the store):
+        // their pool buffers go back now, not after the upscale, detail post-pass, encode and MediaStore insert.
+        val dngKeep = if (shot.saveDng) dngRaw?.buffer else null
+        runCatching { shot.releaseRaw(dngKeep) }
+        shot.timeline?.mark(ShotTimeline.RAW_RELEASED, nowMs())
         // B23: a 50/70 mm still with super-resolution on is saved at its output size: the merge itself, or the B22 merge
         // (or one frame) upscaled, with the reason recorded and named in the EXIF note.
         val sr = shot.superRes
@@ -407,6 +419,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         var jpegSize: Dim? = null
         var error: String? = null
         val encodeStart = nowMs()
+        val savedCameraJpeg = staged.rendered == null
         val jpegOk = try {
             val bmp = staged.rendered
             if (bmp != null) {
@@ -423,6 +436,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
         } finally {
             staged.rendered?.recycle()
             staged.rendered = null
+        }
+        // B24.1: the camera JPEG is never a pressure fallback; when it was saved, say why (a hard reason) in the report.
+        if (savedCameraJpeg && jpegSize != null && burstShot != null) {
+            val hard = hardJpegReason(shot, colour, burstShot)
+            if (hard != null) burstShot = burstShot.copy(path = BurstShot.PATH_JPEG, hardJpegReason = hard)
         }
         val encodeMs = nowMs() - encodeStart
         var dngOk = false
@@ -495,6 +513,17 @@ class StillSaver(context: Context, private val version: String, private val pipe
             colour = colour,
             burst = burstShot
         )
+    }
+
+    /**
+     * B24.1: why a shot was saved as the camera JPEG, when that was a hard error: the RAW render failed (the pipeline's
+     * reason), or the controller took the press without a RAW buffer ([ShotRouter.HARD_PREFIX] in the plan). Null when
+     * the shot was never meant to be rendered from RAW (pipeline off, no RAW stream).
+     */
+    private fun hardJpegReason(shot: StillShot, colour: ColourShot?, b: BurstShot): String? {
+        if (shot.renderRaw) return "render error: ${colour?.fallbackReason ?: b.fallbackReason ?: "no bitmap"}"
+        val plan = b.plan.singleReason ?: return null
+        return plan.split("; ").firstOrNull { it.startsWith(ShotRouter.HARD_PREFIX) }?.removePrefix(ShotRouter.HARD_PREFIX)
     }
 
     /** B21: the pipeline's bitmap (sensor orientation) as the JPEG; EXIF orientation comes from the shot. */

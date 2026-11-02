@@ -79,6 +79,9 @@ class ShutterTimelineTest {
         assertEquals("Capturing · 2 queued", PressPolicy.indicator(3, 0))
         assertEquals("Processing 2", PressPolicy.indicator(0, 2))
         assertEquals("Capturing · 1 queued · Processing 1", PressPolicy.indicator(2, 1))
+        // B24.1: a press waiting for memory shows a busy state.
+        assertEquals("${PressPolicy.MEMORY_WAIT_LABEL} · Capturing", PressPolicy.indicator(1, 0, memoryWait = true))
+        assertEquals(PressPolicy.MEMORY_WAIT_LABEL, PressPolicy.indicator(0, 0, memoryWait = true))
     }
 
     @Test

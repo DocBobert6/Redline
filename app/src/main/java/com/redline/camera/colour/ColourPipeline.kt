@@ -370,7 +370,10 @@ class ColourPipeline(context: Context) {
                 grainTarget = target?.map { it.toDouble() },
                 grainMeasured = if (target != null) st.measured else null,
                 grainAdded = if (target != null) st.added else null,
-                timingsMs = timings
+                timingsMs = timings,
+                peakMb = st.peakMb,
+                width = bitmap.width,
+                height = bitmap.height
             )
         } catch (e: Exception) {
             DetailShot(

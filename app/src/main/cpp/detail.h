@@ -39,6 +39,8 @@ struct DetailStats {
     float added[kNoiseBins] = {0, 0, 0, 0, 0, 0, 0};
     float distortScale = 1.0f;
     double distortMs = 0.0, sharpenMs = 0.0, noiseMs = 0.0, grainMs = 0.0, totalMs = 0.0;
+    // B24.1: the most working memory any stage held at once, bytes (strip buffers; no full-size copy since B24.1)
+    double peakBytes = 0.0;
 };
 
 // In place on RGBA8 (alpha kept). Returns an empty string on success, else a short error (the image is untouched

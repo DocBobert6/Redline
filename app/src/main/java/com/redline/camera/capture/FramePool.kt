@@ -43,7 +43,9 @@ class FramePool(
     val frameBytes: Long,
     @Volatile var capacity: Int,
     private val alloc: (Long) -> ByteBuffer?,
-    private val free: (ByteBuffer) -> Unit
+    private val free: (ByteBuffer) -> Unit,
+    /** B24.1: called after buffers come back (a press waiting for memory can go); must not call back into the pool. */
+    private val onRelease: () -> Unit = {}
 ) {
     private val idle = ArrayDeque<ByteBuffer>()
     private var inUse = 0
@@ -70,12 +72,15 @@ class FramePool(
         return out
     }
 
-    @Synchronized
     fun release(buffers: Collection<ByteBuffer>) {
-        for (b in buffers) {
-            inUse--
-            if (idle.size + inUse < capacity) idle.addLast(b) else free(b)
+        if (buffers.isEmpty()) return
+        synchronized(this) {
+            for (b in buffers) {
+                inUse--
+                if (idle.size + inUse < capacity) idle.addLast(b) else free(b)
+            }
         }
+        onRelease()
     }
 
     /** Frees the idle buffers (memory goes back to the system); buffers in use are untouched. */

@@ -106,6 +106,9 @@ class ShotTimeline(val pressMs: Long) {
         const val RENDER_DONE = "render_done"
         const val STORE_START = "store_start"
         const val SAVED = "saved"
+
+        /** B24.1: the shot's RAW pool buffers went back (right after the RAW render unless a DNG still needs one). */
+        const val RAW_RELEASED = "raw_released"
     }
 }
 
@@ -125,9 +128,13 @@ object PressPolicy {
 
     fun refusedReason(): String = "queue full ($MAX_WAITING_PRESSES presses waiting)"
 
+    const val MEMORY_WAIT_LABEL = "Busy · waiting for memory"
+
     /** The viewfinder's capture line: what the shutter is doing right now, so a press never looks ignored. */
-    fun indicator(outstanding: Int, processing: Int): String? {
+    fun indicator(outstanding: Int, processing: Int, memoryWait: Boolean = false): String? {
         val parts = ArrayList<String>()
+        // B24.1: a press waiting for a RAW buffer (it is not dropped and not turned into the camera JPEG).
+        if (memoryWait) parts += MEMORY_WAIT_LABEL
         if (outstanding > 0) {
             val w = waiting(outstanding)
             parts += if (w > 0) "Capturing · $w queued" else "Capturing"
