@@ -67,3 +67,11 @@ add_executable(detail_tool detail_tool.cpp ${NATIVE_SRC}/detail.cpp)
 target_include_directories(detail_tool PRIVATE ${NATIVE_SRC})
 target_compile_options(detail_tool PRIVATE -Wall -Wextra -Werror -O3)
 target_link_libraries(detail_tool PRIVATE Threads::Threads)
+
+# B25 Ultra HDR gain map: SDR bit-identical with the gain map, cell sums independent of the thread count, headroom and
+# skip rules, the linear (super-resolution) render, the distortion warp. Strict IEEE as for detail_test.
+add_executable(gainmap_test gainmap_test.cpp ${NATIVE_SRC}/raw_pipeline.cpp ${NATIVE_SRC}/gainmap.cpp ${NATIVE_SRC}/detail.cpp)
+target_include_directories(gainmap_test PRIVATE ${NATIVE_SRC})
+target_compile_options(gainmap_test PRIVATE -Wall -Wextra -Werror -O3 -ffp-contract=off)
+target_link_libraries(gainmap_test PRIVATE Threads::Threads)
+add_test(NAME gainmap COMMAND gainmap_test)

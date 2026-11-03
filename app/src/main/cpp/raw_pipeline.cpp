@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -277,8 +278,10 @@ public:
         step_ = (n_ - 1) / (hi_ - lo_);
     }
 
-    float operator()(float lin) const {
-        const float x = gain_ * lin;
+    float operator()(float lin) const { return atX(gain_ * lin); }
+
+    // The curve on an already gained value x (operator() is atX(gain * lin), the same expression as before B25).
+    float atX(float x) const {
         if (!(x > 0.0f)) return 0.0f;
         if (x < floor_) return std::min(x / floor_ * t_[0], 1.0f);
         const float f = (std::log2(x) - lo_) * step_;
@@ -322,6 +325,88 @@ private:
     int n_;
     float cx_ = 0, cy_ = 0, inv_ = 0;
 };
+
+// B25: sRGB decode (IEC 61966-2-1) of an encoded value in 0..1.
+inline double srgbDecode(double v) {
+    v = std::min(std::max(v, 0.0), 1.0);
+    return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+}
+
+// B25: log2 gain of the HDR rendition over the SDR one as a function of e = log2(x), x the curve input (see
+// GainMapAccum). Tabulated from the knee to the curve's top (curveHi) and extended linearly above it, where the curve is
+// flat at its last value. Built once per render, read by every thread.
+class GainTable {
+public:
+    GainTable(const RenderSpec& s, const Curve& curve) {
+        ek_ = s.gainMap->kneeEv;
+        xk_ = std::exp2(ek_);
+        const double lk = srgbDecode(curve.atX(xk_));
+        const double lb = srgbDecode(curve.atX(std::exp2(ek_ - GainMapAccum::kSlopeDeltaEv)));
+        double p = (lk > 0.0 && lb > 0.0) ? (std::log2(lk) - std::log2(lb)) / GainMapAccum::kSlopeDeltaEv : 0.5;
+        if (!std::isfinite(p)) p = 0.5;
+        p = std::min(std::max(p, static_cast<double>(GainMapAccum::kMinSlope)), static_cast<double>(GainMapAccum::kMaxSlope));
+        slope_ = static_cast<float>(p);
+        log2Lk_ = lk > 0.0 ? std::log2(lk) : 0.0;
+        eHi_ = std::max(s.curveHi, ek_ + 1e-3f);
+        step_ = (eHi_ - ek_) / static_cast<float>(kPoints - 1);
+        inv_ = 1.0f / step_;
+        for (int i = 0; i < kPoints; ++i) {
+            const double e = ek_ + step_ * i;
+            t_[i] = static_cast<float>(gainAt(e, srgbDecode(curve.atX(static_cast<float>(std::exp2(e))))));
+        }
+        const double lTop = srgbDecode(curve.atX(std::exp2(eHi_) * 1.0001f));
+        topLog2L_ = lTop > 0.0 ? std::log2(lTop) : 0.0;
+    }
+
+    float slope() const { return slope_; }
+    float knee() const { return xk_; }
+
+    // x > knee() only (below it the gain is 1, log2 0).
+    float operator()(float x) const {
+        const float e = std::log2(x);
+        const float f = (e - ek_) * inv_;
+        if (f >= static_cast<float>(kPoints - 1)) {
+            const float v = static_cast<float>(log2Lk_ + slope_ * (e - ek_) - topLog2L_);
+            return std::max(v, 0.0f);
+        }
+        const int i = std::max(static_cast<int>(f), 0);
+        const float u = f - static_cast<float>(i);
+        return t_[i] + (t_[i + 1] - t_[i]) * u;
+    }
+
+private:
+    double gainAt(double e, double lsdr) const {
+        if (!(lsdr > 0.0)) return 0.0;
+        return std::max(0.0, log2Lk_ + slope_ * (e - ek_) - std::log2(lsdr));
+    }
+
+    static constexpr int kPoints = 512;
+    float t_[kPoints];
+    float ek_ = -1.5f, xk_ = 0.35f, eHi_ = 0.0f, step_ = 1.0f, inv_ = 1.0f, slope_ = 0.5f;
+    double log2Lk_ = 0.0, topLog2L_ = 0.0;
+};
+
+// B25: the cell sums of one output row (the band's thread owns every cell row it touches).
+inline float* cellRow(const RenderSpec& s, int oy) {
+    return s.gainMap->sums + static_cast<std::size_t>(oy / GainMapAccum::kCell) * static_cast<std::size_t>(s.gainMap->cellsW);
+}
+
+// B25: first output row of thread t's band; with a gain map the bands start on cell rows so no cell is shared.
+inline int bandStart(int rows, int t, int threads, bool cellAligned) {
+    if (t <= 0) return 0;
+    if (t >= threads) return rows;
+    const int a = static_cast<int>(static_cast<long long>(rows) * t / threads);
+    return cellAligned ? a / GainMapAccum::kCell * GainMapAccum::kCell : a;
+}
+
+std::string validateGainMap(const RenderSpec& s) {
+    const GainMapAccum* g = s.gainMap;
+    if (g == nullptr) return "";
+    const int k = GainMapAccum::kCell;
+    if (g->sums == nullptr || g->cellsW != (s.outWidth + k - 1) / k || g->cellsH != (s.outHeight + k - 1) / k) return "bad gain map cells";
+    if (!std::isfinite(g->kneeEv) || g->kneeEv >= s.curveHi || g->kneeEv <= s.curveLo) return "gain map knee outside the curve";
+    return "";
+}
 
 inline void lutSample(const float* lut, int n, const float in[3], float out[3]) {
     float x[3];
@@ -371,7 +456,7 @@ std::string validateSpec(const RawInput& in, const RenderSpec& s) {
     if (s.curve == nullptr || s.curvePoints < 2 || !(s.curveHi > s.curveLo)) return "bad tone curve";
     if (s.lut == nullptr || s.lutSize < 2 || s.lutSize > 256) return "bad LUT";
     if (s.vignette != nullptr && (s.vignettePoints < 2 || s.vignettePoints > 4096)) return "bad vignette table";
-    return "";
+    return validateGainMap(s);
 }
 
 // Output writers: RGBA8 for the app's Bitmap, float RGB for the host parity tool.
@@ -398,7 +483,7 @@ struct FloatWriter {
 
 template <typename Writer>
 void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty, const AreaTaps& tx, bool resample,
-                 int o0, int o1, const Writer& out) {
+                 int o0, int o1, const Writer& out, const GainTable* gt) {
     LinearRows rows(in, spec);
     const Curve curve(spec);
     const Vignette vig(spec);
@@ -435,6 +520,7 @@ void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty,
             rows.row(oy, line.data());
             lin = line.data();
         }
+        float* cells = gt != nullptr ? cellRow(spec, oy) : nullptr;
         for (int ox = 0; ox < ow; ++ox) {
             const float* l = lin + static_cast<std::size_t>(ox) * 3;
             const float g = vig.on() ? vig(ox, oy) : 1.0f;
@@ -442,6 +528,10 @@ void renderBlock(const RawInput& in, const RenderSpec& spec, const AreaTaps& ty,
             float o[3];
             lutSample(spec.lut, spec.lutSize, toned, o);
             out.put(ox, oy, o);
+            if (cells != nullptr) {  // B25: reads the same values, writes only the cell sums
+                const float xy = spec.gain * (g * (kLuma[0] * l[0] + kLuma[1] * l[1] + kLuma[2] * l[2]));
+                if (xy > gt->knee()) cells[ox / GainMapAccum::kCell] += (*gt)(xy);
+            }
         }
     }
 }
@@ -462,6 +552,17 @@ std::string validate(const RawInput& in) {
 
 namespace {
 
+// B25: zeroes the cell sums, builds the gain table and reports the slope; null without a gain map.
+std::unique_ptr<GainTable> prepareGainMap(const RenderSpec& spec) {
+    if (spec.gainMap == nullptr) return nullptr;
+    GainMapAccum& g = *spec.gainMap;
+    std::fill(g.sums, g.sums + static_cast<std::size_t>(g.cellsW) * static_cast<std::size_t>(g.cellsH), 0.0f);
+    const Curve curve(spec);
+    auto t = std::make_unique<GainTable>(spec, curve);
+    g.slope = t->slope();
+    return t;
+}
+
 template <typename Writer>
 void renderAll(const RawInput& in, const RenderSpec& spec, const Writer& out) {
     const bool resample = spec.outWidth != spec.crop.width || spec.outHeight != spec.crop.height;
@@ -470,20 +571,23 @@ void renderAll(const RawInput& in, const RenderSpec& spec, const Writer& out) {
         ty = areaTaps(spec.crop.height, spec.outHeight);
         tx = areaTaps(spec.crop.width, spec.outWidth);
     }
-    const int threads = std::min(std::max(spec.threads, 1), std::min(kMaxThreads, spec.outHeight));
+    std::unique_ptr<GainTable> table = prepareGainMap(spec);
+    const GainTable* gt = table.get();
+    const int rows = gt != nullptr ? spec.gainMap->cellsH : spec.outHeight;
+    const int threads = std::min(std::max(spec.threads, 1), std::min(kMaxThreads, rows));
     if (threads == 1) {
-        renderBlock(in, spec, ty, tx, resample, 0, spec.outHeight, out);
+        renderBlock(in, spec, ty, tx, resample, 0, spec.outHeight, out, gt);
         return;
     }
     const int nice = threadNice();
     std::vector<std::thread> pool;
     pool.reserve(threads);
     for (int t = 0; t < threads; ++t) {
-        const int o0 = static_cast<int>(static_cast<long long>(spec.outHeight) * t / threads);
-        const int o1 = static_cast<int>(static_cast<long long>(spec.outHeight) * (t + 1) / threads);
+        const int o0 = bandStart(spec.outHeight, t, threads, gt != nullptr);
+        const int o1 = bandStart(spec.outHeight, t + 1, threads, gt != nullptr);
         pool.emplace_back([&, o0, o1, nice] {
             takeNice(nice);
-            renderBlock(in, spec, ty, tx, resample, o0, o1, out);
+            renderBlock(in, spec, ty, tx, resample, o0, o1, out, gt);
         });
     }
     for (auto& th : pool) th.join();
@@ -607,11 +711,11 @@ std::string validateLinear(const LinearRgb& in, const RenderSpec& s) {
     if (s.curve == nullptr || s.curvePoints < 2 || !(s.curveHi > s.curveLo)) return "bad tone curve";
     if (s.lut == nullptr || s.lutSize < 2 || s.lutSize > 256) return "bad LUT";
     if (s.vignette != nullptr && (s.vignettePoints < 2 || s.vignettePoints > 4096)) return "bad vignette table";
-    return "";
+    return validateGainMap(s);
 }
 
 template <typename Writer>
-void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y1, const Writer& out) {
+void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y1, const Writer& out, const GainTable* gt) {
     const Curve curve(spec);
     const Vignette vig(spec);
     const float* m = spec.colour.matrix;
@@ -621,6 +725,7 @@ void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y
         const float* r = in.data + static_cast<std::size_t>(y) * in.rowStride;
         const float* g = r + in.planeStride;
         const float* b = g + in.planeStride;
+        float* cells = gt != nullptr ? cellRow(spec, y) : nullptr;
         for (int x = 0; x < in.width; ++x) {
             const float c[3] = {std::min(std::max(r[x] * inv[0], 0.0f), 1.0f), std::min(std::max(g[x] * inv[1], 0.0f), 1.0f),
                                 std::min(std::max(b[x] * inv[2], 0.0f), 1.0f)};
@@ -630,26 +735,35 @@ void renderLinearRows(const LinearRgb& in, const RenderSpec& spec, int y0, int y
             float o[3];
             lutSample(spec.lut, spec.lutSize, toned, o);
             out.put(x, y, o);
+            if (cells != nullptr) {  // B25, as in renderBlock
+                float l[3];
+                for (int k = 0; k < 3; ++k) l[k] = m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2];
+                const float xy = spec.gain * (gv * (kLuma[0] * l[0] + kLuma[1] * l[1] + kLuma[2] * l[2]));
+                if (xy > gt->knee()) cells[x / GainMapAccum::kCell] += (*gt)(xy);
+            }
         }
     }
 }
 
 template <typename Writer>
 void renderLinearAll(const LinearRgb& in, const RenderSpec& spec, const Writer& out) {
-    const int threads = std::min(std::max(spec.threads, 1), std::min(kMaxThreads, in.height));
+    std::unique_ptr<GainTable> table = prepareGainMap(spec);
+    const GainTable* gt = table.get();
+    const int rows = gt != nullptr ? spec.gainMap->cellsH : in.height;
+    const int threads = std::min(std::max(spec.threads, 1), std::min(kMaxThreads, rows));
     if (threads == 1) {
-        renderLinearRows(in, spec, 0, in.height, out);
+        renderLinearRows(in, spec, 0, in.height, out, gt);
         return;
     }
     const int nice = threadNice();
     std::vector<std::thread> pool;
     pool.reserve(threads);
     for (int t = 0; t < threads; ++t) {
-        const int a = static_cast<int>(static_cast<long long>(in.height) * t / threads);
-        const int b = static_cast<int>(static_cast<long long>(in.height) * (t + 1) / threads);
+        const int a = bandStart(in.height, t, threads, gt != nullptr);
+        const int b = bandStart(in.height, t + 1, threads, gt != nullptr);
         pool.emplace_back([&, a, b, nice] {
             takeNice(nice);
-            renderLinearRows(in, spec, a, b, out);
+            renderLinearRows(in, spec, a, b, out, gt);
         });
     }
     for (auto& th : pool) th.join();

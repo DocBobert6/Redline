@@ -109,13 +109,76 @@ object RedlineNative {
         lut: CubeLut,
         threads: Int,
         out: Bitmap,
-        vignette: FloatArray? = null
+        vignette: FloatArray? = null,
+        gainMap: GainMapCells? = null
     ): String? {
         val loaded = load()
         if (!loaded.loaded) return "native library not loaded: ${loaded.error}"
         return nativeRenderRaw(
             f.buffer, f.width, f.height, f.rowStrideBytes, f.cfa, f.black, f.white, f.shading, f.shadingRows, f.shadingCols,
-            crop, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette
+            crop, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette,
+            gainMap?.kneeEv ?: 0f, gainMap?.data
+        )
+    }
+
+    // ------------------------------------------------------------------------------------------- B25 Ultra HDR gain map
+
+    /**
+     * B25: the gain map cells a render accumulates for an [width] x [height] still (one per 4x4 output pixels): [data]
+     * holds the cells' summed log2 gain and, last, the knee slope the render measured on the tone curve.
+     */
+    class GainMapCells(val width: Int, val height: Int, val kneeEv: Float) {
+        val cellsW = (width + CELL - 1) / CELL
+        val cellsH = (height + CELL - 1) / CELL
+        val data = FloatArray(cellsW * cellsH + 1)
+        val slope: Float get() = data[cellsW * cellsH]
+
+        companion object {
+            const val CELL = 4
+        }
+    }
+
+    /** B25: what [finishGainMap] made of the cells: the encoded map (rows [stride] bytes) when [written], else why not. */
+    class GainMapBytes(
+        val written: Boolean,
+        val width: Int,
+        val height: Int,
+        val stride: Int,
+        val bytes: ByteArray,
+        val headroomStops: Double,
+        val p999Stops: Double,
+        val maxStops: Double,
+        val aboveKneeFraction: Double,
+        /** 0 written, 1 no highlights above the knee, 2 headroom below the minimum. */
+        val skipCode: Int
+    )
+
+    /** B25: encodes the cells (ratioMin 1, gamma 1, epsilon 0, headroom = capped p99.9). Throws on bad input. */
+    fun finishGainMap(cells: GainMapCells, capStops: Float, minStops: Float, stride: Int = cells.cellsW): GainMapBytes {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        require(stride >= cells.cellsW) { "stride smaller than the width" }
+        val bytes = ByteArray(stride * cells.cellsH)
+        val r = nativeFinishGainMap(cells.data, cells.width, cells.height, capStops, minStops, bytes, stride)
+        return GainMapBytes(
+            written = r[0] > 0.5f,
+            width = cells.cellsW,
+            height = cells.cellsH,
+            stride = stride,
+            bytes = bytes,
+            headroomStops = r[1].toDouble(),
+            p999Stops = r[2].toDouble(),
+            maxStops = r[3].toDouble(),
+            aboveKneeFraction = r[4].toDouble(),
+            skipCode = r[5].toInt()
+        )
+    }
+
+    /** B25: warps [map] in place with the RAW-feel distortion of an [imageWidth] x [imageHeight] still; null or the error. */
+    fun warpGainMap(map: GainMapBytes, imageWidth: Int, imageHeight: Int, distortion: FloatArray): String? {
+        if (!load().loaded) return "native library not loaded"
+        require(distortion.size == 3) { "distortion needs a, b, c" }
+        return nativeWarpGainMap(
+            map.bytes, map.width, map.height, map.stride, imageWidth, imageHeight, distortion[0], distortion[1], distortion[2]
         )
     }
 
@@ -434,10 +497,14 @@ object RedlineNative {
             lut: CubeLut,
             threads: Int,
             out: Bitmap,
-            vignette: FloatArray? = null
+            vignette: FloatArray? = null,
+            gainMap: GainMapCells? = null
         ): String? {
             if (handle == 0L) return "merger closed"
-            return nativeSrRender(handle, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette)
+            return nativeSrRender(
+                handle, matrix, neutral, gain, curve, curveLo, curveHi, lut.data, lut.size, threads, out, vignette,
+                gainMap?.kneeEv ?: 0f, gainMap?.data
+            )
         }
 
         override fun close() {
@@ -529,7 +596,9 @@ object RedlineNative {
         lutSize: Int,
         threads: Int,
         out: Bitmap,
-        vignette: FloatArray?
+        vignette: FloatArray?,
+        gainMapKneeEv: Float,
+        gainMapOut: FloatArray?
     ): String?
 
     @JvmStatic
@@ -641,7 +710,33 @@ object RedlineNative {
         lutSize: Int,
         threads: Int,
         out: Bitmap,
-        vignette: FloatArray?
+        vignette: FloatArray?,
+        gainMapKneeEv: Float,
+        gainMapOut: FloatArray?
+    ): String?
+
+    @JvmStatic
+    private external fun nativeFinishGainMap(
+        sums: FloatArray,
+        outWidth: Int,
+        outHeight: Int,
+        capStops: Float,
+        minStops: Float,
+        out: ByteArray,
+        outStride: Int
+    ): FloatArray
+
+    @JvmStatic
+    private external fun nativeWarpGainMap(
+        map: ByteArray,
+        mapWidth: Int,
+        mapHeight: Int,
+        mapStride: Int,
+        imageWidth: Int,
+        imageHeight: Int,
+        distA: Float,
+        distB: Float,
+        distC: Float
     ): String?
 
     @JvmStatic

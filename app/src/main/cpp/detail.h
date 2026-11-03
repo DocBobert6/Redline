@@ -52,6 +52,11 @@ std::string applyDetail(std::uint8_t* rgba, int width, int height, std::size_t s
 std::string applyDetailFloat(float* rgb, int width, int height, std::size_t strideFloats, const DetailSpec& spec,
                              DetailStats& stats);
 
+// B25: warps an 8-bit gain map (mapWidth x mapHeight, any resolution relative to the still) with the distortion of
+// `spec` as applied to an imageWidth x imageHeight still; no-op when spec.distort is false.
+std::string warpGainMap(std::uint8_t* map, int mapWidth, int mapHeight, std::size_t mapStride, int imageWidth, int imageHeight,
+                        const DetailSpec& spec);
+
 // The encoded luma bin edges of the noise estimate (kNoiseBins + 1 values) and the bin centres.
 extern const float kNoiseBinEdges[kNoiseBins + 1];
 

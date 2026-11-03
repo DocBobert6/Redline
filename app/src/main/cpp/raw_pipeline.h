@@ -38,6 +38,27 @@ struct ColourSpec {
     float neutral[3] = {1, 1, 1};                    // camera neutral, max = 1
 };
 
+// B25: Ultra HDR gain map accumulation during the render. The HDR rendition continues the tone curve past the
+// highlight knee (curve input x = gain * vignette * luma(linear sRGB), knee x_k = 2^kneeEv) with the curve's own
+// log-log slope p just below the knee: L_hdr(x) = L_k * (x / x_k)^p, L = sRGB-decoded curve output; below the knee the
+// two renditions are equal (gain 1). Per 4x4 cell of output pixels the sum of log2(L_hdr / L_sdr(x)) is accumulated
+// (L_sdr(x) = decoded C(x), clamped at >= 0), so the map is the mean log2 gain of the cell. The SDR pixels are not touched:
+// the render writes exactly the same output with or without a gain map (raw_pipeline_test checks bit for bit).
+struct GainMapAccum {
+    float kneeEv = -1.5f;
+    // Output: cellsW x cellsH sums (cellsW = ceil(outWidth / 4), cellsH = ceil(outHeight / 4)); the render zeroes them.
+    float* sums = nullptr;
+    int cellsW = 0;
+    int cellsH = 0;
+    // Output: the slope p the render measured on the curve (log2 of decoded output per EV, 0.25 EV below the knee,
+    // clamped to [kMinSlope, kMaxSlope]).
+    float slope = 0.0f;
+    static constexpr int kCell = 4;
+    static constexpr float kSlopeDeltaEv = 0.25f;
+    static constexpr float kMinSlope = 0.2f;
+    static constexpr float kMaxSlope = 1.0f;
+};
+
 struct RenderSpec {
     CropRect crop;
     int outWidth = 0;
@@ -59,6 +80,8 @@ struct RenderSpec {
     // after the matrix (and the area downscale), before the curve. nullptr = off.
     const float* vignette = nullptr;
     int vignettePoints = 0;
+    // B25: optional gain map accumulation (nullptr = none). With it the row bands of the threads start on cell rows.
+    GainMapAccum* gainMap = nullptr;
 };
 
 struct RawStats {
