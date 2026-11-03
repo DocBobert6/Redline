@@ -155,13 +155,14 @@ jobs:
             ./gradlew --stacktrace :app:connectedDebugAndroidTest
             adb pull /sdcard/Download/RedlineCI uhdr-out
 
-      # B25: validate the emulator's Ultra HDR JPEG with libultrahdr (Apache-2.0; CI only, not part of the app).
+      # B25: validate the emulator's Ultra HDR JPEG with libultrahdr (Apache-2.0; CI only, not part of the app). v1.4.0 misses
+      # an <cstdint> include that the runner's GCC no longer pulls in transitively, hence the forced include.
       - name: Validate Ultra HDR with libultrahdr (host)
         run: |
           sudo apt-get install -y --no-install-recommends libjpeg-turbo8-dev ninja-build > /dev/null
           git clone --depth 1 -b v1.4.0 https://github.com/google/libultrahdr.git build/libultrahdr-src
           cmake -G Ninja -S build/libultrahdr-src -B build/libultrahdr -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-            -DUHDR_BUILD_EXAMPLES=OFF -DUHDR_BUILD_TESTS=OFF -DUHDR_ENABLE_INSTALL=OFF
+            -DUHDR_BUILD_EXAMPLES=OFF -DUHDR_BUILD_TESTS=OFF -DUHDR_ENABLE_INSTALL=OFF -DCMAKE_CXX_FLAGS="-include cstdint"
           cmake --build build/libultrahdr
           g++ -std=c++17 -O2 ci/uhdr_validate.cpp -Ibuild/libultrahdr-src -Lbuild/libultrahdr -luhdr -ljpeg -lpthread -lm \
             -o build/uhdr_validate

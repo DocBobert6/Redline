@@ -15,8 +15,11 @@ import java.nio.ByteBuffer
 object UltraHdrEncoder {
     /** Sets the gain map on [bitmap]; [detach] removes it after the encode. */
     fun attach(bitmap: Bitmap, map: RedlineNative.GainMapBytes) {
-        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) { "Ultra HDR needs API 34" }
-        Api34.attach(bitmap, map)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            Api34.attach(bitmap, map)
+        } else {
+            error("Ultra HDR needs API 34")
+        }
     }
 
     fun detach(bitmap: Bitmap) {
