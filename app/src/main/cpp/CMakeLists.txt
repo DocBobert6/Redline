@@ -1,4 +1,4 @@
-# Redline native module (B20, B21, B22, B23, B24, B25): libredline_native.so. Built by AGP's externalNativeBuild with the NDK pinned in
+# Redline native module (B20, B21, B22, B23, B24, B25, B30): libredline_native.so. Built by AGP's externalNativeBuild with the NDK pinned in
 # app/build.gradle.kts (ndkVersion) and the CI workflows. Halide is deliberately not added yet.
 cmake_minimum_required(VERSION 3.22.1)
 project(redline_native LANGUAGES CXX)
@@ -14,6 +14,8 @@ add_library(redline_native SHARED
     superres.cpp
     detail.cpp
     gainmap.cpp
+    yuv.cpp
+    depth_post.cpp
     redline_jni.cpp)
 
 # B21 renders straight into an android.graphics.Bitmap.
@@ -27,5 +29,7 @@ set_source_files_properties(burst_merge.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 set_source_files_properties(superres.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 # B24: the detail post-pass (blur passes, grain rows) runs on every still.
 set_source_files_properties(detail.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+# B30: depth prep (box downscale of the still) and the confidence analysis.
+set_source_files_properties(depth_post.cpp yuv.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 # 16 KB page alignment (Android 15+ devices with 16 KB pages).
 target_link_options(redline_native PRIVATE "-Wl,-z,max-page-size=16384")

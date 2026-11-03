@@ -48,6 +48,24 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # B30: the depth + segmentation models (not committed; see tools/models/fetch_models.sh).
+      - name: Cache on-device models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/redline-models
+          key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
+
+      # TensorFlow 2.19 has wheels for Python 3.9-3.12 only; ubuntu-latest's default python3 is newer.
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+
+      - name: Fetch / build on-device models
+        run: tools/models/fetch_models.sh
+        env:
+          PYTHON: ${{ steps.py312.outputs.python-path }}
+
       - name: Prepare release keystore
         env:
           KEYSTORE_B64: ${{ secrets.REDLINE_KEYSTORE_BASE64 }}

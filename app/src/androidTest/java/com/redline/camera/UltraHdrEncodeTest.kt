@@ -147,19 +147,66 @@ class UltraHdrEncodeTest {
         assertTrue(abs(mean) > 0)
     }
 
+    /**
+     * B30: the HEIF writer (MediaCodec + MediaMuxer, YUV buffer input, 512 grid). Times the write, decodes the file back
+     * (round-trip means within tolerance, size or rotated size), and reads the Exif item back. Codec and time split go
+     * to the log for the CI summary.
+     */
     @Test
-    fun heifStillWritesWhenAnEncoderExists() {
+    fun heifStillWritesTimedAndDecodes() {
         val (heif, why) = SaveFormatsUi.heifSupport()
         assumeTrue("HEIF encoder: $why", heif)
+        assumeTrue("native library", RedlineNative.load().loaded)
         val f = File(context.cacheDir, "still.heic")
-        val bmp = still(640, 426)
-        PhotoHeif.write(bmp, 90, StillSaver.HEIF_QUALITY, null, f)
+        // Odd width and height: the last grid column and row repeat the edge pixels.
+        val w = 1455
+        val h = 969
+        val bmp = still(w, h)
+        val tiny = File(context.cacheDir, "exif_stub.jpg")
+        Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).compress(Bitmap.CompressFormat.JPEG, 50, tiny.outputStream())
+        ExifInterface(tiny.absolutePath).apply {
+            setAttribute(ExifInterface.TAG_SOFTWARE, "RedlineCI")
+            saveAttributes()
+        }
+        val exif = JpegStructure.exifPayload(tiny.readBytes())
+        assertNotNull("exif payload", exif)
+        val r = PhotoHeif.write(bmp, 90, StillSaver.HEIF_QUALITY, exif, f)
+        Log.i(TAG, "HEIF ${w}x$h: ${r.toMap()} bytes ${f.length()}")
         assertTrue(f.length() > 1000)
         val b = BitmapFactory.decodeFile(f.absolutePath)
         assertNotNull("HEIF decodes", b)
-        // 640x426 stored with irot 90; decoders may or may not apply the rotation
-        assertTrue("${b.width}x${b.height}", (b.width == 640 && b.height == 426) || (b.width == 426 && b.height == 640))
+        // stored with irot 90; decoders may or may not apply the rotation
+        assertTrue("${b.width}x${b.height}", (b.width == w && b.height == h) || (b.width == h && b.height == w))
+        val check = r.check
+        assertNotNull("first HEIF of the process carries the round-trip check", check)
+        assertEquals("round trip $check", true, check!!["ok"])
+        val back = ExifInterface(f.absolutePath)
+        Log.i(
+            TAG,
+            "HEIF exif software=${back.getAttribute(
+                ExifInterface.TAG_SOFTWARE
+            )} orientation=${back.getAttribute(ExifInterface.TAG_ORIENTATION)}"
+        )
+        assertEquals("RedlineCI", back.getAttribute(ExifInterface.TAG_SOFTWARE))
+        // A second write (codec list cached, not the first in the process) for the steady-state time.
+        val f2 = File(context.cacheDir, "still2.heic")
+        val r2 = PhotoHeif.write(bmp, 0, StillSaver.HEIF_QUALITY, null, f2)
+        Log.i(TAG, "HEIF second write: ${r2.ms}")
+        assertTrue(r2.ms.getValue("total") < 20_000)
         toDownloads(f, "redline_ci_still.heic", "image/heic")
+        val json = File(context.cacheDir, "heif.json")
+        json.writeText(
+            org.json.JSONObject(
+                mapOf(
+                    "size" to "${w}x$h",
+                    "first" to r.toMap(),
+                    "second_ms" to r2.ms,
+                    "bytes" to f.length(),
+                    "api" to Build.VERSION.SDK_INT
+                )
+            ).toString(2)
+        )
+        toDownloads(json, "redline_ci_heif.json", "application/json")
     }
 
     companion object {

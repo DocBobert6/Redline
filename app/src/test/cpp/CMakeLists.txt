@@ -75,3 +75,21 @@ target_include_directories(gainmap_test PRIVATE ${NATIVE_SRC})
 target_compile_options(gainmap_test PRIVATE -Wall -Wextra -Werror -O3 -ffp-contract=off)
 target_link_libraries(gainmap_test PRIVATE Threads::Threads)
 add_test(NAME gainmap COMMAND gainmap_test)
+
+# B30 HEIF input: RGBA -> YUV 4:2:0 tiles (rounding, edge repeat, I420 == NV12, round trip).
+add_executable(yuv_test yuv_test.cpp ${NATIVE_SRC}/yuv.cpp)
+target_include_directories(yuv_test PRIVATE ${NATIVE_SRC})
+target_compile_options(yuv_test PRIVATE -Wall -Wextra -Werror -O2)
+add_test(NAME yuv COMMAND yuv_test)
+
+# B30 depth pre/post-processing: invariants (CTest) and the host tool the Python parity test drives.
+add_executable(depth_post_test depth_post_test.cpp ${NATIVE_SRC}/depth_post.cpp ${NATIVE_SRC}/detail.cpp)
+target_include_directories(depth_post_test PRIVATE ${NATIVE_SRC})
+target_compile_options(depth_post_test PRIVATE -Wall -Wextra -Werror -O2)
+target_link_libraries(depth_post_test PRIVATE Threads::Threads)
+add_test(NAME depth_post COMMAND depth_post_test)
+
+add_executable(depth_post_tool depth_post_tool.cpp ${NATIVE_SRC}/depth_post.cpp ${NATIVE_SRC}/detail.cpp)
+target_include_directories(depth_post_tool PRIVATE ${NATIVE_SRC})
+target_compile_options(depth_post_tool PRIVATE -Wall -Wextra -Werror -O2)
+target_link_libraries(depth_post_tool PRIVATE Threads::Threads)

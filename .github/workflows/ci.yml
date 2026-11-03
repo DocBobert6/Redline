@@ -37,6 +37,25 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # B30: the depth + segmentation models (not committed): converted from the pinned, checksum-verified checkpoint and
+      # cached; a cache miss installs TensorFlow (CPU) for the conversion and checks parity with the torch reference.
+      - name: Cache on-device models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/redline-models
+          key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
+
+      # TensorFlow 2.19 has wheels for Python 3.9-3.12 only; ubuntu-latest's default python3 is newer.
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+
+      - name: Fetch / build on-device models
+        run: tools/models/fetch_models.sh
+        env:
+          PYTHON: ${{ steps.py312.outputs.python-path }}
+
       - name: Native host tests (CTest)
         run: |
           cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
@@ -89,11 +108,12 @@ jobs:
       - name: Build native RAW pipeline + burst merge + super-resolution + detail host tools
         run: |
           cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool superres_tool detail_tool
+          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool superres_tool detail_tool depth_post_tool
           echo "REDLINE_RAW_TOOL=$PWD/build/native-host/raw_pipeline_tool" >> "$GITHUB_ENV"
           echo "REDLINE_BURST_TOOL=$PWD/build/native-host/burst_merge_tool" >> "$GITHUB_ENV"
           echo "REDLINE_SR_TOOL=$PWD/build/native-host/superres_tool" >> "$GITHUB_ENV"
           echo "REDLINE_DETAIL_TOOL=$PWD/build/native-host/detail_tool" >> "$GITHUB_ENV"
+          echo "REDLINE_DEPTH_TOOL=$PWD/build/native-host/depth_post_tool" >> "$GITHUB_ENV"
           echo "REDLINE_REQUIRE_NATIVE=1" >> "$GITHUB_ENV"
 
       - name: Cache real-file fixtures
@@ -139,6 +159,25 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # B30: the depth + segmentation models (not committed): converted from the pinned, checksum-verified checkpoint and
+      # cached; a cache miss installs TensorFlow (CPU) for the conversion and checks parity with the torch reference.
+      - name: Cache on-device models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/redline-models
+          key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
+
+      # TensorFlow 2.19 has wheels for Python 3.9-3.12 only; ubuntu-latest's default python3 is newer.
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+
+      - name: Fetch / build on-device models
+        run: tools/models/fetch_models.sh
+        env:
+          PYTHON: ${{ steps.py312.outputs.python-path }}
+
       - name: Build test APKs
         run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest
 
@@ -172,6 +211,11 @@ jobs:
           test -n "$UHDR" && test -n "$PLAIN"
           build/uhdr_validate "$UHDR" 1.5
           build/uhdr_validate --not "$PLAIN"
+
+      # B30: what the emulator measured (HEIF codec + time split, depth / segmentation timings and confidence).
+      - name: Emulator measurements
+        if: always()
+        run: for f in $(find uhdr-out -name '*.json' 2>/dev/null); do echo "== $f"; cat "$f"; echo; done
 
       - name: Upload Ultra HDR / HEIF samples
         if: always()

@@ -14,6 +14,7 @@ import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
@@ -576,7 +577,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 dngSource = if (wantDng) shot.dngSourceLabel ?: "single frame" else null,
                 dngLevels = dg?.levels,
                 dngMs = if (wantDng) dngMs else null,
-                heifError = ph?.heifError
+                heifError = ph?.heifError,
+                heif = ph?.heif
             )
         }
         return ShotResult(
@@ -616,7 +618,9 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val gainmapMs: Long? = null,
         /** After the EXIF write, the MPF entry still points at the gain map image. */
         val verified: Boolean? = null,
-        val heifError: String? = null
+        val heifError: String? = null,
+        /** B30: codec, input mode, grid and time split of a HEIF write. */
+        val heif: Map<String, Any?>? = null
     )
 
     /** B25: what the DNG write did. */
@@ -660,16 +664,23 @@ class StillSaver(context: Context, private val version: String, private val pipe
     }
 
     /**
-     * B25: HEIF (androidx.heifwriter, the HEIC/HEVC encoder) at [HEIF_QUALITY]. The rotation goes in the HEIF itself
+     * B25: HEIF at [HEIF_QUALITY]; B30: written by [PhotoHeif] (hardware HEIC/HEVC encoder, YUV buffer input, 512 grid). The rotation goes in the HEIF itself
      * (irot); the EXIF block (built on a tiny JPEG with the same tags, orientation normal) is added as the item's Exif.
      */
     private fun saveHeif(shot: StillShot, bmp: Bitmap, base: String, look: String, original: ExifInterface, size: Dim): PhotoOut {
+        val te = SystemClock.elapsedRealtime()
         val exif = exifBlock(base, original, shot, size, look)
+        val exifMs = SystemClock.elapsedRealtime() - te
         val tmp = File.createTempFile(base, ".heic", app.cacheDir)
         try {
-            PhotoHeif.write(bmp, shot.jpegOrientation, HEIF_QUALITY, exif, tmp)
+            val t0 = SystemClock.elapsedRealtime()
+            val r = PhotoHeif.write(bmp, shot.jpegOrientation, HEIF_QUALITY, exif, tmp)
+            val t1 = SystemClock.elapsedRealtime()
             insert("$base.${PhotoFormat.HEIF.ext}", PhotoFormat.HEIF.mime, shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
-            return PhotoOut(size, tmp.length())
+            val t2 = SystemClock.elapsedRealtime()
+            val m = LinkedHashMap(r.toMap())
+            m["heif_save_ms"] = linkedMapOf("exif_block" to exifMs, "write" to t1 - t0, "media_store" to t2 - t1)
+            return PhotoOut(size, tmp.length(), heif = m)
         } finally {
             tmp.delete()
         }

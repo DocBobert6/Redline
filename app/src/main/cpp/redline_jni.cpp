@@ -2,6 +2,7 @@
 #include <android/bitmap.h>
 #include <jni.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <new>
@@ -10,10 +11,12 @@
 
 #include "burst_merge.h"
 #include "cube_parser.h"
+#include "depth_post.h"
 #include "detail.h"
 #include "gainmap.h"
 #include "raw_pipeline.h"
 #include "superres.h"
+#include "yuv.h"
 
 namespace {
 
@@ -823,5 +826,134 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
         redline::warpGainMap(bytes.data(), mapWidth, mapHeight, static_cast<std::size_t>(mapStride), imageWidth, imageHeight, spec);
     if (!err.empty()) return env->NewStringUTF(err.c_str());
     env->SetByteArrayRegion(map, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------------------------------- B30 HEIF input
+
+// Converts one tile of an ARGB_8888 bitmap to YUV 4:2:0 straight into the encoder's input image planes (direct buffers).
+// Returns null on success, else the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeRgbaToYuvTile(
+    JNIEnv* env, jclass, jobject bitmap, jint x0, jint y0, jint tileW, jint tileH, jobject yBuf, jint yRowStride, jint yPixelStride,
+    jobject uBuf, jobject vBuf, jint uvRowStride, jint uvPixelStride) {
+    AndroidBitmapInfo info{};
+    if (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        return env->NewStringUTF("input must be an ARGB_8888 bitmap");
+    }
+    auto* y = static_cast<std::uint8_t*>(yBuf != nullptr ? env->GetDirectBufferAddress(yBuf) : nullptr);
+    auto* u = static_cast<std::uint8_t*>(uBuf != nullptr ? env->GetDirectBufferAddress(uBuf) : nullptr);
+    auto* v = static_cast<std::uint8_t*>(vBuf != nullptr ? env->GetDirectBufferAddress(vBuf) : nullptr);
+    if (y == nullptr || u == nullptr || v == nullptr) return env->NewStringUTF("planes must be direct buffers");
+    // Every written byte must lie inside its plane's buffer.
+    const jlong yCap = env->GetDirectBufferCapacity(yBuf), uCap = env->GetDirectBufferCapacity(uBuf), vCap = env->GetDirectBufferCapacity(vBuf);
+    const jlong yNeed = static_cast<jlong>(tileH - 1) * yRowStride + static_cast<jlong>(tileW - 1) * yPixelStride + 1;
+    const jlong uvNeed = static_cast<jlong>(tileH / 2 - 1) * uvRowStride + static_cast<jlong>(tileW / 2 - 1) * uvPixelStride + 1;
+    if (tileW < 2 || tileH < 2 || yCap < yNeed || uCap < uvNeed || vCap < uvNeed) return env->NewStringUTF("planes smaller than the tile");
+    redline::Yuv420Dst dst;
+    dst.y = y;
+    dst.yRowStride = yRowStride;
+    dst.yPixelStride = yPixelStride;
+    dst.u = u;
+    dst.v = v;
+    dst.uvRowStride = uvRowStride;
+    dst.uvPixelStride = uvPixelStride;
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return env->NewStringUTF("could not lock the bitmap");
+    }
+    const char* err = redline::rgbaToYuv420Tile(static_cast<const std::uint8_t*>(pixels), static_cast<int>(info.width),
+                                                static_cast<int>(info.height), static_cast<int>(info.stride), x0, y0, tileW, tileH, dst);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return err[0] == 0 ? nullptr : env->NewStringUTF(err);
+}
+
+// ---------------------------------------------------------------------------------------------------- B30 depth
+
+namespace {
+
+float* directFloats(JNIEnv* env, jobject buf, std::size_t count) {
+    if (buf == nullptr) return nullptr;
+    void* p = env->GetDirectBufferAddress(buf);
+    if (p == nullptr || env->GetDirectBufferCapacity(buf) < static_cast<jlong>(count * sizeof(float))) return nullptr;
+    return static_cast<float*>(p);
+}
+
+}  // namespace
+
+// The model inputs from the rendered still: rgbCanvas (canvasW x canvasH x 3 float, letterboxed upright) and segIn
+// (segW x segH x 3). rect receives the active rect [ax, ay, aw, ah]. Returns null or the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeDepthPrep(
+    JNIEnv* env, jclass, jobject bitmap, jint rot, jobject rgbCanvas, jint canvasW, jint canvasH, jobject segIn, jint segW, jint segH,
+    jintArray rect) {
+    AndroidBitmapInfo info{};
+    if (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        return env->NewStringUTF("still must be an ARGB_8888 bitmap");
+    }
+    float* canvas = directFloats(env, rgbCanvas, static_cast<std::size_t>(canvasW) * canvasH * 3);
+    float* seg = directFloats(env, segIn, static_cast<std::size_t>(segW) * segH * 3);
+    if (canvas == nullptr || seg == nullptr) return env->NewStringUTF("model input buffers missing or too small");
+    if (rect == nullptr || env->GetArrayLength(rect) < 4) return env->NewStringUTF("rect needs 4 ints");
+    const redline::DepthCanvas c = redline::depthCanvas(static_cast<int>(info.width), static_cast<int>(info.height), rot, canvasW, canvasH);
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return env->NewStringUTF("could not lock the bitmap");
+    }
+    const std::string err = redline::depthPrep(static_cast<const std::uint8_t*>(pixels), static_cast<int>(info.width),
+                                               static_cast<int>(info.height), info.stride, c, canvas, seg, segW, segH);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    const jint r[4] = {c.ax, c.ay, c.aw, c.ah};
+    env->SetIntArrayRegion(rect, 0, 4, r);
+    return nullptr;
+}
+
+// The model outputs -> packed RGB16 (depth, person mask, confidence) in the still's pixel orientation, warped with
+// distortion (a, b, c; null = none). out receives outW * outH * 3 shorts; stats (17 floats): confidence, usable, p2, p98,
+// spread, range score, edge agree (-1 none), edge score, person coverage, person nearer (-1 none), person score, dmin,
+// dmax, outW, outH, ms. Returns null or the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeDepthFinish(
+    JNIEnv* env, jclass, jobject depthOut, jobject segOut, jint segW, jint segH, jobject rgbCanvas, jint canvasW, jint canvasH,
+    jintArray rect, jint rot, jint imageW, jint imageH, jfloatArray distortion, jshortArray out, jfloatArray stats) {
+    const float* d = directFloats(env, depthOut, static_cast<std::size_t>(canvasW) * canvasH);
+    const float* s = directFloats(env, segOut, static_cast<std::size_t>(segW) * segH);
+    const float* c = directFloats(env, rgbCanvas, static_cast<std::size_t>(canvasW) * canvasH * 3);
+    if (d == nullptr || s == nullptr || c == nullptr) return env->NewStringUTF("model buffers missing or too small");
+    if (rect == nullptr || env->GetArrayLength(rect) < 4 || stats == nullptr || env->GetArrayLength(stats) < 16 || out == nullptr) {
+        return env->NewStringUTF("rect, stats or out mis-sized");
+    }
+    jint r[4];
+    env->GetIntArrayRegion(rect, 0, 4, r);
+    redline::DepthCanvas cv;
+    cv.canvasW = canvasW;
+    cv.canvasH = canvasH;
+    cv.ax = r[0];
+    cv.ay = r[1];
+    cv.aw = r[2];
+    cv.ah = r[3];
+    cv.rot = ((rot % 360) + 360) % 360;
+    redline::DetailSpec spec;
+    if (distortion != nullptr && env->GetArrayLength(distortion) >= 3) {
+        jfloat k[3];
+        env->GetFloatArrayRegion(distortion, 0, 3, k);
+        spec.distort = true;
+        spec.distA = k[0];
+        spec.distB = k[1];
+        spec.distC = k[2];
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::uint16_t> packed;
+    int ow = 0, oh = 0;
+    redline::DepthAnalysis a;
+    const std::string err = redline::depthFinish(d, s, segW, segH, c, cv, imageW, imageH, spec, packed, ow, oh, a);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    if (env->GetArrayLength(out) < static_cast<jsize>(packed.size())) return env->NewStringUTF("out too small");
+    env->SetShortArrayRegion(out, 0, static_cast<jsize>(packed.size()), reinterpret_cast<const jshort*>(packed.data()));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const jfloat v[16] = {a.confidence, a.usable ? 1.0f : 0.0f, a.p2, a.p98, a.spread, a.rangeScore, a.edgeAgree, a.edgeScore,
+                          a.personCoverage, a.personNearer, a.personScore, a.dmin, a.dmax, static_cast<jfloat>(ow), static_cast<jfloat>(oh),
+                          static_cast<jfloat>(ms)};
+    env->SetFloatArrayRegion(stats, 0, 16, v);
     return nullptr;
 }
