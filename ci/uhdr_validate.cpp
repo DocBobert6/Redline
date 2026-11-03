@@ -107,9 +107,13 @@ int main(int argc, char** argv) {
         ++failures;
     }
     // Full HDR decode (linear, full boost): the bright side must go above SDR white, the dark side must not move.
-    if (!ok(uhdr_dec_set_out_img_format(dec, UHDR_IMG_FMT_64bppRGBAHalfFloat), "out format") ||
+    // probe() ends the configurable state, so reset and configure the output before decoding.
+    const float maxBoost = md->max_content_boost[0];
+    uhdr_reset_decoder(dec);
+    if (!ok(uhdr_dec_set_image(dec, &img), "set image (decode)") ||
+        !ok(uhdr_dec_set_out_img_format(dec, UHDR_IMG_FMT_64bppRGBAHalfFloat), "out format") ||
         !ok(uhdr_dec_set_out_color_transfer(dec, UHDR_CT_LINEAR), "out transfer") ||
-        !ok(uhdr_dec_set_out_max_display_boost(dec, md->max_content_boost[0]), "max boost") || !ok(uhdr_decode(dec), "decode")) {
+        !ok(uhdr_dec_set_out_max_display_boost(dec, maxBoost), "max boost") || !ok(uhdr_decode(dec), "decode")) {
         return 1;
     }
     const uhdr_raw_image_t* out = uhdr_get_decoded_image(dec);
