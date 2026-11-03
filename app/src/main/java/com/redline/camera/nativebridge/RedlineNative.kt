@@ -267,6 +267,76 @@ object RedlineNative {
         return nativeRgbaToYuvTile(bitmap, x0, y0, tileW, tileH, y, yRowStride, yPixelStride, u, v, uvRowStride, uvPixelStride)
     }
 
+    // ------------------------------------------------------------------------------------------- B30 depth
+
+    /**
+     * B30: the depth model's input ([rgbCanvas], canvasW x canvasH x 3 float32, the still upright and letterboxed) and
+     * the segmenter's ([segIn], segW x segH x 3) from the rendered [still] ([rot] = clockwise degrees to upright).
+     * [rect] receives the active rect [ax, ay, aw, ah]. Null on success, else the error.
+     */
+    fun depthPrep(
+        still: Bitmap,
+        rot: Int,
+        rgbCanvas: ByteBuffer,
+        canvasW: Int,
+        canvasH: Int,
+        segIn: ByteBuffer,
+        segW: Int,
+        segH: Int,
+        rect: IntArray
+    ): String? {
+        if (!load().loaded) return "native library not loaded: ${load().error}"
+        return nativeDepthPrep(still, rot, rgbCanvas, canvasW, canvasH, segIn, segW, segH, rect)
+    }
+
+    /** What [depthFinish] measured (see depth_post.py for the cues). */
+    class DepthStats(v: FloatArray) {
+        val confidence = v[0]
+        val usable = v[1] > 0.5f
+        val p2 = v[2]
+        val p98 = v[3]
+        val spread = v[4]
+        val rangeScore = v[5]
+        val edgeAgree: Float? = v[6].takeIf { it >= 0f }
+        val edgeScore = v[7]
+        val personCoverage = v[8]
+        val personNearer: Float? = v[9].takeIf { it >= 0f }
+        val personScore = v[10]
+        val dmin = v[11]
+        val dmax = v[12]
+        val outWidth = v[13].toInt()
+        val outHeight = v[14].toInt()
+        val ms = v[15].toDouble()
+    }
+
+    /**
+     * B30: model outputs -> [out] (outW x outH x 3 shorts: depth normalised to its min..max, person mask, per-pixel
+     * confidence; the still's pixel orientation, warped with [distortion] when not null). Throws IllegalStateException
+     * with the native error.
+     */
+    fun depthFinish(
+        depthOut: ByteBuffer,
+        segOut: ByteBuffer,
+        segW: Int,
+        segH: Int,
+        rgbCanvas: ByteBuffer,
+        canvasW: Int,
+        canvasH: Int,
+        rect: IntArray,
+        rot: Int,
+        imageW: Int,
+        imageH: Int,
+        distortion: FloatArray?,
+        out: ShortArray
+    ): DepthStats {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        val stats = FloatArray(16)
+        val err =
+            nativeDepthFinish(depthOut, segOut, segW, segH, rgbCanvas, canvasW, canvasH, rect, rot, imageW, imageH, distortion, out, stats)
+        check(err == null) { "depth finish: $err" }
+        return DepthStats(stats)
+    }
+
     // ------------------------------------------------------------------------------------------- B22 burst merge
 
     /** A frame-sized buffer in native memory (outside the Java heap), or null when it cannot be allocated. Free with [freeFrame]. */
@@ -779,6 +849,37 @@ object RedlineNative {
         seed: Int,
         threads: Int
     ): FloatArray
+
+    @JvmStatic
+    private external fun nativeDepthPrep(
+        still: Bitmap,
+        rot: Int,
+        rgbCanvas: ByteBuffer,
+        canvasW: Int,
+        canvasH: Int,
+        segIn: ByteBuffer,
+        segW: Int,
+        segH: Int,
+        rect: IntArray
+    ): String?
+
+    @JvmStatic
+    private external fun nativeDepthFinish(
+        depthOut: ByteBuffer,
+        segOut: ByteBuffer,
+        segW: Int,
+        segH: Int,
+        rgbCanvas: ByteBuffer,
+        canvasW: Int,
+        canvasH: Int,
+        rect: IntArray,
+        rot: Int,
+        imageW: Int,
+        imageH: Int,
+        distortion: FloatArray?,
+        out: ShortArray,
+        stats: FloatArray
+    ): String?
 
     @JvmStatic
     private external fun nativeRgbaToYuvTile(

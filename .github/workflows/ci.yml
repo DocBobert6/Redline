@@ -45,8 +45,16 @@ jobs:
           path: ~/.cache/redline-models
           key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
 
+      # TensorFlow 2.19 has wheels for Python 3.9-3.12 only; ubuntu-latest's default python3 is newer.
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+
       - name: Fetch / build on-device models
         run: tools/models/fetch_models.sh
+        env:
+          PYTHON: ${{ steps.py312.outputs.python-path }}
 
       - name: Native host tests (CTest)
         run: |
@@ -159,8 +167,16 @@ jobs:
           path: ~/.cache/redline-models
           key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
 
+      # TensorFlow 2.19 has wheels for Python 3.9-3.12 only; ubuntu-latest's default python3 is newer.
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+
       - name: Fetch / build on-device models
         run: tools/models/fetch_models.sh
+        env:
+          PYTHON: ${{ steps.py312.outputs.python-path }}
 
       - name: Build test APKs
         run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest
