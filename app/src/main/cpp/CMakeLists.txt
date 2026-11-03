@@ -15,6 +15,7 @@ add_library(redline_native SHARED
     detail.cpp
     gainmap.cpp
     yuv.cpp
+    depth_post.cpp
     redline_jni.cpp)
 
 # B21 renders straight into an android.graphics.Bitmap.
@@ -28,5 +29,7 @@ set_source_files_properties(burst_merge.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 set_source_files_properties(superres.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 # B24: the detail post-pass (blur passes, grain rows) runs on every still.
 set_source_files_properties(detail.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+# B30: depth prep (box downscale of the still) and the confidence analysis.
+set_source_files_properties(depth_post.cpp yuv.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 # 16 KB page alignment (Android 15+ devices with 16 KB pages).
 target_link_options(redline_native PRIVATE "-Wl,-z,max-page-size=16384")

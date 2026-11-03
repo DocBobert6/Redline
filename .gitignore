@@ -17,3 +17,4 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+app/src/main/assets/depth/*.tflite

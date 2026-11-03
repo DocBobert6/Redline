@@ -48,6 +48,16 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # B30: the depth + segmentation models (not committed; see tools/models/fetch_models.sh).
+      - name: Cache on-device models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/redline-models
+          key: redline-models-${{ hashFiles('tools/models/fetch_models.sh', 'tools/models/export_depth_anything_v2_small.py', 'tools/models/requirements.txt', 'tools/models/selfcheck_reference_depth.npy') }}
+
+      - name: Fetch / build on-device models
+        run: tools/models/fetch_models.sh
+
       - name: Prepare release keystore
         env:
           KEYSTORE_B64: ${{ secrets.REDLINE_KEYSTORE_BASE64 }}

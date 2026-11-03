@@ -1,0 +1,6 @@
+# B30 model build (tools/models/fetch_models.sh). Pinned; the cache key in CI hashes this file.
+tensorflow-cpu==2.19.0; platform_machine == "x86_64"
+tensorflow==2.19.0; platform_machine != "x86_64"
+safetensors==0.8.0
+numpy==2.1.3
+pillow==11.3.0

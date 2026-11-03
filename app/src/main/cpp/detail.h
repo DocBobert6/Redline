@@ -57,6 +57,9 @@ std::string applyDetailFloat(float* rgb, int width, int height, std::size_t stri
 std::string warpGainMap(std::uint8_t* map, int mapWidth, int mapHeight, std::size_t mapStride, int imageWidth, int imageHeight,
                         const DetailSpec& spec);
 
+// B30: the same warp on a float map (depth, person mask, confidence at the depth resolution); no rounding.
+std::string warpMapFloat(float* map, int mapWidth, int mapHeight, std::size_t mapStride, int imageWidth, int imageHeight,
+                         const DetailSpec& spec);
 // The encoded luma bin edges of the noise estimate (kNoiseBins + 1 values) and the bin centres.
 extern const float kNoiseBinEdges[kNoiseBins + 1];
 
