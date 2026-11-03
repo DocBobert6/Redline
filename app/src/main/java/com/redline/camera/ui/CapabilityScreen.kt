@@ -27,6 +27,10 @@ import com.redline.camera.capability.FeaturePolicy
 import com.redline.camera.capability.TierRules
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.DngSource
+import com.redline.camera.capture.PhotoFormat
+import com.redline.camera.capture.SaveFormatsReport
+import com.redline.camera.capture.SaveFormatsUi
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
@@ -50,6 +54,7 @@ fun CapabilityScreen(
     onCycleLookStrength: (() -> Unit)? = null,
     onToggleColourPipeline: (() -> Unit)? = null,
     onToggleDetail: ((String) -> Unit)? = null,
+    onSaveSetting: ((String) -> Unit)? = null,
     onToggleBurst: (() -> Unit)? = null,
     onToggleSuperRes: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
@@ -194,6 +199,9 @@ fun CapabilityScreen(
                     }
                 }
                 item {
+                    SaveFormatsCard(state.saveFormats, onSaveSetting)
+                }
+                item {
                     ColourPipelineCard(state.colourPipeline, onToggleColourPipeline)
                     DetailCard(state.colourPipeline, onToggleDetail)
                 }
@@ -283,6 +291,56 @@ private fun ColourPipelineCard(r: ColourPipelineReport, onToggle: (() -> Unit)?)
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(COLOUR_TOGGLE_TAG)) {
                 Text("Turn colour pipeline ${if (r.userSetting) "off" else "on"} (default on when the self-check passes)")
+            }
+        }
+    }
+}
+
+const val SAVE_FORMATS_SECTION_TITLE = "Save formats (B25)"
+
+/** B25: save formats (persisted), Ultra HDR and DNG source, what this phone offers, and what the last still wrote. */
+@Composable
+private fun SaveFormatsCard(r: SaveFormatsReport, onChange: ((String) -> Unit)?) {
+    SectionCard(SAVE_FORMATS_SECTION_TITLE) {
+        val s = r.settings
+        val caps = r.caps
+        val e = caps?.let { s.effective(it) }
+        Text("Save formats: ${s.format.label}" + if (s.format.photo) ", photo ${s.photoFormat.label}" else "")
+        Text("Ultra HDR ${if (s.ultraHdr) "on" else "off"} (JPEG only, Android 14+), DNG source: ${s.dngSource.label}")
+        e?.let { Text("In effect: ${it.label()}", style = MaterialTheme.typography.bodySmall) }
+        e?.notes?.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+        Text(
+            "DNG: full sensor, uncropped (no crop tag). A super-resolution shot's DNG is its first frame; a merge DNG keeps " +
+                "the merge's extra precision.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        r.recent.lastOrNull()?.let { l ->
+            Text(
+                "Last: ${l.summary()}" + (l.photoBytes?.let { ", photo ${it / 1024} KB" } ?: "") +
+                    (l.dngBytes?.let { ", DNG ${it / 1024} KB" } ?: "") + (l.gainmapMs?.let { ", gain map $it ms" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (r.ultraHdrWritten + r.ultraHdrSkipped > 0) {
+            Text(
+                "Ultra HDR: ${r.ultraHdrWritten} written, ${r.ultraHdrSkipped} skipped" + (r.lastSkip?.let { " (last: $it)" } ?: ""),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (onChange != null) {
+            val next = SaveFormatsUi.nextFormat(s.format)
+            listOf(
+                SaveFormatsUi.FORMAT to "Save formats: ${next.label}",
+                SaveFormatsUi.PHOTO to "Photo: ${if (s.photoFormat == PhotoFormat.JPEG) "HEIF" else "JPEG"}",
+                SaveFormatsUi.ULTRA_HDR to "Ultra HDR ${if (s.ultraHdr) "off" else "on"}",
+                SaveFormatsUi.DNG_SOURCE to
+                    "DNG source: ${if (s.dngSource == DngSource.SINGLE) DngSource.MERGE.label else DngSource.SINGLE.label}"
+            ).forEach { (key, label) ->
+                OutlinedButton(onClick = {
+                    onChange(key)
+                }, modifier = Modifier.padding(top = 4.dp).testTag(SaveFormatsUi.TAG_PREFIX + key)) {
+                    Text("Switch to $label")
+                }
             }
         }
     }

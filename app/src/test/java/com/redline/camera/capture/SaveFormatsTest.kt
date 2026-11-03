@@ -218,4 +218,39 @@ class SaveFormatsTest {
         assertNull(JpegStructure.exifPayload(jpeg()))
         assertNotNull(JpegStructure.exifPayload(primary + gainmap))
     }
+
+    /** MPF APP2 payload (big-endian) whose second entry points [offset] bytes past the MPF header at an image of [size]. */
+    private fun mpf(offset: Int, size: Int): ByteArray {
+        val bb = ByteBuffer.allocate(4 + 8 + 2 + 3 * 12 + 4 + 32).order(ByteOrder.BIG_ENDIAN)
+        bb.put("MPF\u0000".toByteArray())
+        bb.put("MM".toByteArray())
+        bb.putShort(42)
+        bb.putInt(8)
+        bb.putShort(3)
+        bb.putShort(0xB000.toShort()).putShort(7).putInt(4).put("0100".toByteArray())
+        bb.putShort(0xB001.toShort()).putShort(4).putInt(1).putInt(2)
+        bb.putShort(0xB002.toShort()).putShort(7).putInt(32).putInt(8 + 2 + 36 + 4)
+        bb.putInt(0)
+        bb.putInt(0x030000).putInt(1000).putInt(0).putShort(0).putShort(0)
+        bb.putInt(0).putInt(size).putInt(offset).putShort(0).putShort(0)
+        return bb.array()
+    }
+
+    @Test
+    fun mpfEntryMustPointAtTheGainMap() {
+        val gainmap = jpeg()
+
+        // The MPF header (byte-order mark) sits 2 (SOI) + 4 (APP2 marker, length) + 4 (MPF tag) = 10 bytes into the file.
+        fun build(offsetFix: Int): ByteArray {
+            var primary = jpeg(segment(0xE2, mpf(0, gainmap.size)))
+            val off = primary.size - 10 + offsetFix
+            primary = jpeg(segment(0xE2, mpf(off, gainmap.size)))
+            return primary + gainmap
+        }
+        assertTrue(JpegStructure.mpfSecondImageOk(build(0)))
+        assertFalse(JpegStructure.mpfSecondImageOk(build(3)))
+        val good = build(0)
+        assertFalse(JpegStructure.mpfSecondImageOk(good.copyOf(good.size - gainmap.size))) // map dropped
+        assertFalse(JpegStructure.mpfSecondImageOk(jpeg()))
+    }
 }

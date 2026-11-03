@@ -150,7 +150,36 @@ jobs:
           arch: x86_64
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back emulated -camera-front emulated
-          script: ./gradlew --stacktrace :app:connectedDebugAndroidTest
+          # B25: the Ultra HDR / HEIF test leaves its files in Downloads/RedlineCI; pull them for the host check.
+          script: |
+            ./gradlew --stacktrace :app:connectedDebugAndroidTest
+            adb pull /sdcard/Download/RedlineCI uhdr-out
+
+      # B25: validate the emulator's Ultra HDR JPEG with libultrahdr (Apache-2.0; CI only, not part of the app).
+      - name: Validate Ultra HDR with libultrahdr (host)
+        run: |
+          sudo apt-get install -y --no-install-recommends libjpeg-turbo8-dev ninja-build > /dev/null
+          git clone --depth 1 -b v1.4.0 https://github.com/google/libultrahdr.git build/libultrahdr-src
+          cmake -G Ninja -S build/libultrahdr-src -B build/libultrahdr -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DUHDR_BUILD_EXAMPLES=OFF -DUHDR_BUILD_TESTS=OFF -DUHDR_ENABLE_INSTALL=OFF
+          cmake --build build/libultrahdr
+          g++ -std=c++17 -O2 ci/uhdr_validate.cpp -Ibuild/libultrahdr-src -Lbuild/libultrahdr -luhdr -ljpeg -lpthread -lm \
+            -o build/uhdr_validate
+          ls -lR uhdr-out
+          UHDR=$(find uhdr-out -name 'redline_ci_uhdr.jpg' | head -1)
+          PLAIN=$(find uhdr-out -name 'redline_ci_plain.jpg' | head -1)
+          test -n "$UHDR" && test -n "$PLAIN"
+          build/uhdr_validate "$UHDR" 1.5
+          build/uhdr_validate --not "$PLAIN"
+
+      - name: Upload Ultra HDR / HEIF samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b25-format-samples-api${{ matrix.api }}
+          path: uhdr-out/
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload instrumented reports
         if: always()

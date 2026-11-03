@@ -426,6 +426,62 @@ object JpegStructure {
         return null
     }
 
+    /**
+     * Whether the primary image's MPF index points at a second JPEG (the gain map) that is really there: its MP entry's
+     * offset (from the MPF header's byte-order mark) lands on an SOI inside the file and its size fits. Reads only the
+     * primary's segments, so it is cheap on a full-size still.
+     */
+    fun mpfSecondImageOk(b: ByteArray): Boolean = mpfSecondImageOk(b, b.size.toLong()) { b[it.toInt()].toInt() and 0xFF }
+
+    /** The same on the file's first bytes [head]; [byteAt] reads one byte anywhere in the file of [fileLength] bytes. */
+    fun mpfSecondImageOk(head: ByteArray, fileLength: Long, byteAt: (Long) -> Int): Boolean {
+        val b = head
+        var i = 2
+        if (b.size < 4 || (b[0].toInt() and 0xFF) != 0xFF || (b[1].toInt() and 0xFF) != 0xD8) return false
+        while (i + 4 <= b.size && (b[i].toInt() and 0xFF) == 0xFF) {
+            val marker = b[i + 1].toInt() and 0xFF
+            if (marker == 0xDA) return false
+            val len = ((b[i + 2].toInt() and 0xFF) shl 8) or (b[i + 3].toInt() and 0xFF)
+            if (marker == 0xE2 && startsWith(b, i + 4, "MPF\u0000")) {
+                return mpfEntryOk(b, i + 8, minOf(i + 2 + len, b.size), fileLength, byteAt)
+            }
+            i += 2 + len
+        }
+        return false
+    }
+
+    private fun mpfEntryOk(b: ByteArray, tiff: Int, end: Int, fileLength: Long, byteAt: (Long) -> Int): Boolean {
+        if (tiff + 8 > end) return false
+        val le = b[tiff] == 'I'.code.toByte()
+        fun u16(at: Int): Int {
+            val x = b[at].toInt() and 0xFF
+            val y = b[at + 1].toInt() and 0xFF
+            return if (le) x or (y shl 8) else (x shl 8) or y
+        }
+        fun u32(at: Int): Long = if (le) {
+            u16(at).toLong() or (u16(at + 2).toLong() shl 16)
+        } else {
+            (u16(at).toLong() shl 16) or
+                u16(at + 2).toLong()
+        }
+        val ifd = tiff + u32(tiff + 4).toInt()
+        if (ifd + 2 > end) return false
+        val n = u16(ifd)
+        for (k in 0 until n) {
+            val e = ifd + 2 + 12 * k
+            if (e + 12 > end) return false
+            if (u16(e) != 0xB002) continue
+            val count = u32(e + 4).toInt()
+            val entries = tiff + u32(e + 8).toInt()
+            if (count < 32 || entries + 32 > end) return false
+            val size = u32(entries + 16 + 4)
+            val offset = u32(entries + 16 + 8)
+            val at = tiff + offset
+            return offset > 0 && at + 2 <= fileLength && at + size <= fileLength && byteAt(at) == 0xFF && byteAt(at + 1) == 0xD8
+        }
+        return false
+    }
+
     /** Offset just past the EOI of the image starting at 0. */
     private fun primaryEnd(b: ByteArray): Int = primaryEndFrom(b, 0)
 

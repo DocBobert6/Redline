@@ -73,8 +73,19 @@ class StillShot(
      */
     val releaseRaw: (keep: ByteBuffer?) -> Unit = {},
     /** B24b: the tapped region (frame-normalised, sensor orientation) the render meters with, or null (no tap). */
-    val meterRegion: NormRect? = null
-)
+    val meterRegion: NormRect? = null,
+    /** B25: the formats this shot is saved in (effective settings); null = B24 behaviour (JPEG, DNG per [saveDng]). */
+    val formats: SaveSettings.Effective? = null,
+    /** B25: the DNG's samples are the burst merge's, x this factor (1 = a camera frame). */
+    val dngScale: Float = 1f,
+    /** B25: what the DNG is ("single frame", "burst merge", "frame 0 (super-resolution)", ...). */
+    val dngSourceLabel: String? = null
+) {
+    /** B25: a photo (JPEG or HEIF) is written; false for "DNG only". */
+    val savePhoto: Boolean get() = formats?.photo ?: true
+    val photoFormat: PhotoFormat get() = formats?.photoFormat ?: PhotoFormat.JPEG
+    val ultraHdr: Boolean get() = formats?.ultraHdr ?: false
+}
 
 /**
  * B22a: a burst after its streaming merge: the merged mosaic (x [mergedScale]) in a pool buffer, the reference
@@ -126,7 +137,9 @@ class StagedShot(
     val srMerged: Boolean,
     val srFallback: String?,
     val lookName: String,
-    val look: String
+    val look: String,
+    /** B25: the render's Ultra HDR gain map (warped with the still when RAW feel distorted it), or null. */
+    val hdr: ColourPipeline.HdrMap? = null
 )
 
 /**
@@ -206,6 +219,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
     }
 
     private fun renderInner(shot: StillShot, nowMs: () -> Long, startMs: Long, base: String): StagedShot {
+        // B25: "DNG only" renders no photo (the merge still runs for a merge DNG and its report).
+        val renderRaw = shot.renderRaw && shot.savePhoto
+        val uhdr = shot.ultraHdr
+        var hdr: ColourPipeline.HdrMap? = null
         var colour: ColourShot? = null
         var rendered: Bitmap? = null
         var dngRaw: RawCopy? = shot.raw
@@ -246,7 +263,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     timings["sr_gather"] = Math.round(it.gatherMs)
                 }
             }
-            if (shot.renderRaw && pipeline != null && sr != null && srImage != null && srStats != null) {
+            if (renderRaw && pipeline != null && sr != null && srImage != null && srStats != null) {
                 val o = pipeline.renderSuperRes(
                     srImage,
                     b.referenceResult,
@@ -256,14 +273,16 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     sr.outWidth,
                     sr.outHeight,
                     shot.stopTargetMm,
-                    shot.meterRegion
+                    shot.meterRegion,
+                    uhdr
                 )
                 srImage.close()
                 rendered = o.bitmap
                 colour = o.shot
+                hdr = o.hdr
                 if (rendered == null) srFallback = "super-resolution render: ${o.shot.fallbackReason}" else srMerged = true
             }
-            if (shot.renderRaw && pipeline != null) {
+            if (renderRaw && pipeline != null) {
                 val m = b.merged
                 if (rendered == null && m != null && stats != null) {
                     val o = pipeline.render(
@@ -276,10 +295,12 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.stopLongPx,
                         b.mergedScale,
                         shot.stopTargetMm,
-                        shot.meterRegion
+                        shot.meterRegion,
+                        uhdr
                     )
                     rendered = o.bitmap
                     colour = o.shot
+                    hdr = o.hdr
                     if (rendered == null) fallback = "merged render: ${o.shot.fallbackReason}" else mergedOk = true
                 }
                 val f = b.fallbackRaw
@@ -293,12 +314,19 @@ class StillSaver(context: Context, private val version: String, private val pipe
                         shot.zoomRatio,
                         shot.stopLongPx,
                         stopMm = shot.stopTargetMm,
-                        spot = shot.meterRegion
+                        spot = shot.meterRegion,
+                        ultraHdr = uhdr
                     )
                     rendered = o.bitmap
                     colour = o.shot
+                    hdr = o.hdr
                 }
                 colour?.timingsMs?.get("total")?.let { timings["render"] = it }
+            } else if (!shot.savePhoto) {
+                // B25 "DNG only": nothing rendered; the merge (when it ran) is what the DNG may be written from.
+                runCatching { srImage?.close() }
+                mergedOk = stats != null || (srImage != null && srStats != null)
+                fallback = null
             } else {
                 fallback = "colour pipeline unavailable"
             }
@@ -330,7 +358,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 stress = shot.stress,
                 streaming = b.streaming
             )
-        } else if (shot.renderRaw && shot.raw != null && pipeline != null) {
+        } else if (renderRaw && shot.raw != null && pipeline != null) {
             val o = pipeline.render(
                 shot.raw,
                 shot.result,
@@ -340,11 +368,13 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 shot.zoomRatio,
                 shot.stopLongPx,
                 stopMm = shot.stopTargetMm,
-                spot = shot.meterRegion
+                spot = shot.meterRegion,
+                ultraHdr = uhdr
             )
             rendered = o.bitmap
             colour = o.shot
-        } else if (shot.renderRaw) {
+            hdr = o.hdr
+        } else if (renderRaw) {
             colour =
                 ColourShot(rendered = false, fallbackReason = if (shot.raw == null) "no RAW frame in this shot" else "pipeline unavailable")
         }
@@ -381,7 +411,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 colour = colour?.let { c -> c.copy(detail = d, timingsMs = c.timingsMs + ("detail" to ms)) }
                 burstShot = burstShot?.let { it.copy(timingsMs = it.timingsMs + ("detail" to ms)) }
             }
+            // B25: the gain map is distorted with the still (RAW feel), so it lifts the same highlights.
+            hdr = hdr?.let { pipeline.warpHdr(it, still.width, still.height, shot.stopTargetMm, d?.distortion == true && d.error == null) }
         }
+        if (rendered == null) hdr = null
         val lookName = if (rendered != null) ColourPipeline.LOOK_NAME else LOOK_NONE
         val detail = when {
             sr == null || !sr.applies -> null
@@ -405,7 +438,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
             srMerged = srMerged,
             srFallback = srFallback,
             lookName = lookName,
-            look = look
+            look = look,
+            hdr = hdr
         )
     }
 
@@ -427,36 +461,46 @@ class StillSaver(context: Context, private val version: String, private val pipe
         var error: String? = null
         val encodeStart = nowMs()
         val savedCameraJpeg = staged.rendered == null
-        val jpegOk = try {
-            val bmp = staged.rendered
-            if (bmp != null) {
-                jpegSize = saveRendered(shot, bmp, base, look)
-                colour = colour?.let { it.copy(timingsMs = it.timingsMs + ("encode_save" to (nowMs() - encodeStart))) }
-            } else {
-                jpegSize = saveJpeg(shot, base, look)
-            }
-            true
-        } catch (e: Throwable) {
-            Log.w(TAG, "JPEG save failed", e)
-            error = "JPEG: ${e.javaClass.simpleName}: ${e.message}"
-            false
-        } finally {
+        var photo: PhotoOut? = null
+        val jpegOk = if (!shot.savePhoto) {
             staged.rendered?.recycle()
             staged.rendered = null
+            false
+        } else {
+            try {
+                val bmp = staged.rendered
+                if (bmp != null) {
+                    photo = saveRendered(shot, bmp, base, look, staged.hdr)
+                    jpegSize = photo.size
+                    colour = colour?.let { it.copy(timingsMs = it.timingsMs + ("encode_save" to (nowMs() - encodeStart))) }
+                } else {
+                    photo = saveJpeg(shot, base, look)
+                    jpegSize = photo.size
+                }
+                true
+            } catch (e: Throwable) {
+                Log.w(TAG, "photo save failed", e)
+                error = "${shot.photoFormat.label}: ${e.javaClass.simpleName}: ${e.message}"
+                false
+            } finally {
+                staged.rendered?.recycle()
+                staged.rendered = null
+            }
         }
         // B24.1: the camera JPEG is never a pressure fallback; when it was saved, say why (a hard reason) in the report.
-        if (savedCameraJpeg && jpegSize != null && burstShot != null) {
+        if (shot.savePhoto && savedCameraJpeg && jpegSize != null && burstShot != null) {
             val hard = hardJpegReason(shot, colour, burstShot)
             if (hard != null) burstShot = burstShot.copy(path = BurstShot.PATH_JPEG, hardJpegReason = hard)
         }
         val encodeMs = nowMs() - encodeStart
         var dngOk = false
+        var dng: DngOut? = null
         val dngSource = staged.dngRaw
         val wantDng = dngSource != null && shot.saveDng
         val dngStart = nowMs()
         if (dngSource != null && wantDng) {
             try {
-                saveDng(shot, dngSource, staged.dngResult, base, look)
+                dng = saveDng(shot, dngSource, staged.dngResult, base, look)
                 dngOk = true
             } catch (e: Throwable) {
                 Log.w(TAG, "DNG save failed", e)
@@ -507,9 +551,38 @@ class StillSaver(context: Context, private val version: String, private val pipe
         } else {
             null
         }
+        val ph = photo
+        val dg = dng
+        val formats = shot.formats?.let { f ->
+            val hdr = staged.hdr
+            FormatsShot(
+                settings = f,
+                photoBytes = ph?.bytes,
+                dngBytes = dg?.bytes,
+                photoSize = jpegSize,
+                ultraHdrWanted = f.ultraHdr && f.photo,
+                ultraHdrWritten = ph?.ultraHdr == true,
+                headroomStops = hdr?.headroomStops,
+                p999Stops = hdr?.p999Stops,
+                kneeSlope = hdr?.slope,
+                aboveKneeFraction = hdr?.aboveKneeFraction,
+                ultraHdrSkip = when {
+                    !f.ultraHdr || !f.photo || ph?.ultraHdr == true -> null
+                    else -> ph?.ultraHdrSkip ?: hdr?.skip ?: if (savedCameraJpeg) "camera JPEG (not rendered from RAW)" else "no gain map"
+                },
+                gainmapMs = if (f.ultraHdr && f.photo) (hdr?.ms ?: 0L) + (ph?.gainmapMs ?: 0L) else null,
+                gainmapVerified = ph?.verified,
+                photoEncodeMs = if (shot.savePhoto) encodeMs else null,
+                dngSource = if (wantDng) shot.dngSourceLabel ?: "single frame" else null,
+                dngLevels = dg?.levels,
+                dngMs = if (wantDng) dngMs else null,
+                heifError = ph?.heifError
+            )
+        }
         return ShotResult(
             superRes = srShot,
-            ok = jpegOk,
+            ok = if (shot.savePhoto) jpegOk else dngOk,
+            formats = formats,
             jpegSize = jpegSize,
             dngSaved = dngOk,
             dngWanted = wantDng,
@@ -533,22 +606,93 @@ class StillSaver(context: Context, private val version: String, private val pipe
         return plan.split("; ").firstOrNull { it.startsWith(ShotRouter.HARD_PREFIX) }?.removePrefix(ShotRouter.HARD_PREFIX)
     }
 
-    /** B21: the pipeline's bitmap (sensor orientation) as the JPEG; EXIF orientation comes from the shot. */
-    private fun saveRendered(shot: StillShot, bmp: Bitmap, base: String, look: String): Dim {
+    /** B25: what the photo write did. */
+    private class PhotoOut(
+        val size: Dim,
+        val bytes: Long,
+        val ultraHdr: Boolean = false,
+        val ultraHdrSkip: String? = null,
+        /** Gain map bitmap + metadata, ms (the encode itself is in the photo's encode time). */
+        val gainmapMs: Long? = null,
+        /** After the EXIF write, the MPF entry still points at the gain map image. */
+        val verified: Boolean? = null,
+        val heifError: String? = null
+    )
+
+    /** B25: what the DNG write did. */
+    private class DngOut(val bytes: Long, val levels: String?)
+
+    /**
+     * B21: the pipeline's bitmap (sensor orientation) as the photo; EXIF orientation comes from the shot. B25: HEIF when
+     * chosen (a HEIF failure falls back to JPEG, so the photo is never lost), and an Ultra HDR JPEG when the render made a
+     * gain map: the platform encoder (Bitmap.setGainmap, API 34+) writes the same SDR base JPEG plus the map (MPF + XMP).
+     */
+    private fun saveRendered(shot: StillShot, bmp: Bitmap, base: String, look: String, hdr: ColourPipeline.HdrMap?): PhotoOut {
         val original = ExifInterface(ByteArrayInputStream(shot.jpeg))
         val size = Dim(bmp.width, bmp.height)
+        var heifError: String? = null
+        if (shot.photoFormat == PhotoFormat.HEIF) {
+            try {
+                return saveHeif(shot, bmp, base, look, original, size)
+            } catch (e: Throwable) {
+                Log.w(TAG, "HEIF save failed, writing JPEG", e)
+                heifError = "${e.javaClass.simpleName}: ${e.message}"
+            }
+        }
         val tmp = File.createTempFile(base, ".jpg", app.cacheDir)
         try {
-            tmp.outputStream().use { check(bmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, it)) { "JPEG encode failed" } }
-            writeExif(tmp, original, shot, size, look, CaptureMath.exifOrientation(shot.jpegOrientation))
+            val r = PhotoJpeg.write(bmp, if (shot.ultraHdr) hdr?.bytes else null, tmp, JPEG_QUALITY) { f ->
+                writeExif(f, original, shot, size, look, CaptureMath.exifOrientation(shot.jpegOrientation))
+            }
             insert("$base.jpg", "image/jpeg", shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            return PhotoOut(
+                size,
+                tmp.length(),
+                ultraHdr = r.ultraHdr,
+                ultraHdrSkip = r.skip ?: if (shot.ultraHdr && hdr?.bytes == null) hdr?.skip else null,
+                gainmapMs = r.gainmapMs,
+                verified = r.verified,
+                heifError = heifError
+            )
         } finally {
             tmp.delete()
         }
-        return size
     }
 
-    private fun saveJpeg(shot: StillShot, base: String, look: String): Dim {
+    /**
+     * B25: HEIF (androidx.heifwriter, the HEIC/HEVC encoder) at [HEIF_QUALITY]. The rotation goes in the HEIF itself
+     * (irot); the EXIF block (built on a tiny JPEG with the same tags, orientation normal) is added as the item's Exif.
+     */
+    private fun saveHeif(shot: StillShot, bmp: Bitmap, base: String, look: String, original: ExifInterface, size: Dim): PhotoOut {
+        val exif = exifBlock(base, original, shot, size, look)
+        val tmp = File.createTempFile(base, ".heic", app.cacheDir)
+        try {
+            PhotoHeif.write(bmp, shot.jpegOrientation, HEIF_QUALITY, exif, tmp)
+            insert("$base.${PhotoFormat.HEIF.ext}", PhotoFormat.HEIF.mime, shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            return PhotoOut(size, tmp.length())
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    /** B25: the Exif payload ("Exif\0\0" + TIFF) for a HEIF, written by ExifInterface on a tiny JPEG. */
+    private fun exifBlock(base: String, original: ExifInterface, shot: StillShot, size: Dim, look: String): ByteArray? {
+        val tiny = File.createTempFile("$base-exif", ".jpg", app.cacheDir)
+        return try {
+            val b = Bitmap.createBitmap(EXIF_STUB_PX, EXIF_STUB_PX, Bitmap.Config.ARGB_8888)
+            tiny.outputStream().use { b.compress(Bitmap.CompressFormat.JPEG, 50, it) }
+            b.recycle()
+            writeExif(tiny, original, shot, size, look, ExifInterface.ORIENTATION_NORMAL)
+            JpegStructure.exifPayload(tiny.readBytes())
+        } catch (e: Throwable) {
+            Log.w(TAG, "HEIF EXIF block failed", e)
+            null
+        } finally {
+            tiny.delete()
+        }
+    }
+
+    private fun saveJpeg(shot: StillShot, base: String, look: String): PhotoOut {
         val bytes = shot.jpeg
         val original = ExifInterface(ByteArrayInputStream(bytes))
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -574,10 +718,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
             scaled.recycle()
             writeExif(tmp, original, shot, out, look)
             insert("$base.jpg", "image/jpeg", shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            return PhotoOut(out, tmp.length())
         } finally {
             tmp.delete()
         }
-        return out
     }
 
     private fun writeExif(file: File, original: ExifInterface, shot: StillShot, size: Dim, look: String, orientation: Int? = null) {
@@ -603,15 +747,65 @@ class StillSaver(context: Context, private val version: String, private val pipe
         exif.saveAttributes()
     }
 
-    /** The single RAW frame as a DNG (full sensor, uncropped, no crop tag), from its pool copy and its own result. */
-    private fun saveDng(shot: StillShot, raw: RawCopy, result: TotalCaptureResult, base: String, look: String) {
+    /**
+     * The RAW frame as a DNG (full sensor, uncropped, no crop tag), from its pool copy and its own result. B25: a burst
+     * merge DNG ([StillShot.dngScale] > 1) is written at the merge's precision with WhiteLevel/BlackLevel scaled to match
+     * ([DngLevels]); if the levels cannot be patched, the samples are divided back to the sensor scale and written again.
+     */
+    private fun saveDng(shot: StillShot, raw: RawCopy, result: TotalCaptureResult, base: String, look: String): DngOut {
+        val scale = Math.round(shot.dngScale)
+        if (scale <= 1) {
+            var count = 0L
+            writeDng(shot, raw, result, look) { write ->
+                insert("$base.dng", "image/x-adobe-dng", shot.keep) { os -> CountingStream(os).also { write(it) }.let { count = it.count } }
+            }
+            return DngOut(count, null)
+        }
+        val tmp = File.createTempFile(base, ".dng", app.cacheDir)
+        try {
+            writeDng(shot, raw, result, look) { write -> tmp.outputStream().buffered().use { write(it) } }
+            var levels = "patched x$scale"
+            if (!DngLevels.patch(tmp, scale)) {
+                divideSamples(raw, scale)
+                writeDng(shot, raw, result, look) { write -> tmp.outputStream().buffered().use { write(it) } }
+                levels = "divided by $scale (levels not patchable)"
+            }
+            insert("$base.dng", "image/x-adobe-dng", shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            return DngOut(tmp.length(), levels)
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    private fun writeDng(shot: StillShot, raw: RawCopy, result: TotalCaptureResult, look: String, sink: ((OutputStream) -> Unit) -> Unit) {
         DngCreator(shot.characteristics, result).use { dng ->
             dng.setOrientation(CaptureMath.exifOrientation(shot.jpegOrientation))
             dng.setDescription(look)
-            insert("$base.dng", "image/x-adobe-dng", shot.keep) { os ->
-                dng.writeByteBuffer(os, Size(raw.width, raw.height), raw.buffer.duplicate().also { it.clear() }, 0L)
-            }
+            sink { os -> dng.writeByteBuffer(os, Size(raw.width, raw.height), raw.buffer.duplicate().also { it.clear() }, 0L) }
         }
+    }
+
+    /** B25: merge samples back to the sensor scale, in place (the render is done with them by the time the store runs). */
+    private fun divideSamples(raw: RawCopy, scale: Int) {
+        val sb = raw.buffer.duplicate().also { it.clear() }.order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
+        val half = scale / 2
+        for (i in 0 until minOf(sb.capacity(), raw.width * raw.height)) {
+            val v = sb.get(i).toInt() and 0xFFFF
+            sb.put(i, ((v + half) / scale).toShort())
+        }
+    }
+
+    private class CountingStream(private val out: OutputStream) : OutputStream() {
+        var count = 0L
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+        override fun flush() = out.flush()
     }
 
     /** Pending insert, write, publish; a stress shot is deleted after the full write instead of published. */
@@ -648,6 +842,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
     companion object {
         private const val TAG = "RedlineSaver"
         const val JPEG_QUALITY = 95
+
+        /** B25: HEIF quality (HeifWriter 0..100) and how long the encoder may take to finish. */
+        const val HEIF_QUALITY = 92
+        private const val EXIF_STUB_PX = 16
 
         /** B23: the burst timings copied into the super-resolution record. */
         private val SR_TIMINGS = setOf("capture", "merge_tail", "shutter_release", "render", "queue_wait")

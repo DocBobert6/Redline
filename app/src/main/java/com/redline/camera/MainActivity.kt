@@ -47,7 +47,13 @@ import com.redline.camera.capability.SelfTest
 import com.redline.camera.capability.StillPath
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.DngSource
+import com.redline.camera.capture.PhotoFormat
 import com.redline.camera.capture.PressPolicy
+import com.redline.camera.capture.SaveCaps
+import com.redline.camera.capture.SaveFormat
+import com.redline.camera.capture.SaveFormatsUi
+import com.redline.camera.capture.SaveSettings
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipeline
@@ -113,7 +119,14 @@ class MainActivity : ComponentActivity() {
     private val permissionGranted = mutableStateOf(false)
 
     /** B13: save a DNG next to the JPEG. Off by default (PLAN 5: RAW file is a toggle; B21 captures RAW for the look regardless). */
-    private val rawOn = mutableStateOf(false)
+    /** B25: the persisted save formats (Info screen; the viewfinder button cycles JPEG / JPEG + DNG / DNG). */
+    private val saveSettings = mutableStateOf(SaveSettings())
+
+    /** B25: HEIF encoder present (checked once off the UI thread) and why not. */
+    @Volatile private var heifSupport: Pair<Boolean, String?> = false to "not checked yet"
+
+    /** B25: the session refused the RAW stream (no DNG then). */
+    private var rawRefused = false
 
     /** B22b: presses sent that are not yet out of the camera (the one capturing plus those waiting), for the shutter's feedback. */
     private val pressesOutstanding = mutableIntStateOf(0)
@@ -416,7 +429,8 @@ class MainActivity : ComponentActivity() {
 
         override fun onRawUnavailable(reason: String) {
             runOnUiThread {
-                rawOn.value = false
+                rawRefused = true
+                applySaveFormats()
                 status.value = "RAW unavailable: $reason"
                 updateColour { it.copy(sessionRawUnavailable = reason) }
             }
@@ -451,6 +465,12 @@ class MainActivity : ComponentActivity() {
             grain = prefs.getBoolean(PREF_DETAIL_GRAIN, true),
             distortion = prefs.getBoolean(PREF_DETAIL_DISTORTION, false)
         )
+        saveSettings.value = SaveSettings(
+            format = SaveFormat.of(prefs.getString(PREF_SAVE_FORMAT, null)),
+            photoFormat = PhotoFormat.of(prefs.getString(PREF_PHOTO_FORMAT, null)),
+            ultraHdr = prefs.getBoolean(PREF_ULTRA_HDR, SaveSettings.ULTRA_HDR_DEFAULT),
+            dngSource = DngSource.of(prefs.getString(PREF_DNG_SOURCE, null))
+        )
         colourPipeline.detailSettings = detailSetting
         lookRenderer = LookPreviewRenderer(lookListener)
         lookRenderer.setStrength(lookStrength)
@@ -464,7 +484,6 @@ class MainActivity : ComponentActivity() {
         }
         savedInstanceState?.let {
             selectedStop.intValue = it.getInt(STATE_STOP, ZoomStops.DEFAULT_STOP)
-            rawOn.value = it.getBoolean(STATE_RAW, false)
             restoreManual(it)
             if (it.getBoolean(STATE_CAPABILITY, false)) screen.value = Screen.CAPABILITY
         }
@@ -540,6 +559,11 @@ class MainActivity : ComponentActivity() {
 
         // The cached profile first: it is all the viewfinder needs to open the camera.
         val app = applicationContext
+        // B25: is there an HEIC / HEVC encoder for HEIF stills (MediaCodecList, off the UI thread).
+        worker.execute {
+            heifSupport = SaveFormatsUi.heifSupport()
+            runOnUiThread { applySaveFormats() }
+        }
         worker.execute {
             val (loaded, hit) = runCatching { DeviceProfileProbe(app).cachedOrBuild() }.getOrNull() ?: (null to false)
             val camera = FeaturePolicy.defaultCamera(loaded)
@@ -600,6 +624,7 @@ class MainActivity : ComponentActivity() {
             colourChoice = ProfileChoice(null, null, null, "no usable camera")
             refreshColourAvailability()
         }
+        applySaveFormats()
         syncCamera()
         if (!awaitingPermission) scheduleChecks(immediate = !permissionGranted.value || setup == null)
         // The prompt may have been answered while the profile was still being probed without the permission.
@@ -680,7 +705,6 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
         outState.putInt(STATE_STOP, selectedStop.intValue)
         outState.putBoolean(STATE_CAPABILITY, screen.value == Screen.CAPABILITY)
-        outState.putBoolean(STATE_RAW, rawOn.value)
         val m = manualSettings.value
         outState.putString(STATE_MODE, m.mode.name)
         outState.putInt(STATE_ISO, m.iso)
@@ -737,8 +761,9 @@ class MainActivity : ComponentActivity() {
                 shutterWaiting = PressPolicy.waiting(pressesOutstanding.intValue),
                 pressCount = pressCount.intValue,
                 rawAvailable = rawAvailable(),
-                rawOn = rawOn.value,
-                onToggleRaw = ::toggleRaw,
+                saveFormatLabel = saveEffective().label(),
+                rawOn = saveEffective().dng,
+                onToggleRaw = { setSaveFormat(SaveFormatsUi.nextFormat(saveSettings.value.format)) },
                 captureText = listOfNotNull(burstOverlay(), state.value.capture.overlayText()).joinToString(" · ").ifEmpty { null },
                 shutterRefused = shutterRefused.value,
                 manualUi = ManualUi(
@@ -784,6 +809,7 @@ class MainActivity : ComponentActivity() {
                 onToggleLook = if (state.value.lookPreview.available == true && lookRuntimeError == null) ::toggleLook else null,
                 onToggleColourPipeline = if (state.value.colourPipeline.available == true) ::toggleColourPipeline else null,
                 onToggleDetail = if (state.value.colourPipeline.available == true) ::toggleDetail else null,
+                onSaveSetting = ::changeSaveSetting,
                 onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
                 onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
@@ -1021,9 +1047,49 @@ class MainActivity : ComponentActivity() {
     private fun rawAvailable(): Boolean =
         setupState.value?.rawSize != null && state.value.policy(profile).defaults.stillPath == StillPath.RAW_PLUS_JPEG
 
-    private fun toggleRaw() {
-        rawOn.value = !rawOn.value && rawAvailable()
-        controller.setRaw(rawOn.value)
+    // ------------------------------------------------------------------------------------------------ B25 save formats
+
+    private fun saveCaps(): SaveCaps = SaveCaps(
+        raw = rawAvailable() && !rawRefused,
+        heif = heifSupport.first,
+        ultraHdr = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+        heifReason = heifSupport.second
+    )
+
+    private fun saveEffective(): SaveSettings.Effective = saveSettings.value.effective(saveCaps())
+
+    /** Pushes the save formats to the controller (RAW stream for a DNG) and the report. */
+    private fun applySaveFormats() {
+        if (!::controller.isInitialized) return
+        controller.setSaveFormats(saveEffective())
+        update { it.copy(saveFormats = it.saveFormats.copy(settings = saveSettings.value, caps = saveCaps())) }
+    }
+
+    private fun persistSaveSettings(s: SaveSettings) {
+        saveSettings.value = s
+        prefs.edit {
+            putString(PREF_SAVE_FORMAT, s.format.key)
+            putString(PREF_PHOTO_FORMAT, s.photoFormat.key)
+            putBoolean(PREF_ULTRA_HDR, s.ultraHdr)
+            putString(PREF_DNG_SOURCE, s.dngSource.key)
+        }
+        applySaveFormats()
+    }
+
+    private fun setSaveFormat(f: SaveFormat) = persistSaveSettings(saveSettings.value.copy(format = f))
+
+    /** Info screen buttons: [SaveFormatsUi] keys. */
+    private fun changeSaveSetting(key: String) {
+        val s = saveSettings.value
+        persistSaveSettings(
+            when (key) {
+                SaveFormatsUi.FORMAT -> s.copy(format = SaveFormatsUi.nextFormat(s.format))
+                SaveFormatsUi.PHOTO -> s.copy(photoFormat = if (s.photoFormat == PhotoFormat.JPEG) PhotoFormat.HEIF else PhotoFormat.JPEG)
+                SaveFormatsUi.ULTRA_HDR -> s.copy(ultraHdr = !s.ultraHdr)
+                SaveFormatsUi.DNG_SOURCE -> s.copy(dngSource = if (s.dngSource == DngSource.SINGLE) DngSource.MERGE else DngSource.SINGLE)
+                else -> s
+            }
+        )
     }
 
     /** B22b: the last press that was not taken (queue full), shown briefly over the shutter. */
@@ -1088,11 +1154,13 @@ class MainActivity : ComponentActivity() {
                 }
                 val superRes =
                     result.superRes?.let { state.value.superRes.record(it, result.shutterToSavedMs, result.ok) } ?: state.value.superRes
+                val formats = result.formats?.let { state.value.saveFormats.record(it) } ?: state.value.saveFormats
                 state.value = state.value.copy(
                     capture = state.value.capture.add(result, b13Stress),
                     colourPipeline = colour,
                     burst = burst,
-                    superRes = superRes
+                    superRes = superRes,
+                    saveFormats = formats
                 )
                 done(result)
             }
@@ -1149,7 +1217,7 @@ class MainActivity : ComponentActivity() {
                 stressRequested = runs,
                 stressDone = 0,
                 stressFailures = 0,
-                stressRaw = rawOn.value,
+                stressRaw = saveEffective().dng,
                 stressRunning = true
             )
         )
@@ -1282,7 +1350,7 @@ class MainActivity : ComponentActivity() {
             val stop = setup.zoomPlan.stop(selectedStop.intValue)
             val ratio = stop?.zoomRatio ?: 1f
             if (status.value != null && !selfTestOwnsCamera) status.value = null
-            controller.open(setup, target, ratio, appliedStabilization, rawOn.value && rawAvailable(), colourEnabled())
+            controller.open(setup, target, ratio, appliedStabilization, saveEffective().dng, colourEnabled())
             controller.setBurst(burstEnabled())
             controller.setSuperRes(superResEnabled())
             updateViewfinder { it.copy(zoomStopMm = stop?.targetMm, zoomRatio = ratio, status = "opening") }
@@ -1370,7 +1438,10 @@ class MainActivity : ComponentActivity() {
         }
         updateColour { it.copy(available = available, reason = reason, profileSource = choice?.source, profileId = choice?.profileId) }
         syncColourPipeline()
-        runOnUiThread { refreshBurstAvailability() }
+        runOnUiThread {
+            refreshBurstAvailability()
+            applySaveFormats()
+        }
     }
 
     /**
@@ -1694,7 +1765,6 @@ class MainActivity : ComponentActivity() {
         private const val REPEAT_RUNS = 100
         private const val STATE_STOP = "redline.zoom_stop"
         private const val STATE_CAPABILITY = "redline.capability_screen"
-        private const val STATE_RAW = "redline.raw"
         private const val STATE_MODE = "redline.mode"
         private const val STATE_ISO = "redline.iso"
         private const val STATE_EXPOSURE = "redline.exposure_ns"
@@ -1733,6 +1803,10 @@ class MainActivity : ComponentActivity() {
         private const val PREF_DETAIL_SHARPEN = "detail_sharpen"
         private const val PREF_DETAIL_GRAIN = "detail_grain"
         private const val PREF_DETAIL_DISTORTION = "detail_distortion"
+        private const val PREF_SAVE_FORMAT = "save_format"
+        private const val PREF_PHOTO_FORMAT = "photo_format"
+        private const val PREF_ULTRA_HDR = "ultra_hdr"
+        private const val PREF_DNG_SOURCE = "dng_source"
         private const val GYRO_SMOOTHING = 0.1
         private const val LOOK_LUT_ASSET = "luts/redline_standard_preview_33.cube"
         private const val LOOK_BADGE = "Look preview (approx.)"
