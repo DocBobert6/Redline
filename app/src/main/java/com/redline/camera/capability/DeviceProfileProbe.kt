@@ -1,6 +1,8 @@
 package com.redline.camera.capability
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -14,7 +16,9 @@ import kotlin.math.abs
 
 /**
  * Builds the full [DeviceProfile] from CameraCharacteristics and MediaCodecList (PLAN 4.1).
- * Reads only static metadata: no camera is opened and no permission is needed.
+ * Reads only static metadata: no camera is opened. It runs without the CAMERA permission, but then Camera2 leaves out
+ * the permission-gated keys (minimum focus distance, distortion, colour transforms), so such a profile is marked
+ * [DeviceProfile.probedWithCameraPermission] = false and re-probed once the permission is held (B25).
  * Every key is read on its own so one vendor quirk can't hide the rest.
  */
 class DeviceProfileProbe(private val context: Context) {
@@ -26,14 +30,19 @@ class DeviceProfileProbe(private val context: Context) {
         sdkInt = Build.VERSION.SDK_INT,
         buildFingerprint = Build.FINGERPRINT,
         cameras = safe { manager.cameraIdList.toList() }.orEmpty().mapNotNull { id -> safe { camera(id) } },
-        encoders = encoders()
+        encoders = encoders(),
+        probedWithCameraPermission = hasCameraPermission()
     )
+
+    private fun hasCameraPermission(): Boolean =
+        context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     /** Builds the profile and caches it; reuses the cache until the OS build changes. */
     fun cachedJson(): String {
         val file = File(context.filesDir, CACHE_FILE)
         val cached = safe { file.readText() }
-        if (cached != null && cached.contains(Json.string(Build.FINGERPRINT))) return cached
+        val parsed = DeviceProfileParser.fromJson(cached)
+        if (cached != null && DeviceProfile.cacheReusable(parsed, Build.FINGERPRINT, hasCameraPermission())) return cached
         val json = build().toJson()
         safe { file.writeText(json) }
         return json
@@ -41,12 +50,13 @@ class DeviceProfileProbe(private val context: Context) {
 
     /**
      * The profile for the viewfinder's cold start: the cached copy when it is for this OS build and schema
-     * (no camera is probed), else a fresh [build] that is written to the cache. Second value: true on a cache hit.
+     * (no camera is probed) and not probed before a CAMERA grant, else a fresh [build] that is written to the cache.
+     * Second value: true on a cache hit.
      */
     fun cachedOrBuild(): Pair<DeviceProfile, Boolean> {
         val file = File(context.filesDir, CACHE_FILE)
         val cached = DeviceProfileParser.fromJson(safe { file.readText() })
-        if (cached != null && cached.buildFingerprint == Build.FINGERPRINT) return cached to true
+        if (cached != null && DeviceProfile.cacheReusable(cached, Build.FINGERPRINT, hasCameraPermission())) return cached to true
         val fresh = build()
         safe { file.writeText(fresh.toJson()) }
         return fresh to false

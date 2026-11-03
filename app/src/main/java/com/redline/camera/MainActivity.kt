@@ -169,6 +169,7 @@ class MainActivity : ComponentActivity() {
     }
     private var selfTestOwnsCamera = false
     private var awaitingPermission = false
+    private var refreshingAfterGrant = false
     private var checksPending = false
     private var oneTimeChecksDone = false
     private var firstFrameSeen = false
@@ -288,6 +289,7 @@ class MainActivity : ComponentActivity() {
         awaitingPermission = false
         permissionGranted.value = granted
         if (granted) {
+            refreshAfterGrant()
             syncCamera()
             scheduleChecks(immediate = false)
         } else {
@@ -600,6 +602,45 @@ class MainActivity : ComponentActivity() {
         }
         syncCamera()
         if (!awaitingPermission) scheduleChecks(immediate = !permissionGranted.value || setup == null)
+        // The prompt may have been answered while the profile was still being probed without the permission.
+        if (permissionGranted.value) refreshAfterGrant()
+    }
+
+    /**
+     * B25 manual-focus fix: Camera2 omits permission-gated keys before the CAMERA grant (LENS_INFO_MINIMUM_FOCUS_DISTANCE
+     * among them), and on a first launch the profile and the viewfinder setup are read before the prompt is answered.
+     * Once the permission is held, re-probe a profile that was built without it and re-read the manual caps, so manual
+     * focus is not hidden until the next launch (and the cache does not keep the incomplete profile). No-op otherwise.
+     */
+    private fun refreshAfterGrant() {
+        val oldProfile = profileState.value
+        val oldSetup = setupState.value
+        val profileStale = oldProfile != null && !oldProfile.probedWithCameraPermission
+        val setupStale = oldSetup != null && !oldSetup.manualReadWithPermission
+        val stale = profileStale || setupStale
+        if (!stale || refreshingAfterGrant) return
+        refreshingAfterGrant = true
+        val app = applicationContext
+        worker.execute {
+            val (loaded, _) = runCatching { DeviceProfileProbe(app).cachedOrBuild() }.getOrNull() ?: (oldProfile to false)
+            colourPipeline.forgetChoices()
+            val camera = loaded?.cameras?.firstOrNull { it.id == oldSetup?.cameraId }
+            val setup = if (oldSetup != null && camera != null) ViewfinderSetup.withManualReread(app, oldSetup, camera) else oldSetup
+            val choice = setup?.let { colourPipeline.profileFor(it.cameraId) }
+            runOnUiThread {
+                refreshingAfterGrant = false
+                profileState.value = loaded
+                // The open session keeps its setup object: only the manual caps change, nothing that needs a reopen.
+                if (setupState.value?.cameraId == setup?.cameraId) setupState.value = setup
+                updateViewfinder { it.copy(profileCache = "miss, re-probed after CAMERA grant") }
+                update { it.copy(manual = it.manual.copy(caps = setup?.manual)) }
+                applyManual()
+                if (choice != null) {
+                    colourChoice = choice
+                    refreshColourAvailability()
+                }
+            }
+        }
     }
 
     override fun onResume() {
@@ -607,6 +648,8 @@ class MainActivity : ComponentActivity() {
         resumed = true
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
         permissionGranted.value = SelfTest(this).hasPermission()
+        // Granted in system settings while the app was in the background.
+        if (permissionGranted.value) refreshAfterGrant()
         syncCamera()
         syncLevelSensor()
         syncGyro()

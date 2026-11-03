@@ -1,8 +1,10 @@
 package com.redline.camera.viewfinder
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -97,7 +99,13 @@ data class ViewfinderSetup(
     /** B14 manual-control ranges; null when the characteristics could not be read. */
     val manual: ManualCaps? = null,
     /** B24b: touch focus / metering (CONTROL_MAX_REGIONS_AF / _AE > 0 only). */
-    val touch: TouchFocusCaps = TouchFocusCaps.NONE
+    val touch: TouchFocusCaps = TouchFocusCaps.NONE,
+    /**
+     * B25: whether [manual] was read while the CAMERA permission was held. Camera2 leaves out
+     * LENS_INFO_MINIMUM_FOCUS_DISTANCE (a permission-gated key) before the grant, which hid manual focus on every
+     * first launch; [withManualReread] reads the caps again once the permission is granted.
+     */
+    val manualReadWithPermission: Boolean = true
 ) {
     val zoomApi: String get() = if (zoomRatioRange != null) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"
 
@@ -140,6 +148,7 @@ data class ViewfinderSetup(
                 rawSize = if (camera.has("RAW")) largest(camera.outputSizes["RAW_SENSOR"]) else null,
                 frontFacing = camera.facing == "FRONT",
                 manual = runCatching { manualCaps(ch, camera) }.getOrNull(),
+                manualReadWithPermission = hasCameraPermission(context),
                 touch = runCatching {
                     TouchFocusCaps.from(
                         ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF),
@@ -148,6 +157,23 @@ data class ViewfinderSetup(
                         ch.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
                     )
                 }.getOrDefault(TouchFocusCaps.NONE)
+            )
+        }
+
+        private fun hasCameraPermission(context: Context): Boolean =
+            context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+        /**
+         * The setup with [manual] read again from fresh characteristics (and [camera], the profile re-probed after the
+         * grant). Only the manual caps hold permission-gated keys; preview size, zoom, orientation and the touch caps
+         * are not gated, so the rest of the setup (and an open session) stays as it is.
+         */
+        fun withManualReread(context: Context, setup: ViewfinderSetup, camera: CameraProfile): ViewfinderSetup {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val ch = runCatching { manager.getCameraCharacteristics(setup.cameraId) }.getOrNull() ?: return setup
+            return setup.copy(
+                manual = runCatching { manualCaps(ch, camera) }.getOrNull() ?: setup.manual,
+                manualReadWithPermission = hasCameraPermission(context)
             )
         }
 

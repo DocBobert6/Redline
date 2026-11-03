@@ -15,7 +15,13 @@ data class DeviceProfile(
     val sdkInt: Int,
     val buildFingerprint: String,
     val cameras: List<CameraProfile>,
-    val encoders: Encoders
+    val encoders: Encoders,
+    /**
+     * B25: whether the CAMERA permission was held when the profile was probed. Without it Camera2 omits every
+     * permission-gated key (getKeysNeedingPermission: LENS_INFO_MINIMUM_FOCUS_DISTANCE, LENS_DISTORTION, the colour
+     * transforms and forward matrices, ...), so a profile probed before the grant is incomplete and is re-probed.
+     */
+    val probedWithCameraPermission: Boolean = true
 ) {
     fun toJson(): String = Json.value(toMap())
 
@@ -25,12 +31,20 @@ data class DeviceProfile(
         "model" to model,
         "sdk_int" to sdkInt,
         "build_fingerprint" to buildFingerprint,
+        "probed_with_camera_permission" to probedWithCameraPermission,
         "encoders" to encoders.toMap(),
         "cameras" to cameras.map { it.toMap() }
     )
 
     companion object {
-        const val SCHEMA = 2
+        const val SCHEMA = 3
+
+        /**
+         * Whether a cached profile can be reused: same schema (the parser already returns null otherwise), same OS
+         * build, and not probed without the CAMERA permission while the permission is held now (B25 manual focus fix).
+         */
+        fun cacheReusable(cached: DeviceProfile?, fingerprint: String, permissionNow: Boolean): Boolean =
+            cached != null && cached.buildFingerprint == fingerprint && (cached.probedWithCameraPermission || !permissionNow)
     }
 }
 

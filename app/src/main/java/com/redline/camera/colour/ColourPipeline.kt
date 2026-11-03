@@ -120,6 +120,12 @@ class ColourPipeline(context: Context) {
     }
 
     /** Profile for [cameraId]: bundled (model hash + facing), else Camera2 matrices, else none with the reason. Cached. */
+    /**
+     * Drops the cached choices. B25: a choice made before the CAMERA grant could not see the factory calibration
+     * (SENSOR_COLOR_TRANSFORM / FORWARD_MATRIX are permission-gated), so it is made again after the grant.
+     */
+    fun forgetChoices() = synchronized(choices) { choices.clear() }
+
     fun profileFor(cameraId: String): ProfileChoice = synchronized(choices) {
         choices.getOrPut(cameraId) {
             val manager = app.getSystemService(Context.CAMERA_SERVICE) as CameraManager
