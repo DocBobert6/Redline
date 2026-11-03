@@ -14,6 +14,7 @@
 #include "gainmap.h"
 #include "raw_pipeline.h"
 #include "superres.h"
+#include "yuv.h"
 
 namespace {
 
@@ -824,4 +825,43 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     if (!err.empty()) return env->NewStringUTF(err.c_str());
     env->SetByteArrayRegion(map, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------------------------------- B30 HEIF input
+
+// Converts one tile of an ARGB_8888 bitmap to YUV 4:2:0 straight into the encoder's input image planes (direct buffers).
+// Returns null on success, else the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeRgbaToYuvTile(
+    JNIEnv* env, jclass, jobject bitmap, jint x0, jint y0, jint tileW, jint tileH, jobject yBuf, jint yRowStride, jint yPixelStride,
+    jobject uBuf, jobject vBuf, jint uvRowStride, jint uvPixelStride) {
+    AndroidBitmapInfo info{};
+    if (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        return env->NewStringUTF("input must be an ARGB_8888 bitmap");
+    }
+    auto* y = static_cast<std::uint8_t*>(yBuf != nullptr ? env->GetDirectBufferAddress(yBuf) : nullptr);
+    auto* u = static_cast<std::uint8_t*>(uBuf != nullptr ? env->GetDirectBufferAddress(uBuf) : nullptr);
+    auto* v = static_cast<std::uint8_t*>(vBuf != nullptr ? env->GetDirectBufferAddress(vBuf) : nullptr);
+    if (y == nullptr || u == nullptr || v == nullptr) return env->NewStringUTF("planes must be direct buffers");
+    // Every written byte must lie inside its plane's buffer.
+    const jlong yCap = env->GetDirectBufferCapacity(yBuf), uCap = env->GetDirectBufferCapacity(uBuf), vCap = env->GetDirectBufferCapacity(vBuf);
+    const jlong yNeed = static_cast<jlong>(tileH - 1) * yRowStride + static_cast<jlong>(tileW - 1) * yPixelStride + 1;
+    const jlong uvNeed = static_cast<jlong>(tileH / 2 - 1) * uvRowStride + static_cast<jlong>(tileW / 2 - 1) * uvPixelStride + 1;
+    if (tileW < 2 || tileH < 2 || yCap < yNeed || uCap < uvNeed || vCap < uvNeed) return env->NewStringUTF("planes smaller than the tile");
+    redline::Yuv420Dst dst;
+    dst.y = y;
+    dst.yRowStride = yRowStride;
+    dst.yPixelStride = yPixelStride;
+    dst.u = u;
+    dst.v = v;
+    dst.uvRowStride = uvRowStride;
+    dst.uvPixelStride = uvPixelStride;
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return env->NewStringUTF("could not lock the bitmap");
+    }
+    const char* err = redline::rgbaToYuv420Tile(static_cast<const std::uint8_t*>(pixels), static_cast<int>(info.width),
+                                                static_cast<int>(info.height), static_cast<int>(info.stride), x0, y0, tileW, tileH, dst);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return err[0] == 0 ? nullptr : env->NewStringUTF(err);
 }

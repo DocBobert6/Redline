@@ -50,7 +50,7 @@ enum class DngSource(val key: String, val label: String) {
 data class SaveCaps(
     /** RAW_SENSOR in the session (the camera has the RAW capability and it was not demoted). */
     val raw: Boolean,
-    /** An HEIC image encoder or an HEVC video encoder exists (androidx.heifwriter needs one of them). */
+    /** An HEIC image encoder or an HEVC video encoder with YUV buffer input exists (B30: [PhotoHeif]). */
     val heif: Boolean,
     /** API 34+: android.graphics.Gainmap and the platform's Ultra HDR JPEG encoder. */
     val ultraHdr: Boolean,
@@ -169,7 +169,9 @@ data class FormatsShot(
     /** "patched" (x16 data, WhiteLevel/BlackLevel scaled) or "divided" (data back at the sensor scale); null = single frame. */
     val dngLevels: String? = null,
     val dngMs: Long? = null,
-    val heifError: String? = null
+    val heifError: String? = null,
+    /** B30: the HEIF writer's codec, input mode, grid and time split (null for JPEG). */
+    val heif: Map<String, Any?>? = null
 ) {
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "formats" to settings.toMap(),
@@ -191,7 +193,8 @@ data class FormatsShot(
         "dng_source" to dngSource,
         "dng_levels" to dngLevels,
         "dng_ms" to dngMs,
-        "heif_error" to heifError
+        "heif_error" to heifError,
+        "heif" to heif
     )
 
     fun summary(): String = buildString {

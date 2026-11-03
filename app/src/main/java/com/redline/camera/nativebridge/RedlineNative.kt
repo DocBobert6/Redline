@@ -243,6 +243,30 @@ object RedlineNative {
         return DetailStats.of(r)
     }
 
+    // ------------------------------------------------------------------------------------------- B30 HEIF input
+
+    /**
+     * B30: one [tileW] x [tileH] window of an ARGB_8888 [bitmap] at ([x0], [y0]) as full-range BT.601 YUV 4:2:0, written
+     * straight into an encoder input image's planes (edge pixels repeat past the image). Null on success, else the error.
+     */
+    fun rgbaToYuvTile(
+        bitmap: Bitmap,
+        x0: Int,
+        y0: Int,
+        tileW: Int,
+        tileH: Int,
+        y: ByteBuffer,
+        yRowStride: Int,
+        yPixelStride: Int,
+        u: ByteBuffer,
+        v: ByteBuffer,
+        uvRowStride: Int,
+        uvPixelStride: Int
+    ): String? {
+        if (!load().loaded) return "native library not loaded: ${load().error}"
+        return nativeRgbaToYuvTile(bitmap, x0, y0, tileW, tileH, y, yRowStride, yPixelStride, u, v, uvRowStride, uvPixelStride)
+    }
+
     // ------------------------------------------------------------------------------------------- B22 burst merge
 
     /** A frame-sized buffer in native memory (outside the Java heap), or null when it cannot be allocated. Free with [freeFrame]. */
@@ -755,6 +779,22 @@ object RedlineNative {
         seed: Int,
         threads: Int
     ): FloatArray
+
+    @JvmStatic
+    private external fun nativeRgbaToYuvTile(
+        bitmap: Bitmap,
+        x0: Int,
+        y0: Int,
+        tileW: Int,
+        tileH: Int,
+        y: ByteBuffer,
+        yRowStride: Int,
+        yPixelStride: Int,
+        u: ByteBuffer,
+        v: ByteBuffer,
+        uvRowStride: Int,
+        uvPixelStride: Int
+    ): String?
 
     @JvmStatic
     private external fun nativeParseCube(bytes: ByteArray): FloatArray

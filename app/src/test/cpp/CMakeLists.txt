@@ -75,3 +75,9 @@ target_include_directories(gainmap_test PRIVATE ${NATIVE_SRC})
 target_compile_options(gainmap_test PRIVATE -Wall -Wextra -Werror -O3 -ffp-contract=off)
 target_link_libraries(gainmap_test PRIVATE Threads::Threads)
 add_test(NAME gainmap COMMAND gainmap_test)
+
+# B30 HEIF input: RGBA -> YUV 4:2:0 tiles (rounding, edge repeat, I420 == NV12, round trip).
+add_executable(yuv_test yuv_test.cpp ${NATIVE_SRC}/yuv.cpp)
+target_include_directories(yuv_test PRIVATE ${NATIVE_SRC})
+target_compile_options(yuv_test PRIVATE -Wall -Wextra -Werror -O2)
+add_test(NAME yuv COMMAND yuv_test)

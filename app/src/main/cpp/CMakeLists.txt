@@ -1,4 +1,4 @@
-# Redline native module (B20, B21, B22, B23, B24, B25): libredline_native.so. Built by AGP's externalNativeBuild with the NDK pinned in
+# Redline native module (B20, B21, B22, B23, B24, B25, B30): libredline_native.so. Built by AGP's externalNativeBuild with the NDK pinned in
 # app/build.gradle.kts (ndkVersion) and the CI workflows. Halide is deliberately not added yet.
 cmake_minimum_required(VERSION 3.22.1)
 project(redline_native LANGUAGES CXX)
@@ -14,6 +14,7 @@ add_library(redline_native SHARED
     superres.cpp
     detail.cpp
     gainmap.cpp
+    yuv.cpp
     redline_jni.cpp)
 
 # B21 renders straight into an android.graphics.Bitmap.

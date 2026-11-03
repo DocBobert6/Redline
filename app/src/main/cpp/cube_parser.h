@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#define REDLINE_NATIVE_VERSION "redline_native 0.2.6-alpha.1 (B20 .cube parser, B21 RAW colour pipeline, B22b streaming burst merge, B23 super-resolution, B23b.1 rapid fire, B23c metering stats, B23c.1 p25 for the headroom lift, B24 vignette + detail post-pass, B24.1 strip detail stages, B24b region stats for touch metering, B25 Ultra HDR gain map)"
+#define REDLINE_NATIVE_VERSION "redline_native 0.3.0-alpha.1 (B20 .cube parser, B21 RAW colour pipeline, B22b streaming burst merge, B23 super-resolution, B23b.1 rapid fire, B23c metering stats, B23c.1 p25 for the headroom lift, B24 vignette + detail post-pass, B24.1 strip detail stages, B24b region stats for touch metering, B25 Ultra HDR gain map, B30 HEIF YUV tiles + depth/segmentation pre/post-processing)"
 
 namespace redline {
 

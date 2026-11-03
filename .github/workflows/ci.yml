@@ -173,6 +173,11 @@ jobs:
           build/uhdr_validate "$UHDR" 1.5
           build/uhdr_validate --not "$PLAIN"
 
+      # B30: what the emulator measured (HEIF codec + time split, depth / segmentation timings and confidence).
+      - name: Emulator measurements
+        if: always()
+        run: for f in $(find uhdr-out -name '*.json' 2>/dev/null); do echo "== $f"; cat "$f"; echo; done
+
       - name: Upload Ultra HDR / HEIF samples
         if: always()
         uses: actions/upload-artifact@v4
