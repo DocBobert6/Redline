@@ -23,7 +23,8 @@ object DeviceProfileParser {
                 hevcMain10 = enc?.bool("hevc_main10") == true,
                 av1 = enc?.bool("av1") == true,
                 apv = enc?.bool("apv") == true
-            )
+            ),
+            probedWithCameraPermission = m.bool("probed_with_camera_permission") == true
         )
     }
 

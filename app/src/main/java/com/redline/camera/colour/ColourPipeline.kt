@@ -14,6 +14,7 @@ import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.JsonParse
 import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.RawCopy
+import com.redline.camera.capture.SaveSettings
 import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.look.CubeLut
 import com.redline.camera.nativebridge.RedlineNative
@@ -43,7 +44,23 @@ class ColourPipeline(context: Context) {
         val detailError: String? = null
     )
 
-    class Outcome(val bitmap: Bitmap?, val shot: ColourShot)
+    class Outcome(val bitmap: Bitmap?, val shot: ColourShot, val hdr: HdrMap? = null)
+
+    /**
+     * B25: the Ultra HDR gain map of a render: the encoded map ([bytes] null when not worth writing, [skip] says why), the
+     * knee slope the render measured, and the time spent on it outside the render (encoding the cells, warping).
+     */
+    class HdrMap(
+        val bytes: RedlineNative.GainMapBytes?,
+        val slope: Double?,
+        val skip: String?,
+        val ms: Long,
+        val headroomStops: Double? = null,
+        val p999Stops: Double? = null,
+        val aboveKneeFraction: Double? = null
+    ) {
+        fun plus(extraMs: Long) = HdrMap(bytes, slope, skip, ms + extraMs, headroomStops, p999Stops, aboveKneeFraction)
+    }
 
     @Volatile private var tone: DoubleArray? = null
 
@@ -120,6 +137,12 @@ class ColourPipeline(context: Context) {
     }
 
     /** Profile for [cameraId]: bundled (model hash + facing), else Camera2 matrices, else none with the reason. Cached. */
+    /**
+     * Drops the cached choices. B25: a choice made before the CAMERA grant could not see the factory calibration
+     * (SENSOR_COLOR_TRANSFORM / FORWARD_MATRIX are permission-gated), so it is made again after the grant.
+     */
+    fun forgetChoices() = synchronized(choices) { choices.clear() }
+
     fun profileFor(cameraId: String): ProfileChoice = synchronized(choices) {
         choices.getOrPut(cameraId) {
             val manager = app.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -162,7 +185,8 @@ class ColourPipeline(context: Context) {
         stopLongPx: Int,
         levelScale: Float = 1f,
         stopMm: Int = 0,
-        spot: NormRect? = null
+        spot: NormRect? = null,
+        ultraHdr: Boolean = false
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -197,9 +221,10 @@ class ColourPipeline(context: Context) {
             timings["plan"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val out = Bitmap.createBitmap(g.out.width, g.out.height, Bitmap.Config.ARGB_8888)
+            val cells = if (ultraHdr) RedlineNative.GainMapCells(g.out.width, g.out.height, ColourMath.KNEE_EV.toFloat()) else null
             val err = RedlineNative.renderRaw(
                 frame, g.crop, m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(),
-                l, threads(), out, vignetteTable(stopMm)
+                l, threads(), out, vignetteTable(stopMm), cells
             )
             timings["render"] = SystemClock.elapsedRealtime() - t1
             timings["total"] = SystemClock.elapsedRealtime() - t0
@@ -228,12 +253,56 @@ class ColourPipeline(context: Context) {
                     timingsMs = timings,
                     iso = sensitivity(result),
                     stopMm = stopMm
-                )
+                ),
+                cells?.let { finishHdr(it) }
             )
         } catch (e: Exception) {
             fail("${e.javaClass.simpleName}: ${e.message}")
         } catch (e: OutOfMemoryError) {
             fail("out of memory")
+        }
+    }
+
+    /** B25: encodes the gain map cells of a render (capped p99.9 headroom); never throws. */
+    private fun finishHdr(cells: RedlineNative.GainMapCells): HdrMap {
+        val t0 = SystemClock.elapsedRealtime()
+        return try {
+            val b = RedlineNative.finishGainMap(cells, SaveSettings.HEADROOM_CAP_STOPS, SaveSettings.HEADROOM_MIN_STOPS)
+            val skip = when (b.skipCode) {
+                0 -> null
+                1 -> "no highlights above the knee"
+                else -> "headroom %.2f stops < %.2f".format(b.headroomStops, SaveSettings.HEADROOM_MIN_STOPS)
+            }
+            HdrMap(
+                if (b.written) b else null,
+                cells.slope.toDouble(),
+                skip,
+                SystemClock.elapsedRealtime() - t0,
+                b.headroomStops,
+                b.p999Stops,
+                b.aboveKneeFraction
+            )
+        } catch (e: Exception) {
+            HdrMap(null, null, "gain map: ${e.javaClass.simpleName}: ${e.message}", SystemClock.elapsedRealtime() - t0)
+        }
+    }
+
+    /**
+     * B25: the gain map follows the still through the RAW-feel distortion ([applied]: the detail pass distorted it), so
+     * the highlights it lifts stay on the same pixels. Returns the map with the warp time added; never throws.
+     */
+    fun warpHdr(hdr: HdrMap, imageWidth: Int, imageHeight: Int, stopMm: Int, applied: Boolean): HdrMap {
+        val b = hdr.bytes ?: return hdr
+        val d = detail ?: return hdr
+        if (!applied || stopMm <= 0) return hdr
+        val t0 = SystemClock.elapsedRealtime()
+        val err = runCatching { RedlineNative.warpGainMap(b, imageWidth, imageHeight, d.distortionFor(stopMm)) }
+            .getOrElse { "${it.javaClass.simpleName}: ${it.message}" }
+        val ms = SystemClock.elapsedRealtime() - t0
+        return if (err == null) {
+            hdr.plus(ms)
+        } else {
+            HdrMap(null, hdr.slope, "gain map warp: $err", hdr.ms + ms, hdr.headroomStops, hdr.p999Stops, hdr.aboveKneeFraction)
         }
     }
 
@@ -251,7 +320,8 @@ class ColourPipeline(context: Context) {
         outWidth: Int,
         outHeight: Int,
         stopMm: Int = 0,
-        spot: NormRect? = null
+        spot: NormRect? = null,
+        ultraHdr: Boolean = false
     ): Outcome {
         val t0 = SystemClock.elapsedRealtime()
         val timings = LinkedHashMap<String, Long>()
@@ -283,9 +353,10 @@ class ColourPipeline(context: Context) {
             timings["plan"] = SystemClock.elapsedRealtime() - t1
             t1 = SystemClock.elapsedRealtime()
             val out = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+            val cells = if (ultraHdr) RedlineNative.GainMapCells(outWidth, outHeight, ColourMath.KNEE_EV.toFloat()) else null
             val err = sr.render(
                 m, n, tn.curve.gain.toFloat(), table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), l, threads(), out,
-                vignetteTable(stopMm)
+                vignetteTable(stopMm), cells
             )
             timings["render"] = SystemClock.elapsedRealtime() - t1
             timings["total"] = SystemClock.elapsedRealtime() - t0
@@ -314,7 +385,8 @@ class ColourPipeline(context: Context) {
                     timingsMs = timings,
                     iso = sensitivity(result),
                     stopMm = stopMm
-                )
+                ),
+                cells?.let { finishHdr(it) }
             )
         } catch (e: Exception) {
             fail("${e.javaClass.simpleName}: ${e.message}")

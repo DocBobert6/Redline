@@ -631,4 +631,38 @@ std::string applyDetailFloat(float* rgb, int width, int height, std::size_t stri
     return run(im, spec, stats);
 }
 
+// B25: the gain map follows the still through the same lens distortion (RAW feel). Each map value is inverse-mapped
+// with the image's own k(r) (distortMap at the image size), the map's cell centres taken in image coordinates; bilinear.
+std::string warpGainMap(std::uint8_t* map, int mapWidth, int mapHeight, std::size_t mapStride, int imageWidth, int imageHeight,
+                        const DetailSpec& spec) {
+    if (!spec.distort) return "";
+    if (map == nullptr || mapWidth < 2 || mapHeight < 2 || mapStride < static_cast<std::size_t>(mapWidth)) return "bad gain map";
+    const std::string err = validate(imageWidth, imageHeight, spec);
+    if (!err.empty()) return err;
+    const DistortMap m = distortMap(imageWidth, imageHeight, spec);
+    const std::vector<std::uint8_t> src(map, map + mapStride * static_cast<std::size_t>(mapHeight));
+    const float sx = static_cast<float>(imageWidth) / static_cast<float>(mapWidth);
+    const float sy = static_cast<float>(imageHeight) / static_cast<float>(mapHeight);
+    const float cx = imageWidth / 2.0f, cy = imageHeight / 2.0f;
+    for (int y = 0; y < mapHeight; ++y) {
+        const float yy = (static_cast<float>(y) + 0.5f) * sy - cy;
+        std::uint8_t* row = map + static_cast<std::size_t>(y) * mapStride;
+        for (int x = 0; x < mapWidth; ++x) {
+            const float xx = (static_cast<float>(x) + 0.5f) * sx - cx;
+            const float rd = std::sqrt(xx * xx + yy * yy) * m.invHalf;
+            const float k = lookup(m.ratio, rd * m.invRMax) * m.scale;
+            const float fx = std::min(std::max((xx * k + cx) / sx - 0.5f, 0.0f), static_cast<float>(mapWidth - 1));
+            const float fy = std::min(std::max((yy * k + cy) / sy - 0.5f, 0.0f), static_cast<float>(mapHeight - 1));
+            const int x0 = std::min(static_cast<int>(fx), mapWidth - 2);
+            const int y0 = std::min(static_cast<int>(fy), mapHeight - 2);
+            const float ux = fx - static_cast<float>(x0), uy = fy - static_cast<float>(y0);
+            const std::uint8_t* a = src.data() + static_cast<std::size_t>(y0) * mapStride;
+            const std::uint8_t* b = a + mapStride;
+            const float v = (a[x0] * (1 - ux) + a[x0 + 1] * ux) * (1 - uy) + (b[x0] * (1 - ux) + b[x0 + 1] * ux) * uy;
+            row[x] = static_cast<std::uint8_t>(std::min(std::max(v, 0.0f), 255.0f) + 0.5f);
+        }
+    }
+    return "";
+}
+
 }  // namespace redline

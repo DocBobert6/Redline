@@ -124,6 +124,8 @@ fun ViewfinderScreen(
     onShutter: () -> Unit = {},
     shutterEnabled: Boolean = false,
     rawAvailable: Boolean = false,
+    /** B25: the save formats in effect (JPEG / JPEG + DNG / DNG, with HEIF and Ultra HDR); the button cycles them. */
+    saveFormatLabel: String = "JPEG",
     rawOn: Boolean = false,
     onToggleRaw: () -> Unit = {},
     captureText: String? = null,
@@ -254,7 +256,7 @@ fun ViewfinderScreen(
                     ) {
                         if (rawAvailable) {
                             OutlinedButton(onClick = onToggleRaw, modifier = Modifier.testTag(RAW_TOGGLE_TAG)) {
-                                Text(if (rawOn) "RAW on" else "RAW off", color = if (rawOn) Accent else Color.White)
+                                Text(saveFormatLabel, color = if (rawOn) Accent else Color.White)
                             }
                         } else {
                             Spacer(modifier = Modifier.size(1.dp))

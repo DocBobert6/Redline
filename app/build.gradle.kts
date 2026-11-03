@@ -91,6 +91,8 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     implementation(libs.camerax.camera2)
     implementation(libs.camerax.lifecycle)
+    // B25: HEIF stills (HEIC / HEVC encoder)
+    implementation(libs.androidx.heifwriter)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)

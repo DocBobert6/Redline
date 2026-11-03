@@ -1,8 +1,10 @@
 package com.redline.camera.viewfinder
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -39,6 +41,7 @@ import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.BurstShot
 import com.redline.camera.capture.BurstStreaming
 import com.redline.camera.capture.CaptureMath
+import com.redline.camera.capture.DngSource
 import com.redline.camera.capture.DropReason
 import com.redline.camera.capture.EarlyNoise
 import com.redline.camera.capture.FramePool
@@ -49,6 +52,7 @@ import com.redline.camera.capture.MemoryWait
 import com.redline.camera.capture.PressPolicy
 import com.redline.camera.capture.RawCopy
 import com.redline.camera.capture.RawHoldingQueue
+import com.redline.camera.capture.SaveSettings
 import com.redline.camera.capture.ShotBuffers
 import com.redline.camera.capture.ShotResult
 import com.redline.camera.capture.ShotRouter
@@ -97,7 +101,13 @@ data class ViewfinderSetup(
     /** B14 manual-control ranges; null when the characteristics could not be read. */
     val manual: ManualCaps? = null,
     /** B24b: touch focus / metering (CONTROL_MAX_REGIONS_AF / _AE > 0 only). */
-    val touch: TouchFocusCaps = TouchFocusCaps.NONE
+    val touch: TouchFocusCaps = TouchFocusCaps.NONE,
+    /**
+     * B25: whether [manual] was read while the CAMERA permission was held. Camera2 leaves out
+     * LENS_INFO_MINIMUM_FOCUS_DISTANCE (a permission-gated key) before the grant, which hid manual focus on every
+     * first launch; [withManualReread] reads the caps again once the permission is granted.
+     */
+    val manualReadWithPermission: Boolean = true
 ) {
     val zoomApi: String get() = if (zoomRatioRange != null) "CONTROL_ZOOM_RATIO" else "SCALER_CROP_REGION"
 
@@ -140,6 +150,7 @@ data class ViewfinderSetup(
                 rawSize = if (camera.has("RAW")) largest(camera.outputSizes["RAW_SENSOR"]) else null,
                 frontFacing = camera.facing == "FRONT",
                 manual = runCatching { manualCaps(ch, camera) }.getOrNull(),
+                manualReadWithPermission = hasCameraPermission(context),
                 touch = runCatching {
                     TouchFocusCaps.from(
                         ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF),
@@ -148,6 +159,23 @@ data class ViewfinderSetup(
                         ch.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
                     )
                 }.getOrDefault(TouchFocusCaps.NONE)
+            )
+        }
+
+        private fun hasCameraPermission(context: Context): Boolean =
+            context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+        /**
+         * The setup with [manual] read again from fresh characteristics (and [camera], the profile re-probed after the
+         * grant). Only the manual caps hold permission-gated keys; preview size, zoom, orientation and the touch caps
+         * are not gated, so the rest of the setup (and an open session) stays as it is.
+         */
+        fun withManualReread(context: Context, setup: ViewfinderSetup, camera: CameraProfile): ViewfinderSetup {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val ch = runCatching { manager.getCameraCharacteristics(setup.cameraId) }.getOrNull() ?: return setup
+            return setup.copy(
+                manual = runCatching { manualCaps(ch, camera) }.getOrNull() ?: setup.manual,
+                manualReadWithPermission = hasCameraPermission(context)
             )
         }
 
@@ -395,6 +423,9 @@ class ViewfinderController(
     // B13 still capture (camera thread). rawWanted = the DNG toggle; pipelineWanted = B21 renders stills from RAW.
     private var rawWanted = false
     private var pipelineWanted = false
+
+    /** B25: the save formats of the next shots (camera thread); null until MainActivity sets them (B24 behaviour). */
+    private var saveFormats: SaveSettings.Effective? = null
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
     private var sessionHasRaw = false
@@ -579,6 +610,20 @@ class ViewfinderController(
             if (rawWanted == on) return@post
             rawWanted = on
             syncRawStream()
+        }
+    }
+
+    /**
+     * B25: the save formats (Info screen). The RAW stream is wanted for a DNG exactly as the B13 toggle wanted it; the rest
+     * is stamped on each shot for the saver.
+     */
+    fun setSaveFormats(e: SaveSettings.Effective) {
+        handler.post {
+            saveFormats = e
+            if (rawWanted != e.dng) {
+                rawWanted = e.dng
+                syncRawStream()
+            }
         }
     }
 
@@ -1607,6 +1652,12 @@ class ViewfinderController(
         val keep = ArrayList<ByteBuffer>()
         var merged: RawCopy? = null
         var dngRaw: RawCopy? = null
+        var dngScale = 1f
+        var dngLabel = when {
+            run.merge.superRes != null -> "frame 0 (super-resolution: the DNG stays one camera frame)"
+            stats == null -> "single frame (merge failed)"
+            else -> "single frame"
+        }
         var fallbackRaw: RawCopy? = null
         var refResult = result
         val ref = stats?.reference?.let { run.copies.getOrNull(it) }
@@ -1628,7 +1679,14 @@ class ViewfinderController(
             val out = run.dngOut
             if (out != null) {
                 merged = RawCopy(out, ref.width, ref.height, ref.timestampNs)
-                dngRaw = ref
+                // B25: a merge DNG is written from the merge itself (x merge scale, levels patched by the saver).
+                if (saveFormats?.dngSource == DngSource.MERGE) {
+                    dngRaw = merged
+                    dngScale = run.merge.scale
+                    dngLabel = "burst merge (${stats.frames} frames)"
+                } else {
+                    dngRaw = ref
+                }
                 keep += out
             } else {
                 merged = ref // merged in place
@@ -1667,8 +1725,9 @@ class ViewfinderController(
             stats = stats,
             referenceResult = refResult,
             dngRaw = dngRaw,
-            // The DNG's metadata is its own frame's result (super-resolution: frame 0, not the SR reference frame).
-            dngResult = dngRaw?.let { resultFor(it) },
+            // The DNG's metadata is its own frame's result (super-resolution: frame 0, not the SR reference frame). A merge DNG
+            // carries the reference frame's.
+            dngResult = dngRaw?.let { if (it === merged) refResult else resultFor(it) },
             fallbackRaw = fallbackRaw,
             fallbackResult = fallbackRaw?.let { f -> if (run.merge.superRes != null) resultFor(f) else refResult },
             fallbackReason = when {
@@ -1685,7 +1744,7 @@ class ViewfinderController(
             srStats = srStats,
             srError = if (run.merge.superRes != null && srImage == null) run.merge.error ?: "superres: no result" else null
         )
-        queueSave(p, buildShot(p, result, jpeg, ch, capture, SystemClock.elapsedRealtime(), keep))
+        queueSave(p, buildShot(p, result, jpeg, ch, capture, SystemClock.elapsedRealtime(), keep, dngScale, dngLabel))
     }
 
     private fun buildShot(
@@ -1695,7 +1754,9 @@ class ViewfinderController(
         ch: CameraCharacteristics,
         burst: BurstCapture?,
         queuedAtMs: Long,
-        keep: List<ByteBuffer>
+        keep: List<ByteBuffer>,
+        dngScale: Float = 1f,
+        dngLabel: String = "single frame"
     ): StillShot {
         val r = p.request
         val plan = p.plan
@@ -1739,7 +1800,14 @@ class ViewfinderController(
             superRes = p.superRes,
             release = { buffers.releaseAll() },
             releaseRaw = { k -> buffers.releaseExcept(k) },
-            meterRegion = p.meterRegion
+            meterRegion = p.meterRegion,
+            formats = saveFormats,
+            dngScale = dngScale,
+            dngSourceLabel = if (saveFormats?.dngSource == DngSource.MERGE && dngScale == 1f && burst == null) {
+                "single frame (no burst for this shot)"
+            } else {
+                dngLabel
+            }
         )
     }
 

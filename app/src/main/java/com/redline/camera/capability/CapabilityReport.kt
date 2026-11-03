@@ -2,6 +2,7 @@ package com.redline.camera.capability
 
 import com.redline.camera.capture.BurstReport
 import com.redline.camera.capture.CaptureStats
+import com.redline.camera.capture.SaveFormatsReport
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.look.LookPreviewReport
@@ -44,7 +45,9 @@ data class CapabilityState(
     /** B23 super-resolution at 50/70 mm: availability, self-check, per-shot coverage and timings, gates. */
     val superRes: SuperResReport = SuperResReport(),
     /** B24b touch focus / metering: capability, last tap, AF state, time to focus, lock, resets. */
-    val touchFocus: TouchFocusReport = TouchFocusReport()
+    val touchFocus: TouchFocusReport = TouchFocusReport(),
+    /** B25 save formats: settings, availability (HEIF encoder, Ultra HDR API), gain map headroom/skips/timing, file sizes. */
+    val saveFormats: SaveFormatsReport = SaveFormatsReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -81,6 +84,7 @@ object CapabilityReport {
         out["burst"] = state.burst.toMap()
         out["superres"] = state.superRes.toMap()
         out["touch_focus"] = state.touchFocus.toMap()
+        out["save_formats"] = state.saveFormats.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

@@ -116,7 +116,9 @@ data class ShotResult(
     val superRes: SuperResShot? = null,
     /** B24.1: how long the press waited for memory (a pool buffer or a holding-queue slot) and why; null = it did not. */
     val memoryWaitMs: Long? = null,
-    val memoryWaitReason: String? = null
+    val memoryWaitReason: String? = null,
+    /** B25: the formats written (photo format, Ultra HDR gain map, DNG source), sizes and gain map timing; null = B24 path. */
+    val formats: FormatsShot? = null
 ) {
     fun summary(): String = when {
         dropped != null && shutterBlocked -> "Not taken: $dropped"
@@ -124,8 +126,15 @@ data class ShotResult(
         !ok -> "Capture failed: ${error ?: "unknown"}"
         else -> buildString {
             append(if (kept) "Saved " else "Captured ")
-            append("JPEG ${jpegSize ?: "?"}")
-            if (dngWanted) append(if (dngSaved) " + DNG" else " (DNG failed: ${error ?: "?"})")
+            val f = formats
+            when {
+                f == null -> append("JPEG ${jpegSize ?: "?"}")
+                f.settings.photo -> append("${if (f.heifError != null) "JPEG" else f.settings.photoFormat.label} ${jpegSize ?: "?"}")
+                else -> append("DNG only")
+            }
+            if (f != null && f.settings.photo && f.ultraHdrWritten) append(" Ultra HDR +%.1f".format(f.headroomStops ?: 0.0))
+            if (dngWanted && (f == null || f.settings.photo)) append(if (dngSaved) " + DNG" else " (DNG failed: ${error ?: "?"})")
+            if (f?.dngLevels != null && dngSaved) append(" (merge)")
             shutterToSavedMs?.let { append(" in $it ms") }
             colour?.let { append(if (it.rendered) " · RAW look" else " · camera JPEG (${it.fallbackReason ?: "?"})") }
             burst?.let { b ->

@@ -11,6 +11,7 @@
 #include "burst_merge.h"
 #include "cube_parser.h"
 #include "detail.h"
+#include "gainmap.h"
 #include "raw_pipeline.h"
 #include "superres.h"
 
@@ -84,6 +85,35 @@ private:
     jsize n_ = 0;
 };
 
+// B25: the gain map accumulation for a render: `out` holds cellsW * cellsH cell sums plus one trailing value (the slope
+// the render measured); null = no gain map. The sums are copied back after the render (copyGainMap).
+struct GainMapOut {
+    std::vector<float> sums;
+    redline::GainMapAccum accum;
+    bool on = false;
+};
+
+std::string prepareGainMap(JNIEnv* env, jfloatArray out, jfloat kneeEv, int width, int height, GainMapOut& g) {
+    if (out == nullptr) return "";
+    const int k = redline::GainMapAccum::kCell;
+    const int cw = (width + k - 1) / k, ch = (height + k - 1) / k;
+    if (env->GetArrayLength(out) != cw * ch + 1) return "gain map array size does not match the output";
+    g.sums.assign(static_cast<std::size_t>(cw) * ch, 0.0f);
+    g.accum.sums = g.sums.data();
+    g.accum.cellsW = cw;
+    g.accum.cellsH = ch;
+    g.accum.kneeEv = kneeEv;
+    g.on = true;
+    return "";
+}
+
+void copyGainMap(JNIEnv* env, jfloatArray out, const GainMapOut& g) {
+    if (!g.on) return;
+    env->SetFloatArrayRegion(out, 0, static_cast<jsize>(g.sums.size()), g.sums.data());
+    const jfloat slope = g.accum.slope;
+    env->SetFloatArrayRegion(out, static_cast<jsize>(g.sums.size()), 1, &slope);
+}
+
 // Fills RawInput from the Kotlin arguments; returns an error message or "".
 std::string rawInput(JNIEnv* env, jobject buffer, jint width, jint height, jint rowStrideBytes, jint cfa, const Floats& black,
                      jfloat white, const Floats& shading, jint shadingRows, jint shadingCols, redline::RawInput& in) {
@@ -154,7 +184,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     JNIEnv* env, jclass, jobject buffer, jint width, jint height, jint rowStrideBytes, jint cfa, jfloatArray black,
     jfloat white, jfloatArray shading, jint shadingRows, jint shadingCols, jintArray crop, jfloatArray matrix,
     jfloatArray neutral, jfloat gain, jfloatArray curve, jfloat curveLo, jfloat curveHi, jfloatArray lut, jint lutSize,
-    jint threads, jobject bitmap, jfloatArray vignette) {
+    jint threads, jobject bitmap, jfloatArray vignette, jfloat gainMapKneeEv, jfloatArray gainMapOut) {
     const Floats b(env, black), sh(env, shading), m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut), vg(env, vignette);
     redline::RawInput in;
     redline::RenderSpec spec;
@@ -183,12 +213,17 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
         spec.vignette = vg.get();
         spec.vignettePoints = vg.size();
     }
+    GainMapOut gm;  // B25
+    err = prepareGainMap(env, gainMapOut, gainMapKneeEv, spec.outWidth, spec.outHeight, gm);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    if (gm.on) spec.gainMap = &gm.accum;
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
         return env->NewStringUTF("could not lock the bitmap");
     }
     err = redline::renderRaw(in, spec, static_cast<std::uint8_t*>(pixels), info.stride);
     AndroidBitmap_unlockPixels(env, bitmap);
+    if (err.empty()) copyGainMap(env, gainMapOut, gm);
     return err.empty() ? nullptr : env->NewStringUTF(err.c_str());
 }
 
@@ -557,7 +592,8 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
 // Renders the finished merge into `bitmap` (ARGB_8888 at the output size) through B21 stages 4-8.
 extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeSrRender(
     JNIEnv* env, jclass, jlong handle, jfloatArray matrix, jfloatArray neutral, jfloat gain, jfloatArray curve, jfloat curveLo,
-    jfloat curveHi, jfloatArray lut, jint lutSize, jint threads, jobject bitmap, jfloatArray vignette) {
+    jfloat curveHi, jfloatArray lut, jint lutSize, jint threads, jobject bitmap, jfloatArray vignette, jfloat gainMapKneeEv,
+    jfloatArray gainMapOut) {
     auto* h = reinterpret_cast<SrHandle*>(handle);
     if (h == nullptr || !h->finished) return env->NewStringUTF("no finished merge");
     const Floats m(env, matrix), n(env, neutral), cv(env, curve), lt(env, lut), vg(env, vignette);
@@ -587,12 +623,17 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
         spec.vignette = vg.get();
         spec.vignettePoints = vg.size();
     }
+    GainMapOut gm;  // B25
+    std::string err = prepareGainMap(env, gainMapOut, gainMapKneeEv, spec.outWidth, spec.outHeight, gm);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    if (gm.on) spec.gainMap = &gm.accum;
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
         return env->NewStringUTF("could not lock the bitmap");
     }
-    const std::string err = redline::renderLinear(h->linear(), spec, static_cast<std::uint8_t*>(pixels), info.stride);
+    err = redline::renderLinear(h->linear(), spec, static_cast<std::uint8_t*>(pixels), info.stride);
     AndroidBitmap_unlockPixels(env, bitmap);
+    if (err.empty()) copyGainMap(env, gainMapOut, gm);
     return err.empty() ? nullptr : env->NewStringUTF(err.c_str());
 }
 
@@ -731,4 +772,56 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_Re
     if (out == nullptr) return nullptr;
     env->SetFloatArrayRegion(out, 0, kN, v);
     return out;
+}
+
+// ---------------------------------------------------------------------------------------------------- B25 Ultra HDR gain map
+
+// Encodes the cell sums (gainMapOut of a render, without its trailing slope) into `out` (cellsW x cellsH bytes, rows
+// `outStride` apart). Returns [written 1/0, headroom stops, p99.9 stops, max stops, fraction of cells above the knee,
+// skip code (0 none, 1 no highlights above the knee, 2 headroom below minStops)]; throws IllegalArgumentException.
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeFinishGainMap(
+    JNIEnv* env, jclass, jfloatArray sums, jint outWidth, jint outHeight, jfloat capStops, jfloat minStops, jbyteArray out,
+    jint outStride) {
+    const Floats s(env, sums);
+    const int k = redline::GainMapAccum::kCell;
+    const int cw = (outWidth + k - 1) / k, ch = (outHeight + k - 1) / k;
+    if (s.get() == nullptr || s.size() < cw * ch || out == nullptr || env->GetArrayLength(out) < outStride * ch) {
+        throwIllegalArgument(env, "gain map buffers mis-sized");
+        return nullptr;
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(outStride) * ch, 0);
+    redline::GainMapResult r;
+    const std::string err = redline::finishGainMap(s.get(), cw, ch, outWidth, outHeight, capStops, minStops, bytes.data(),
+                                                   static_cast<std::size_t>(outStride), r);
+    if (!err.empty()) {
+        throwIllegalArgument(env, err);
+        return nullptr;
+    }
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
+    const jfloat skip = r.written ? 0.0f : (r.aboveKneeFraction == 0.0f ? 1.0f : 2.0f);
+    const jfloat v[6] = {r.written ? 1.0f : 0.0f, r.headroomStops, r.p999Stops, r.maxStops, r.aboveKneeFraction, skip};
+    jfloatArray res = env->NewFloatArray(6);
+    if (res == nullptr) return nullptr;
+    env->SetFloatArrayRegion(res, 0, 6, v);
+    return res;
+}
+
+// Warps the gain map in place with the still's RAW-feel distortion (lensfun ptlens a, b, c at the still's size).
+// Returns null on success, else the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeWarpGainMap(
+    JNIEnv* env, jclass, jbyteArray map, jint mapWidth, jint mapHeight, jint mapStride, jint imageWidth, jint imageHeight, jfloat distA,
+    jfloat distB, jfloat distC) {
+    if (map == nullptr || env->GetArrayLength(map) < mapStride * mapHeight) return env->NewStringUTF("gain map mis-sized");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(env->GetArrayLength(map)));
+    env->GetByteArrayRegion(map, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<jbyte*>(bytes.data()));
+    redline::DetailSpec spec;
+    spec.distort = true;
+    spec.distA = distA;
+    spec.distB = distB;
+    spec.distC = distC;
+    const std::string err =
+        redline::warpGainMap(bytes.data(), mapWidth, mapHeight, static_cast<std::size_t>(mapStride), imageWidth, imageHeight, spec);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    env->SetByteArrayRegion(map, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
+    return nullptr;
 }
