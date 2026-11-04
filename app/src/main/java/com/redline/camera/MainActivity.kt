@@ -823,6 +823,7 @@ class MainActivity : ComponentActivity() {
                 onSaveSetting = ::changeSaveSetting,
                 onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
                 onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
+                onToggleDepth = ::toggleDepth,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
                     {
                         burstStressPending = true

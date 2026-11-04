@@ -158,7 +158,10 @@ data class DepthReport(
     val maxTotalMs: Long = 0,
     val storedBytes: Long = 0,
     val lastError: String? = null,
-    val recent: List<DepthShot> = emptyList()
+    val recent: List<DepthShot> = emptyList(),
+    /** The most recent skip reason, and whether the latest event was a skip (not a shot). */
+    val lastSkip: String? = null,
+    val lastWasSkip: Boolean = false
 ) {
     fun record(s: DepthShot): DepthReport = copy(
         shots = shots + 1,
@@ -169,10 +172,30 @@ data class DepthReport(
         maxTotalMs = if (s.ok) maxOf(maxTotalMs, s.totalMs) else maxTotalMs,
         storedBytes = storedBytes + (s.storedBytes ?: 0L),
         lastError = if (s.ok) lastError else s.error,
-        recent = (recent + s).takeLast(RECENT)
+        recent = (recent + s).takeLast(RECENT),
+        lastWasSkip = false
     )
 
-    fun skip(reason: String): DepthReport = copy(skips = skips + (reason to (skips[reason] ?: 0) + 1))
+    fun skip(reason: String): DepthReport =
+        copy(skips = skips + (reason to (skips[reason] ?: 0) + 1), lastSkip = reason, lastWasSkip = true)
+
+    /** The info screen's one line: on/off, delegate, then the last shot (depth ms, confidence) or the last skip. */
+    fun statusLine(): String {
+        if (!enabled) return "Off"
+        val delegate = when {
+            engine == null -> "engine loads on first shot"
+            engine.delegate == null -> "engine failed: ${engine.error ?: "self-check"}"
+            else -> engine.delegate
+        }
+        val last = recent.lastOrNull()
+        val tail = when {
+            lastWasSkip -> "last skipped: $lastSkip"
+            last == null -> "no shots yet"
+            last.ok -> "last ${last.depthMs} ms depth (${last.totalMs} ms total), confidence %.2f".format(last.confidence ?: 0.0)
+            else -> "last failed: ${last.error}"
+        }
+        return "On · $delegate · $tail"
+    }
 
     /** The B30 gate: depth (the model) under [GATE_MS] on every shot it ran. Null before any shot. */
     val gatePassed: Boolean? get() = if (done == 0) null else maxDepthMs < GATE_MS
@@ -193,6 +216,8 @@ data class DepthReport(
         "gate_depth_lt_400_ms" to gatePassed,
         "stored_bytes" to storedBytes,
         "last_error" to lastError,
+        "last_skip" to lastSkip,
+        "status" to statusLine(),
         "last" to recent.lastOrNull()?.toMap(),
         "recent_shots" to recent.map { it.toMap() }
     )
