@@ -6,6 +6,7 @@ import com.redline.camera.capture.SaveFormatsReport
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.depth.DepthReport
+import com.redline.camera.depth.HardwareDepth
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
 import com.redline.camera.viewfinder.TouchFocusReport
@@ -88,7 +89,7 @@ object CapabilityReport {
         out["superres"] = state.superRes.toMap()
         out["touch_focus"] = state.touchFocus.toMap()
         out["save_formats"] = state.saveFormats.toMap()
-        out["depth"] = state.depth.toMap()
+        out["depth"] = state.depth.copy(hardware = state.depth.hardware ?: HardwareDepth.of(profile)).toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

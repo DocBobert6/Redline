@@ -1,5 +1,7 @@
 package com.redline.camera.depth
 
+import com.redline.camera.capability.DeviceProfile
+
 /**
  * B30: how the depth engine came up: which accelerator passed the self-check (GPU fp16 -> GPU fp32 -> CPU), what each
  * attempt measured or why it failed, and the models. Pure JVM (host-tested).
@@ -128,6 +130,16 @@ data class HardwareDepth(val depthOutputCameras: List<String>, val logicalMultiC
             "DEPTH_OUTPUT present but not used yet (monocular model is the depth source)"
         }
     )
+
+    companion object {
+        /** Read from the profile's per-camera capabilities; null before the profile has loaded. */
+        fun of(profile: DeviceProfile?): HardwareDepth? = profile?.let { p ->
+            HardwareDepth(
+                depthOutputCameras = p.cameras.filter { it.has("DEPTH_OUTPUT") }.map { it.id },
+                logicalMultiCameras = p.cameras.filter { it.has("LOGICAL_MULTI_CAMERA") }.map { it.id }
+            )
+        }
+    }
 }
 
 /** B30: the report's "depth" section. */
