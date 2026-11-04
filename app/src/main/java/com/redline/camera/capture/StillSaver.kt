@@ -165,7 +165,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
     /**
      * B30: depth sidecars. When [depthEnabled] and [depth] is set, a kept shot rendered from RAW gets depth prep from
      * its rendered still right after the photo is saved (before the bitmap is recycled) and the models run on the
-     * depth lane, off the save path. Off by default; the caller sets both.
+     * depth lane, off the save path. Off until the caller sets both (the app setting "depth_enabled" defaults on).
      */
     @Volatile var depthEnabled: Boolean = false
 

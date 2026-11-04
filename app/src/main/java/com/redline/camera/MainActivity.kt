@@ -60,6 +60,8 @@ import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.colour.DetailSettings
 import com.redline.camera.colour.ProfileChoice
+import com.redline.camera.depth.DepthReport
+import com.redline.camera.depth.DepthService
 import com.redline.camera.look.CubeLut
 import com.redline.camera.look.LookPreviewRenderer
 import com.redline.camera.look.LookPreviewReport
@@ -229,6 +231,8 @@ class MainActivity : ComponentActivity() {
 
     // B23 super-resolution at 50/70 mm (main thread): the setting and its native self-check.
     private var superResSetting = true
+    private var depthSetting = DepthReport.DEFAULT_ON
+    private lateinit var depthService: DepthService
     private var superResChecked = false
 
     /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
@@ -457,6 +461,11 @@ class MainActivity : ComponentActivity() {
         colourSetting = prefs.getBoolean(PREF_COLOUR_PIPELINE, true)
         burstSetting = prefs.getBoolean(PREF_BURST_MERGE, true)
         superResSetting = prefs.getBoolean(PREF_SUPER_RES, true)
+        depthSetting = prefs.getBoolean(PREF_DEPTH, DepthReport.DEFAULT_ON)
+        depthService = DepthService.shared(this)
+        depthService.setEnabled(depthSetting)
+        depthService.onChange = { r -> runOnUiThread { state.value = state.value.copy(depth = r) } }
+        controller.setDepth(depthService, depthSetting)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
         detailSetting = DetailSettings(
@@ -693,6 +702,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // The depth lane outlives the activity (app lifetime); only drop this instance's listener.
+        depthService.onChange = null
         mainHandler.removeCallbacks(checksFallback)
         mainHandler.removeCallbacks(lookPrepareTimeout)
         // The renderer owns the camera's SurfaceTexture on the look path: release it once the camera has closed.
@@ -1493,6 +1504,14 @@ class MainActivity : ComponentActivity() {
         syncSuperRes()
     }
 
+    /** B30: depth sidecars on/off; runs off the save path, so the default is on. Takes effect at the next shot. */
+    private fun toggleDepth() {
+        depthSetting = !depthSetting
+        prefs.edit { putBoolean(PREF_DEPTH, depthSetting) }
+        depthService.setEnabled(depthSetting)
+        controller.setDepth(depthService, depthSetting)
+    }
+
     private fun superResEnabled(): Boolean = state.value.superRes.enabled && colourEnabled()
 
     private fun syncSuperRes() {
@@ -1799,6 +1818,7 @@ class MainActivity : ComponentActivity() {
         private const val PREF_COLOUR_PIPELINE = "colour_pipeline"
         private const val PREF_BURST_MERGE = "burst_merge"
         private const val PREF_SUPER_RES = "super_resolution"
+        private const val PREF_DEPTH = "depth_enabled"
         private const val PREF_DETAIL_VIGNETTE = "detail_vignette"
         private const val PREF_DETAIL_SHARPEN = "detail_sharpen"
         private const val PREF_DETAIL_GRAIN = "detail_grain"

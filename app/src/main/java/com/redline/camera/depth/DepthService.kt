@@ -48,6 +48,12 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
 
     fun skip(reason: String) = update { it.skip(reason) }
 
+    /** Called (on whichever thread changed it) after every report change: a shot recorded, a skip, the engine up. */
+    @Volatile var onChange: ((DepthReport) -> Unit)? = null
+
+    /** Mirrors the user setting into the report (the saver's own flag gates the work). */
+    fun setEnabled(on: Boolean) = update { it.copy(enabled = on) }
+
     /**
      * Starts depth for a saved shot from its rendered [still] ([rotation] = clockwise degrees to upright, the JPEG
      * orientation). Returns quickly; never throws. Skips (recorded) when a job is still running.
@@ -228,11 +234,19 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
     }
 
     private fun update(f: (DepthReport) -> DepthReport) {
-        synchronized(lock) { state = f(state) }
+        val now = synchronized(lock) { f(state).also { state = it } }
+        onChange?.let { cb -> runCatching { cb(now) } }
     }
 
     companion object {
         private const val TAG = "RedlineDepth"
+
+        @Volatile private var instance: DepthService? = null
+
+        /** The app-lifetime depth lane (one worker, one engine) shared by every activity instance. */
+        fun shared(context: Context): DepthService = instance ?: synchronized(this) {
+            instance ?: DepthService(context.applicationContext).also { instance = it }
+        }
         const val DIR = "depth"
         const val SUFFIX = ".depth.png"
         const val KEEP_SIDECARS = 20
