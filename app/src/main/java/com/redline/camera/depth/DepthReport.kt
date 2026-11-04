@@ -103,7 +103,7 @@ data class DepthShot(
     )
 
     fun summary(): String = if (ok) {
-        "depth ${depthMs} ms ($delegate), seg $segMs ms, total $totalMs ms, confidence %.2f%s, %d KB".format(
+        "depth $depthMs ms ($delegate), seg $segMs ms, total $totalMs ms, confidence %.2f%s, %d KB".format(
             confidence ?: 0.0,
             if (usable == true) "" else " (below 0.35: no bokeh)",
             (storedBytes ?: 0L) / 1024

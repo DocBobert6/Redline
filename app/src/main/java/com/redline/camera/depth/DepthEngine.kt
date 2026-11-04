@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision
 import com.google.ai.edge.litert.Environment
 import com.google.ai.edge.litert.TensorBuffer
 import java.io.Closeable
@@ -175,7 +176,7 @@ class DepthEngine private constructor(
             CPU -> CompiledModel.Options(Accelerator.CPU)
             else -> CompiledModel.Options(Accelerator.GPU).apply {
                 gpuOptions = CompiledModel.GpuOptions(
-                    precision = if (delegate == GPU_FP16) CompiledModel.GpuOptions.Precision.FP16 else CompiledModel.GpuOptions.Precision.FP32
+                    precision = if (delegate == GPU_FP16) Precision.FP16 else Precision.FP32
                 )
             }
         }
