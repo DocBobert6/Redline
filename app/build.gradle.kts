@@ -98,6 +98,7 @@ dependencies {
     implementation(libs.camerax.lifecycle)
     implementation(libs.litert)
     implementation(libs.litert.gpu)
+    implementation(libs.androidx.fragment)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)

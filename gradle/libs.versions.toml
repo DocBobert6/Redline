@@ -11,6 +11,7 @@ androidxTestExt = "1.3.0"
 androidxTestRunner = "1.7.0"
 ktlintGradle = "14.2.0"
 litert = "2.3.2"
+fragment = "1.8.9"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -29,6 +30,8 @@ androidx-test-runner = { module = "androidx.test:runner", version.ref = "android
 compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
 compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
+# LiteRT pulls an old androidx.fragment (via Play ai-delivery); pin it so registerForActivityResult lints clean.
+androidx-fragment = { module = "androidx.fragment:fragment", version.ref = "fragment" }
 litert-gpu = { module = "com.google.ai.edge.litert:litert-gpu", version.ref = "litert" }
 
 [plugins]
