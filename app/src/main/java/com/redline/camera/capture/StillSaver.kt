@@ -21,6 +21,8 @@ import android.util.Size
 import com.redline.camera.capability.Dim
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourShot
+import com.redline.camera.depth.DepthReport
+import com.redline.camera.depth.DepthService
 import com.redline.camera.nativebridge.RedlineNative
 import com.redline.camera.viewfinder.NormRect
 import java.io.ByteArrayInputStream
@@ -159,6 +161,15 @@ class StagedShot(
 class StillSaver(context: Context, private val version: String, private val pipeline: ColourPipeline? = null) {
     private val app = context.applicationContext
     private val resolver = app.contentResolver
+
+    /**
+     * B30: depth sidecars. When [depthEnabled] and [depth] is set, a kept shot rendered from RAW gets depth prep from
+     * its rendered still right after the photo is saved (before the bitmap is recycled) and the models run on the
+     * depth lane, off the save path. Off until the caller sets both (the app setting "depth_enabled" defaults on).
+     */
+    @Volatile var depthEnabled: Boolean = false
+
+    @Volatile var depth: DepthService? = null
 
     /** Render then store on the calling thread (the two lanes in one). Never throws; always calls [StillShot.release]. */
     fun save(shot: StillShot, nowMs: () -> Long): ShotResult = store(render(shot, nowMs), nowMs)
@@ -444,6 +455,20 @@ class StillSaver(context: Context, private val version: String, private val pipe
         )
     }
 
+    /** B30: hands a saved, kept, RAW-rendered still to the depth lane (prep runs here, the models there). Never throws. */
+    private fun startDepth(shot: StillShot, base: String, still: Bitmap?, saved: Boolean) {
+        val svc = depth ?: return
+        if (!depthEnabled) return
+        runCatching {
+            when {
+                !saved -> svc.skip(DepthReport.SKIP_NO_PHOTO)
+                still == null || still.isRecycled -> svc.skip(DepthReport.SKIP_NOT_RENDERED)
+                !shot.keep -> svc.skip(DepthReport.SKIP_NOT_KEPT)
+                else -> svc.submit(still, shot.jpegOrientation, base)
+            }
+        }.onFailure { Log.w(TAG, "depth hand-off failed", it) }
+    }
+
     private fun storeInner(staged: StagedShot, nowMs: () -> Long): ShotResult {
         val shot = staged.shot
         val storeStart = nowMs()
@@ -484,6 +509,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 error = "${shot.photoFormat.label}: ${e.javaClass.simpleName}: ${e.message}"
                 false
             } finally {
+                startDepth(shot, staged.base, staged.rendered, photo != null)
                 staged.rendered?.recycle()
                 staged.rendered = null
             }

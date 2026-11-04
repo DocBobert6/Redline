@@ -4,3 +4,6 @@
 -keepclasseswithmembernames,includedescriptorclasses class com.redline.camera.nativebridge.RedlineNative {
     native <methods>;
 }
+# B30 LiteRT: JNI-bound runtime classes.
+-keep class com.google.ai.edge.litert.** { *; }
+-dontwarn com.google.ai.edge.litert.**

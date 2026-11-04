@@ -69,6 +69,7 @@ import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.capture.identitySet
 import com.redline.camera.colour.ColourMath
 import com.redline.camera.colour.ColourPipeline
+import com.redline.camera.depth.DepthService
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.nativebridge.RedlineNative
@@ -639,6 +640,12 @@ class ViewfinderController(
     /** B22 burst merge on/off (the setting, its self-check and the B21 pipeline all on); takes effect at the next shot. */
     fun setBurst(on: Boolean) {
         handler.post { burstWanted = on }
+    }
+
+    /** B30: the app-lifetime depth lane and whether kept RAW-rendered shots get a depth sidecar (next shot on). */
+    fun setDepth(service: DepthService?, on: Boolean) {
+        saver.depth = service
+        saver.depthEnabled = on && service != null
     }
 
     /** B23 super-resolution at 50/70 mm on/off (the setting and its self-check passed); takes effect at the next shot. */

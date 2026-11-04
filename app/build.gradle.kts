@@ -73,6 +73,11 @@ android {
         buildConfig = true
     }
 
+    androidResources {
+        // B30: depth/segmenter models are memory-mapped by LiteRT.
+        noCompress += "tflite"
+    }
+
     lint {
         abortOnError = true
         warningsAsErrors = false
@@ -91,6 +96,9 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     implementation(libs.camerax.camera2)
     implementation(libs.camerax.lifecycle)
+    implementation(libs.litert)
+    implementation(libs.litert.gpu)
+    implementation(libs.androidx.fragment)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)

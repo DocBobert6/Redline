@@ -33,6 +33,7 @@ import com.redline.camera.capture.SaveFormatsReport
 import com.redline.camera.capture.SaveFormatsUi
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
+import com.redline.camera.depth.DepthReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
@@ -57,6 +58,7 @@ fun CapabilityScreen(
     onSaveSetting: ((String) -> Unit)? = null,
     onToggleBurst: (() -> Unit)? = null,
     onToggleSuperRes: (() -> Unit)? = null,
+    onToggleDepth: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
@@ -210,6 +212,9 @@ fun CapabilityScreen(
                 }
                 item {
                     SuperResCard(state.superRes, onToggleSuperRes)
+                }
+                item {
+                    DepthCard(state.depth, onToggleDepth)
                 }
                 item {
                     LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
@@ -517,6 +522,23 @@ private fun SuperResCard(r: SuperResReport, onToggle: (() -> Unit)?) {
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(SUPER_RES_TOGGLE_TAG)) {
                 Text("Turn super-resolution ${if (r.userSetting) "off" else "on"} (default on when its self-check passes)")
+            }
+        }
+    }
+}
+
+const val DEPTH_SECTION_TITLE = "Depth"
+const val DEPTH_TOGGLE_TAG = "depth_toggle"
+const val DEPTH_STATUS_TAG = "depth_status"
+
+/** B30: depth sidecars on/off and one status line (delegate, last depth ms and confidence, or why it skipped). */
+@Composable
+private fun DepthCard(r: DepthReport, onToggle: (() -> Unit)?) {
+    SectionCard(DEPTH_SECTION_TITLE) {
+        Text(r.statusLine(), modifier = Modifier.testTag(DEPTH_STATUS_TAG))
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(DEPTH_TOGGLE_TAG)) {
+                Text("Turn depth ${if (r.enabled) "off" else "on"} (default on; runs after the photo is saved)")
             }
         }
     }
