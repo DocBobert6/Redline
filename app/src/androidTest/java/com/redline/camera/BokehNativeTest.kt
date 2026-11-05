@@ -42,7 +42,7 @@ class BokehNativeTest {
         val hi = 1f
         val n = 256
         val curve = FloatArray(n) { i ->
-            val x = 2.0.pow(lo + (hi - lo) * i / (n - 1) - hi)
+            val x = 2.0.pow((lo + (hi - lo) * i / (n - 1) - hi).toDouble())
             val y = if (x <= 0.0031308) 12.92 * x else 1.055 * x.pow(1 / 2.4) - 0.055
             y.coerceIn(0.0, 1.0).toFloat()
         }
