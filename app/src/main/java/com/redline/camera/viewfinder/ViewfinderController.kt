@@ -70,6 +70,7 @@ import com.redline.camera.capture.identitySet
 import com.redline.camera.colour.ColourMath
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.depth.DepthService
+import com.redline.camera.dof.DofStage
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.nativebridge.RedlineNative
@@ -646,6 +647,18 @@ class ViewfinderController(
     fun setDepth(service: DepthService?, on: Boolean) {
         saver.depth = service
         saver.depthEnabled = on && service != null
+    }
+
+    /**
+     * B31: simulated depth of field on the save path (null = off). Its depth and bokeh work runs under the worker
+     * governor (3 threads at nice 5 while a capture backs the queue up, else up to [DofStage.MAX_THREADS]); a shot with
+     * others queued behind it (rapid fire) or under system memory pressure is saved sharp instead of delayed.
+     */
+    fun setDof(stage: DofStage?) {
+        saver.dofBudget = { budget(DofStage.MAX_THREADS) }
+        saver.dofQueuedBehind = { maxOf(0, loadProcessing - 1) + loadCapturing }
+        saver.dofLowMemory = { systemLowOnMemory() }
+        saver.dof = stage
     }
 
     /** B23 super-resolution at 50/70 mm on/off (the setting and its self-check passed); takes effect at the next shot. */

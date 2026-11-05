@@ -44,7 +44,13 @@ class ColourPipeline(context: Context) {
         val detailError: String? = null
     )
 
-    class Outcome(val bitmap: Bitmap?, val shot: ColourShot, val hdr: HdrMap? = null)
+    class Outcome(val bitmap: Bitmap?, val shot: ColourShot, val hdr: HdrMap? = null, val tone: RenderTone? = null)
+
+    /**
+     * B31: the tone curve a still was rendered with (the native table on log2 gained linear values [lo]..[hi], encoded
+     * output) and the B25 knee, so the bokeh can invert it and render in linear light.
+     */
+    class RenderTone(val table: FloatArray, val lo: Float, val hi: Float, val kneeEv: Float)
 
     /**
      * B25: the Ultra HDR gain map of a render: the encoded map ([bytes] null when not worth writing, [skip] says why), the
@@ -254,7 +260,8 @@ class ColourPipeline(context: Context) {
                     iso = sensitivity(result),
                     stopMm = stopMm
                 ),
-                cells?.let { finishHdr(it) }
+                cells?.let { finishHdr(it) },
+                RenderTone(table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), ColourMath.KNEE_EV.toFloat())
             )
         } catch (e: Exception) {
             fail("${e.javaClass.simpleName}: ${e.message}")
@@ -386,7 +393,8 @@ class ColourPipeline(context: Context) {
                     iso = sensitivity(result),
                     stopMm = stopMm
                 ),
-                cells?.let { finishHdr(it) }
+                cells?.let { finishHdr(it) },
+                RenderTone(table, ColourMath.EV_MIN.toFloat(), tn.curve.clipEv.toFloat(), ColourMath.KNEE_EV.toFloat())
             )
         } catch (e: Exception) {
             fail("${e.javaClass.simpleName}: ${e.message}")
