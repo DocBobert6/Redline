@@ -108,3 +108,24 @@ def test_native_finish_matches_reference(tmp_path, rot):
     assert float(v["spread"]) == pytest.approx(a.spread, rel=1e-4)
     assert float(v["person_nearer"]) == pytest.approx(a.person_nearer, abs=1e-4)
     assert float(v["edge_agree"]) == pytest.approx(a.edge_agree, abs=1e-3)
+
+
+def test_matte_path_person_dominant_and_flat_wall():
+    """B31.1: a person filling much of the frame on a floor as near as they are passes on the matte (the depth term alone
+    collapses); a flat wall, and a flat wall with an undecided mask, still fail; the 0.35 threshold is unchanged."""
+    h, w = 120, 200
+    yy, xx = np.mgrid[0:h, 0:w]
+    inside = (xx >= 20) & (xx < 180) & (yy >= 10) & (yy < 110)
+    depth = 0.5 + 1.0 * yy / h
+    mask = inside.astype(np.float64)
+    rgb = np.repeat(np.where(inside, 0.75, 0.2)[..., None], 3, 2)
+    a = dp.analyse(depth, mask, rgb)
+    assert a.depth_confidence < dp.USABLE
+    assert a.usable and a.matte_score > 0.9
+    wall = 1.0 + 0.002 * xx / w
+    flat = dp.analyse(wall, np.zeros((h, w)), np.full((h, w, 3), 0.5))
+    assert not flat.usable and flat.matte_score == 0.0
+    unsure = np.where(xx < 70, 0.45 + 0.15 * ((xx + yy) % 2), 0.0)
+    u = dp.analyse(wall, unsure, np.full((h, w, 3), 0.5))
+    assert not u.usable and u.mask_clarity < 0.4
+    assert dp.USABLE == 0.35

@@ -29,6 +29,9 @@ struct DepthAnalysis {
     float confidence = 0, p2 = 0, p98 = 0, spread = 0, rangeScore = 0;
     float edgeAgree = -1, edgeScore = 0.5f;
     float personCoverage = 0, personNearer = -1, personScore = 1;
+    // B31.1: mask clarity (1 - mean 4m(1-m) where m > 0.05), the matte score and the two candidate confidences
+    // (depth: range x edges x person; matte: person-dominant clear mask); confidence = the larger.
+    float maskClarity = 0, matteScore = 0, depthConfidence = 0, matteConfidence = 0;
     float dmin = 0, dmax = 0;
     bool usable = false;
 };

@@ -913,7 +913,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
 // The model outputs -> packed RGB16 (depth, person mask, confidence) in the still's pixel orientation, warped with
 // distortion (a, b, c; null = none). out receives outW * outH * 3 shorts; stats (17 floats): confidence, usable, p2, p98,
 // spread, range score, edge agree (-1 none), edge score, person coverage, person nearer (-1 none), person score, dmin,
-// dmax, outW, outH, ms. Returns null or the error.
+// dmax, outW, outH, ms, then (B31.1, 20 floats) mask clarity, matte score, depth confidence, matte confidence. Returns
+// null or the error.
 extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeDepthFinish(
     JNIEnv* env, jclass, jobject depthOut, jobject segOut, jint segW, jint segH, jobject rgbCanvas, jint canvasW, jint canvasH,
     jintArray rect, jint rot, jint imageW, jint imageH, jfloatArray distortion, jshortArray out, jfloatArray stats) {
@@ -921,7 +922,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     const float* s = directFloats(env, segOut, static_cast<std::size_t>(segW) * segH);
     const float* c = directFloats(env, rgbCanvas, static_cast<std::size_t>(canvasW) * canvasH * 3);
     if (d == nullptr || s == nullptr || c == nullptr) return env->NewStringUTF("model buffers missing or too small");
-    if (rect == nullptr || env->GetArrayLength(rect) < 4 || stats == nullptr || env->GetArrayLength(stats) < 16 || out == nullptr) {
+    if (rect == nullptr || env->GetArrayLength(rect) < 4 || stats == nullptr || env->GetArrayLength(stats) < 20 || out == nullptr) {
         return env->NewStringUTF("rect, stats or out mis-sized");
     }
     jint r[4];
@@ -952,10 +953,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     if (env->GetArrayLength(out) < static_cast<jsize>(packed.size())) return env->NewStringUTF("out too small");
     env->SetShortArrayRegion(out, 0, static_cast<jsize>(packed.size()), reinterpret_cast<const jshort*>(packed.data()));
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    const jfloat v[16] = {a.confidence, a.usable ? 1.0f : 0.0f, a.p2, a.p98, a.spread, a.rangeScore, a.edgeAgree, a.edgeScore,
+    const jfloat v[20] = {a.confidence, a.usable ? 1.0f : 0.0f, a.p2, a.p98, a.spread, a.rangeScore, a.edgeAgree, a.edgeScore,
                           a.personCoverage, a.personNearer, a.personScore, a.dmin, a.dmax, static_cast<jfloat>(ow), static_cast<jfloat>(oh),
-                          static_cast<jfloat>(ms)};
-    env->SetFloatArrayRegion(stats, 0, 16, v);
+                          static_cast<jfloat>(ms), a.maskClarity, a.matteScore, a.depthConfidence, a.matteConfidence};
+    env->SetFloatArrayRegion(stats, 0, 20, v);
     return nullptr;
 }
 
