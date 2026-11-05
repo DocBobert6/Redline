@@ -7,6 +7,7 @@ import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.depth.DepthReport
 import com.redline.camera.depth.HardwareDepth
+import com.redline.camera.dof.DofReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
 import com.redline.camera.viewfinder.TouchFocusReport
@@ -51,7 +52,9 @@ data class CapabilityState(
     /** B25 save formats: settings, availability (HEIF encoder, Ultra HDR API), gain map headroom/skips/timing, file sizes. */
     val saveFormats: SaveFormatsReport = SaveFormatsReport(),
     /** B30 depth sidecars: setting, engine (delegate, self-check), per-shot stage timings, confidence, skips. */
-    val depth: DepthReport = DepthReport()
+    val depth: DepthReport = DepthReport(),
+    /** B31 simulated depth of field: setting, aperture, per-shot applied/skip, depth/bokeh ms, preview fps during the work. */
+    val dof: DofReport = DofReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -90,6 +93,7 @@ object CapabilityReport {
         out["touch_focus"] = state.touchFocus.toMap()
         out["save_formats"] = state.saveFormats.toMap()
         out["depth"] = state.depth.copy(hardware = state.depth.hardware ?: HardwareDepth.of(profile)).toMap()
+        out["dof"] = state.dof.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

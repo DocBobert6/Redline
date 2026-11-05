@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.redline.camera.capability.Dim
+import com.redline.camera.dof.DofMath
 import com.redline.camera.viewfinder.PreviewTextureView
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
@@ -145,7 +146,11 @@ fun ViewfinderScreen(
     /** B24b: tap (long = false) or long-press (long = true) on the preview at (x, y) px of the frame box; null = no touch focus. */
     onTapFrame: ((x: Float, y: Float, long: Boolean) -> Unit)? = null,
     /** B24b: the AF point to draw, or null. */
-    touchBox: TouchBoxUi? = null
+    touchBox: TouchBoxUi? = null,
+    /** B31: the simulated aperture (dial f/2.8-f/22 in 1/3 stops), or null to hide the dial; [dofOn] greys it when off. */
+    aperture: Float? = null,
+    dofOn: Boolean = true,
+    onApertureStep: (Int) -> Unit = {}
 ) {
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     val view = LocalView.current
@@ -289,7 +294,11 @@ fun ViewfinderScreen(
                                 Text("+$shutterWaiting", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                             }
                         }
-                        Spacer(modifier = Modifier.size(width = 88.dp, height = 1.dp))
+                        if (aperture != null) {
+                            ApertureDial(aperture, dofOn, onApertureStep)
+                        } else {
+                            Spacer(modifier = Modifier.size(width = 88.dp, height = 1.dp))
+                        }
                     }
                     if (plan != null) {
                         ZoomRing(plan = plan, selected = selectedStop, onSelect = onSelectStop, modifier = Modifier.fillMaxWidth())
@@ -297,6 +306,39 @@ fun ViewfinderScreen(
                 }
             }
         }
+    }
+}
+
+const val APERTURE_DIAL_TAG = "aperture_dial"
+const val APERTURE_LABEL_TAG = "aperture_label"
+const val APERTURE_DOWN_TAG = "aperture_down"
+const val APERTURE_UP_TAG = "aperture_up"
+
+/** B31: the simulated aperture: the value, and one-third-stop steps either side (no live blur; that is B44). */
+@Composable
+private fun ApertureDial(aperture: Float, on: Boolean, onStep: (Int) -> Unit) {
+    Row(
+        modifier = Modifier.size(width = 88.dp, height = 40.dp).background(Scrim).testTag(APERTURE_DIAL_TAG),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "‹",
+            fontSize = 22.sp,
+            modifier = Modifier.clickable { onStep(-1) }.padding(horizontal = 6.dp).testTag(APERTURE_DOWN_TAG)
+        )
+        Text(
+            DofMath.label(aperture),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (on) Accent else Color.Gray,
+            modifier = Modifier.testTag(APERTURE_LABEL_TAG)
+        )
+        Text(
+            "›",
+            fontSize = 22.sp,
+            modifier = Modifier.clickable { onStep(1) }.padding(horizontal = 6.dp).testTag(APERTURE_UP_TAG)
+        )
     }
 }
 

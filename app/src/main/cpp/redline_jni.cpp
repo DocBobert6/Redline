@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "bokeh.h"
 #include "burst_merge.h"
 #include "cube_parser.h"
 #include "depth_post.h"
@@ -955,5 +956,85 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
                           a.personCoverage, a.personNearer, a.personScore, a.dmin, a.dmax, static_cast<jfloat>(ow), static_cast<jfloat>(oh),
                           static_cast<jfloat>(ms)};
     env->SetFloatArrayRegion(stats, 0, 16, v);
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------------------------------- B31 bokeh
+
+// Simulated depth of field on the rendered still, in place (ARGB_8888). lens (9 floats): focal mm, f-number, focus
+// distance m, focus x, focus y (0..1), phone full-frame-equivalent f-number, far distance m (<= 0: infinity), max CoC
+// (fraction of the width), confidence. tone (4 floats): curveLo, curveHi, kneeEv, slope (0: no HDR); curve: the
+// RenderSpec table; gain: mean log2 HDR gain (gainW x gainH) or null. depth / mask / conf: depthW x depthH (mask, conf
+// nullable). gainOut (nullable, gainW x gainH): the gain map recomputed from the blurred result (written when applied
+// with the HDR continuation). stats (16 floats): applied, maxRadius, capRadius, rFocus, rBg, scale, phoneFactor, kmax, gathers,
+// onPerson, ca, mapMs, levelsMs, bandsMs, totalMs, peak MB. Returns null when rendered, "skip: <reason>" when gated
+// (the still untouched), else the error.
+extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBokehRender(
+    JNIEnv* env, jclass, jobject bitmap, jfloatArray lens, jfloatArray curve, jfloatArray tone, jfloatArray gain, jint gainW, jint gainH,
+    jfloatArray depth, jfloatArray mask, jfloatArray conf, jint depthW, jint depthH, jint workMax, jint threads, jfloatArray stats,
+    jfloatArray gainOut) {
+    const Floats ln(env, lens), cv(env, curve), tn(env, tone), gn(env, gain), dp(env, depth), mk(env, mask), cf(env, conf);
+    if (ln.size() < 9 || tn.size() < 4 || cv.size() < 2) return env->NewStringUTF("lens, tone or curve mis-sized");
+    const jsize dn = depthW * depthH;
+    if (depthW < 3 || depthH < 3 || dp.size() < dn || (mask != nullptr && mk.size() < dn) || (conf != nullptr && cf.size() < dn)) {
+        return env->NewStringUTF("depth maps mis-sized");
+    }
+    if (gain != nullptr && (gainW < 1 || gainH < 1 || gn.size() < gainW * gainH)) return env->NewStringUTF("gain map mis-sized");
+    if (gainOut != nullptr && (gain == nullptr || env->GetArrayLength(gainOut) < gainW * gainH)) return env->NewStringUTF("gain out mis-sized");
+    std::vector<float> gOut(gainOut != nullptr ? static_cast<std::size_t>(gainW) * static_cast<std::size_t>(gainH) : 0);
+    if (stats == nullptr || env->GetArrayLength(stats) < 16) return env->NewStringUTF("stats needs 16 floats");
+    AndroidBitmapInfo info{};
+    if (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        return env->NewStringUTF("still must be an ARGB_8888 bitmap");
+    }
+    const float* l = ln.get();
+    redline::BokehParams p;
+    p.focalMm = l[0];
+    p.aperture = l[1];
+    p.focusM = l[2];
+    p.focusX = l[3];
+    p.focusY = l[4];
+    p.phoneN = l[5];
+    p.farM = l[6];
+    p.maxCoc = l[7];
+    p.workMax = workMax > 0 ? workMax : p.workMax;
+    p.threads = threads;
+    redline::BokehTone t;
+    t.curve = cv.get();
+    t.curvePoints = cv.size();
+    t.curveLo = tn.get()[0];
+    t.curveHi = tn.get()[1];
+    t.kneeEv = tn.get()[2];
+    t.slope = tn.get()[3];
+    if (gain != nullptr) {
+        t.gainLog2 = gn.get();
+        t.gainW = gainW;
+        t.gainH = gainH;
+        if (gainOut != nullptr) t.gainOut = gOut.data();
+    }
+    redline::BokehDepth d;
+    d.depth = dp.get();
+    d.mask = mask != nullptr ? mk.get() : nullptr;
+    d.confMap = conf != nullptr ? cf.get() : nullptr;
+    d.width = depthW;
+    d.height = depthH;
+    d.confidence = l[8];
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return env->NewStringUTF("could not lock the bitmap");
+    }
+    redline::BokehStats st;
+    const std::string err = redline::bokehRender(static_cast<std::uint8_t*>(pixels), static_cast<int>(info.width), static_cast<int>(info.height),
+                                                 info.stride, t, d, p, st);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (!err.empty()) return env->NewStringUTF(err.c_str());
+    if (gainOut != nullptr && st.applied) env->SetFloatArrayRegion(gainOut, 0, static_cast<jsize>(gOut.size()), gOut.data());
+    const jfloat v[16] = {st.applied ? 1.0f : 0.0f, st.maxRadius, st.capRadius, st.rFocus, st.rBg, st.scale, st.phoneFactor,
+                          static_cast<jfloat>(st.kmax), static_cast<jfloat>(st.layers), st.onPerson ? 1.0f : 0.0f, st.ca ? 1.0f : 0.0f,
+                          static_cast<jfloat>(st.mapMs), static_cast<jfloat>(st.levelsMs), static_cast<jfloat>(st.bandsMs),
+                          static_cast<jfloat>(st.totalMs), static_cast<jfloat>(st.peakBytes / 1e6)};
+    env->SetFloatArrayRegion(stats, 0, 16, v);
+    if (!st.applied) return env->NewStringUTF(("skip: " + st.reason).c_str());
     return nullptr;
 }

@@ -2,6 +2,7 @@ package com.redline.camera.depth
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.redline.camera.capability.Json
@@ -9,8 +10,11 @@ import com.redline.camera.nativebridge.RedlineNative
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -37,8 +41,13 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
     private val rect = IntArray(4)
     private val packed = ShortArray(DepthEngine.W * DepthEngine.H * 3)
 
-    // Worker thread only.
-    private var engine: DepthEngine? = null
+    // Created and used on the worker thread; read (ready or not) from the store lane.
+    @Volatile private var engine: DepthEngine? = null
+    private val warming = AtomicBoolean(false)
+
+    /** B31: writes the sharp copies (a JPEG encode) off both the store lane and the depth worker. */
+    private val io: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "redline-dof-io").apply { isDaemon = true } }
+    private val dofDir = File(app.filesDir, DOF_DIR)
 
     private val lock = Any()
     private var state = DepthReport()
@@ -103,6 +112,161 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
         }
     }
 
+    /**
+     * B31: compiles the engine on the worker now (at nice [WARM_NICE]) instead of on the first shot, so the first DOF shot
+     * finds it ready. Never blocks; does nothing when it is up or already warming.
+     */
+    fun warmUp() {
+        if (engine != null || !warming.compareAndSet(false, true)) return
+        runCatching {
+            worker.execute {
+                try {
+                    runCatching { Process.setThreadPriority(WARM_NICE) }
+                    if (engine == null) {
+                        engine = DepthEngine.open(app.assets, cpuOnly).also { update { s -> s.copy(engine = it.info) } }
+                    }
+                } finally {
+                    warming.set(false)
+                }
+            }
+        }.onFailure { warming.set(false) }
+    }
+
+    /** B31: the engine compiled and passed its self-check (a sync job will not wait for compilation). */
+    val engineReady: Boolean get() = engine?.ready == true
+
+    /** B31: the maps of one shot (still orientation), handed back to the save path by [runSync]. */
+    class SyncDepth(
+        val depth: FloatArray,
+        val mask: FloatArray,
+        val confidenceMap: FloatArray,
+        val width: Int,
+        val height: Int,
+        val confidence: Float,
+        val usable: Boolean,
+        val personCoverage: Float,
+        val prepMs: Long,
+        val depthMs: Long,
+        val segMs: Long,
+        val finishMs: Long,
+        /** Prep to maps back (what the save path waited). */
+        val waitMs: Long,
+        val delegate: String?
+    )
+
+    /** B31: [maps], or why there are none ([skip], a reason for the DOF report). */
+    class SyncResult(val maps: SyncDepth?, val skip: String?)
+
+    /**
+     * B31: depth for a shot on the save path. Prep runs here, the models and the finish on the worker, and this call waits
+     * for the maps (at most [timeoutMs]); the sidecar is then written on the worker, after the maps are handed back. Never
+     * queues and never compiles: an engine not ready (warm-up started) or busy returns at once with the reason, and the
+     * caller saves the still sharp. [nice]: the worker's priority for this job (the save path's throttle).
+     */
+    fun runSync(still: Bitmap, rotation: Int, base: String, nice: Int, timeoutMs: Long = SYNC_TIMEOUT_MS): SyncResult {
+        val e = engine
+        if (e == null) {
+            warmUp()
+            return SyncResult(null, "$SKIP_SYNC_NOT_READY (warming up)")
+        }
+        if (!e.ready) return SyncResult(null, "$SKIP_SYNC_NOT_READY (${e.info.error ?: "self-check failed"})")
+        if (!busy.compareAndSet(false, true)) return SyncResult(null, SKIP_SYNC_BUSY)
+        val t0 = SystemClock.elapsedRealtime()
+        val future = CompletableFuture<SyncDepth?>()
+        var handed = false
+        try {
+            val imageW = still.width
+            val imageH = still.height
+            rgbCanvas.clear()
+            segIn.clear()
+            val err = RedlineNative.depthPrep(
+                still,
+                rotation,
+                rgbCanvas,
+                DepthEngine.W,
+                DepthEngine.H,
+                segIn,
+                DepthEngine.SEG_W,
+                DepthEngine.SEG_H,
+                rect
+            )
+            val prepMs = SystemClock.elapsedRealtime() - t0
+            if (err != null) {
+                update { it.record(DepthShot(base = base, ok = false, prepMs = prepMs, error = "prep: $err")) }
+                return SyncResult(null, "depth failed (prep: $err)")
+            }
+            val handedAt = SystemClock.elapsedRealtime()
+            worker.execute {
+                try {
+                    runCatching { Process.setThreadPriority(nice) }
+                    run(base, rotation, imageW, imageH, prepMs, handedAt) { maps -> future.complete(maps) }
+                } catch (t: Throwable) {
+                    future.complete(null)
+                    throw t
+                } finally {
+                    future.complete(null)
+                    busy.set(false)
+                }
+            }
+            handed = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "depth sync failed", t)
+            return SyncResult(null, "depth failed (${describe(t)})")
+        } finally {
+            if (!handed) busy.set(false)
+        }
+        val maps = try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (t: TimeoutException) {
+            return SyncResult(null, "depth failed (timed out after $timeoutMs ms)")
+        } catch (t: Throwable) {
+            return SyncResult(null, "depth failed (${describe(t)})")
+        }
+        return if (maps == null) SyncResult(null, "depth failed (${report.lastError ?: "no maps"})") else SyncResult(maps, null)
+    }
+
+    /**
+     * B31: keeps the sharp render for re-edit: [copy] (recycled here) written as files/dof/<base>.sharp.jpg (q95) on the
+     * io thread, with [metaJson] (the lens and tone the shot was rendered with) as <base>.dof.json, then pruned with the
+     * depth sidecars. Never throws.
+     */
+    fun writeSharp(copy: Bitmap, base: String, metaJson: String, onDone: (Boolean) -> Unit = {}) {
+        runCatching {
+            io.execute {
+                var ok = false
+                try {
+                    runCatching { Process.setThreadPriority(IO_NICE) }
+                    dofDir.mkdirs()
+                    val tmp = File(dofDir, "$base$SHARP_SUFFIX.tmp")
+                    tmp.outputStream().buffered().use { check(copy.compress(Bitmap.CompressFormat.JPEG, SHARP_QUALITY, it)) { "encode" } }
+                    File(dofDir, "$base$META_SUFFIX").writeText(metaJson)
+                    ok = tmp.renameTo(File(dofDir, "$base$SHARP_SUFFIX"))
+                    pruneSharp()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "sharp copy failed", t)
+                } finally {
+                    copy.recycle()
+                    runCatching { onDone(ok) }
+                }
+            }
+        }.onFailure {
+            copy.recycle()
+            onDone(false)
+        }
+    }
+
+    /** B31: shots that have both a sidecar and a sharp copy (re-edit candidates), newest first. */
+    fun reeditable(): List<String> {
+        val sharp = dofDir.listFiles { f -> f.name.endsWith(SHARP_SUFFIX) } ?: return emptyList()
+        return sharp.sortedByDescending { it.lastModified() }
+            .map { it.name.removeSuffix(SHARP_SUFFIX) }
+            .filter { File(dir, "$it$SUFFIX").isFile }
+    }
+
+    fun sharpFile(base: String) = File(dofDir, "$base$SHARP_SUFFIX")
+
+    fun sidecarFile(base: String) = File(dir, "$base$SUFFIX")
+
     /** Closes the engine on its own thread and stops the worker. */
     fun close() {
         runCatching {
@@ -112,9 +276,18 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
             }
         }
         worker.shutdown()
+        io.shutdown()
     }
 
-    private fun run(base: String, rot: Int, imageW: Int, imageH: Int, prepMs: Long, handedAt: Long) {
+    private fun run(
+        base: String,
+        rot: Int,
+        imageW: Int,
+        imageH: Int,
+        prepMs: Long,
+        handedAt: Long,
+        deliver: ((SyncDepth?) -> Unit)? = null
+    ) {
         val start = SystemClock.elapsedRealtime()
         val queueMs = start - handedAt
         val e = engine ?: DepthEngine.open(app.assets, cpuOnly).also {
@@ -123,6 +296,7 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
         }
         if (!e.ready) {
             skip(DepthReport.SKIP_ENGINE)
+            deliver?.invoke(null)
             return
         }
         try {
@@ -151,6 +325,9 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
                 packed
             )
             val finishMs = SystemClock.elapsedRealtime() - f0
+            deliver?.invoke(
+                syncMaps(stats, prepMs, depthMs, segMs, finishMs, SystemClock.elapsedRealtime() - handedAt + prepMs, e.info.delegate)
+            )
             val w0 = SystemClock.elapsedRealtime()
             val meta = Json.value(metadata(e, stats, rot, imageW, imageH))
             dir.mkdirs()
@@ -186,6 +363,7 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
             }
         } catch (t: Throwable) {
             Log.w(TAG, "depth job failed", t)
+            deliver?.invoke(null)
             update {
                 it.record(
                     DepthShot(
@@ -227,11 +405,55 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
         "person_score" to s.personScore.toDouble()
     )
 
+    private fun syncMaps(
+        s: RedlineNative.DepthStats,
+        prepMs: Long,
+        depthMs: Long,
+        segMs: Long,
+        finishMs: Long,
+        waitMs: Long,
+        delegate: String?
+    ): SyncDepth {
+        val n = s.outWidth * s.outHeight
+        val d = FloatArray(n)
+        val m = FloatArray(n)
+        val c = FloatArray(n)
+        for (i in 0 until n) {
+            d[i] = (packed[3 * i].toInt() and 0xFFFF) / 65535f
+            m[i] = (packed[3 * i + 1].toInt() and 0xFFFF) / 65535f
+            c[i] = (packed[3 * i + 2].toInt() and 0xFFFF) / 65535f
+        }
+        return SyncDepth(
+            d, m, c, s.outWidth, s.outHeight, s.confidence, s.usable, s.personCoverage, prepMs, depthMs, segMs, finishMs, waitMs,
+            delegate
+        )
+    }
+
     private fun prune() {
         val files = dir.listFiles { f -> f.name.endsWith(SUFFIX) } ?: return
-        if (files.size <= KEEP_SIDECARS) return
-        files.sortedByDescending { it.lastModified() }.drop(KEEP_SIDECARS).forEach { runCatching { it.delete() } }
+        if (files.size > KEEP_SIDECARS) {
+            files.sortedByDescending { it.lastModified() }.drop(KEEP_SIDECARS).forEach { runCatching { it.delete() } }
+        }
+        pruneSharp()
     }
+
+    /** B31: sharp copies go with their sidecars (a copy whose sidecar was pruned is deleted), newest [KEEP_SIDECARS]. */
+    @Synchronized private fun pruneSharp() {
+        val sharp = dofDir.listFiles { f -> f.name.endsWith(SHARP_SUFFIX) } ?: return
+        val now = System.currentTimeMillis()
+        sharp.sortedByDescending { it.lastModified() }.forEachIndexed { i, f ->
+            val base = f.name.removeSuffix(SHARP_SUFFIX)
+            // A copy written moments before its sidecar is kept (the sidecar is still being written on the worker).
+            val orphan = !File(dir, "$base$SUFFIX").isFile && now - f.lastModified() > ORPHAN_GRACE_MS
+            if (i >= KEEP_SIDECARS || orphan) runCatching { f.delete() }
+        }
+        dofDir.listFiles { f -> f.name.endsWith(META_SUFFIX) }?.forEach { f ->
+            val base = f.name.removeSuffix(META_SUFFIX)
+            if (!File(dofDir, "$base$SHARP_SUFFIX").isFile && now - f.lastModified() > ORPHAN_GRACE_MS) runCatching { f.delete() }
+        }
+    }
+
+    fun metaFile(base: String) = File(dofDir, "$base$META_SUFFIX")
 
     private fun update(f: (DepthReport) -> DepthReport) {
         val now = synchronized(lock) { f(state).also { state = it } }
@@ -250,6 +472,18 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
         const val DIR = "depth"
         const val SUFFIX = ".depth.png"
         const val KEEP_SIDECARS = 20
+
+        /** B31: the sharp renders kept for re-edit (app-private), JPEG quality. */
+        const val DOF_DIR = "dof"
+        const val SHARP_SUFFIX = ".sharp.jpg"
+        const val META_SUFFIX = ".dof.json"
+        const val SHARP_QUALITY = 95
+        const val SYNC_TIMEOUT_MS = 3_000L
+        const val SKIP_SYNC_NOT_READY = "depth engine not ready"
+        const val SKIP_SYNC_BUSY = "depth engine busy"
+        private const val WARM_NICE = 10
+        private const val IO_NICE = 10
+        private const val ORPHAN_GRACE_MS = 60_000L
 
         private fun direct(floats: Int): ByteBuffer = ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder())
 

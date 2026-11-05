@@ -337,6 +337,105 @@ object RedlineNative {
         return DepthStats(stats)
     }
 
+    // ------------------------------------------------------------------------------------------- B31 bokeh
+
+    /**
+     * B31: the virtual lens for [bokehRender]. [phoneEquivalentAperture] is the phone's full-frame-equivalent f-number for
+     * the crop being rendered (PLAN 19.5 "phone gap"; only the difference from the phone's own blur is added).
+     * [farDistanceM] is where the farthest 2 % of the frame sits (0 = infinity, the default depth-scale anchor).
+     */
+    class BokehLens(
+        val focalMm: Float,
+        val aperture: Float,
+        val focusDistanceM: Float,
+        val focusX: Float = 0.5f,
+        val focusY: Float = 0.5f,
+        val phoneEquivalentAperture: Float,
+        val farDistanceM: Float = 0f,
+        val maxCoc: Float = 0.08f
+    )
+
+    /**
+     * B31: the tone curve the still was rendered with (the RenderSpec table on log2 gained linear values, [curveLo]..
+     * [curveHi]) and, optionally, the B25 HDR continuation ([slope] > 0, knee [kneeEv], [gainLog2] = mean log2 HDR gain,
+     * [gainW] x [gainH]) so specular highlights bloom.
+     */
+    class BokehTone(
+        val curve: FloatArray,
+        val curveLo: Float,
+        val curveHi: Float,
+        val kneeEv: Float = -1.5f,
+        val slope: Float = 0f,
+        val gainLog2: FloatArray? = null,
+        val gainW: Int = 0,
+        val gainH: Int = 0,
+        /**
+         * Optional output ([gainW] x [gainH]): the mean log2 HDR gain per cell recomputed from the blurred linear result
+         * (same continuation), so an Ultra HDR gain map stays consistent with the blurred base. Written only when the
+         * render is applied with the HDR continuation; cells no changed pixel falls in keep their input value.
+         */
+        val gainOut: FloatArray? = null
+    )
+
+    /** B31: the B30 maps at their resolution (still orientation): inverse depth 0..1 (1 near), person mask, confidence. */
+    class BokehDepth(
+        val depth: FloatArray,
+        val mask: FloatArray?,
+        val confidenceMap: FloatArray?,
+        val width: Int,
+        val height: Int,
+        val confidence: Float
+    )
+
+    /** What [bokehRender] did: [applied] false with [reason] when gated (the still is untouched). */
+    class BokehResult(v: FloatArray, val reason: String?) {
+        val applied = v[0] > 0.5f
+        val maxRadiusPx = v[1]
+        val capRadiusPx = v[2]
+        val focusDepth = v[3]
+        val backgroundDepth = v[4]
+        val inverseDepthScale = v[5]
+        val phoneFactor = v[6]
+        val layers = v[7].toInt()
+        val gathers = v[8].toInt()
+        val onPerson = v[9] > 0.5f
+        val chromatic = v[10] > 0.5f
+        val mapMs = v[11].toDouble()
+        val levelsMs = v[12].toDouble()
+        val bandsMs = v[13].toDouble()
+        val totalMs = v[14].toDouble()
+        val peakMb = v[15].toDouble()
+    }
+
+    /**
+     * B31: simulated depth of field on the rendered [still] (ARGB_8888, in place). Not applied (still untouched) when
+     * the depth confidence is below 0.35 or the phone's own depth of field is already as deep as the chosen aperture.
+     * Throws IllegalStateException with the native error.
+     */
+    fun bokehRender(
+        still: Bitmap,
+        lens: BokehLens,
+        tone: BokehTone,
+        depth: BokehDepth,
+        threads: Int = 1,
+        workMax: Int = 1024
+    ): BokehResult {
+        check(load().loaded) { "native library not loaded: ${load().error}" }
+        val lensV = floatArrayOf(
+            lens.focalMm, lens.aperture, lens.focusDistanceM, lens.focusX, lens.focusY, lens.phoneEquivalentAperture,
+            lens.farDistanceM, lens.maxCoc, depth.confidence
+        )
+        val toneV = floatArrayOf(tone.curveLo, tone.curveHi, tone.kneeEv, tone.slope)
+        val stats = FloatArray(16)
+        val err = nativeBokehRender(
+            still, lensV, tone.curve, toneV, tone.gainLog2, tone.gainW, tone.gainH, depth.depth, depth.mask,
+            depth.confidenceMap, depth.width, depth.height, workMax, threads, stats, tone.gainOut
+        )
+        if (err != null && err.startsWith("skip: ")) return BokehResult(stats, err.removePrefix("skip: "))
+        check(err == null) { "bokeh: $err" }
+        return BokehResult(stats, null)
+    }
+
     // ------------------------------------------------------------------------------------------- B22 burst merge
 
     /** A frame-sized buffer in native memory (outside the Java heap), or null when it cannot be allocated. Free with [freeFrame]. */
@@ -895,6 +994,26 @@ object RedlineNative {
         v: ByteBuffer,
         uvRowStride: Int,
         uvPixelStride: Int
+    ): String?
+
+    @JvmStatic
+    private external fun nativeBokehRender(
+        still: Bitmap,
+        lens: FloatArray,
+        curve: FloatArray,
+        tone: FloatArray,
+        gain: FloatArray?,
+        gainW: Int,
+        gainH: Int,
+        depth: FloatArray,
+        mask: FloatArray?,
+        conf: FloatArray?,
+        depthW: Int,
+        depthH: Int,
+        workMax: Int,
+        threads: Int,
+        stats: FloatArray,
+        gainOut: FloatArray?
     ): String?
 
     @JvmStatic

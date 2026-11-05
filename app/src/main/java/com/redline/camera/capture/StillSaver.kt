@@ -23,6 +23,8 @@ import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.colour.ColourShot
 import com.redline.camera.depth.DepthReport
 import com.redline.camera.depth.DepthService
+import com.redline.camera.dof.DofMath
+import com.redline.camera.dof.DofStage
 import com.redline.camera.nativebridge.RedlineNative
 import com.redline.camera.viewfinder.NormRect
 import java.io.ByteArrayInputStream
@@ -142,7 +144,9 @@ class StagedShot(
     val lookName: String,
     val look: String,
     /** B25: the render's Ultra HDR gain map (warped with the still when RAW feel distorted it), or null. */
-    val hdr: ColourPipeline.HdrMap? = null
+    val hdr: ColourPipeline.HdrMap? = null,
+    /** B31: the tone curve the still was rendered with (the bokeh inverts it), or null. */
+    val tone: ColourPipeline.RenderTone? = null
 )
 
 /**
@@ -170,6 +174,19 @@ class StillSaver(context: Context, private val version: String, private val pipe
     @Volatile var depthEnabled: Boolean = false
 
     @Volatile var depth: DepthService? = null
+
+    /**
+     * B31: simulated depth of field on the save path ([DofStage.apply] before the encode, on the store lane). Off until
+     * the caller sets it. [dofBudget] (threads, nice) is the worker governor's for this work; [dofQueuedBehind] the
+     * shots queued behind the one saving; [dofLowMemory] the system's low-memory flag.
+     */
+    @Volatile var dof: DofStage? = null
+
+    @Volatile var dofBudget: () -> WorkerBudget = { WorkerBudget(DofStage.MAX_THREADS, WorkerGovernor.IDLE_NICE, loaded = false) }
+
+    @Volatile var dofQueuedBehind: () -> Int = { 0 }
+
+    @Volatile var dofLowMemory: () -> Boolean = { false }
 
     /** Render then store on the calling thread (the two lanes in one). Never throws; always calls [StillShot.release]. */
     fun save(shot: StillShot, nowMs: () -> Long): ShotResult = store(render(shot, nowMs), nowMs)
@@ -235,6 +252,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val renderRaw = shot.renderRaw && shot.savePhoto
         val uhdr = shot.ultraHdr
         var hdr: ColourPipeline.HdrMap? = null
+        var tone: ColourPipeline.RenderTone? = null
         var colour: ColourShot? = null
         var rendered: Bitmap? = null
         var dngRaw: RawCopy? = shot.raw
@@ -292,6 +310,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 rendered = o.bitmap
                 colour = o.shot
                 hdr = o.hdr
+                tone = o.tone
                 if (rendered == null) srFallback = "super-resolution render: ${o.shot.fallbackReason}" else srMerged = true
             }
             if (renderRaw && pipeline != null) {
@@ -313,6 +332,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     rendered = o.bitmap
                     colour = o.shot
                     hdr = o.hdr
+                    tone = o.tone
                     if (rendered == null) fallback = "merged render: ${o.shot.fallbackReason}" else mergedOk = true
                 }
                 val f = b.fallbackRaw
@@ -332,6 +352,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
                     rendered = o.bitmap
                     colour = o.shot
                     hdr = o.hdr
+                    tone = o.tone
                 }
                 colour?.timingsMs?.get("total")?.let { timings["render"] = it }
             } else if (!shot.savePhoto) {
@@ -386,6 +407,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
             rendered = o.bitmap
             colour = o.shot
             hdr = o.hdr
+            tone = o.tone
         } else if (renderRaw) {
             colour =
                 ColourShot(rendered = false, fallbackReason = if (shot.raw == null) "no RAW frame in this shot" else "pipeline unavailable")
@@ -451,7 +473,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
             srFallback = srFallback,
             lookName = lookName,
             look = look,
-            hdr = hdr
+            hdr = hdr,
+            tone = if (rendered != null) tone else null
         )
     }
 
@@ -467,6 +490,61 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 else -> svc.submit(still, shot.jpegOrientation, base)
             }
         }.onFailure { Log.w(TAG, "depth hand-off failed", it) }
+    }
+
+    /** B31: the DOF stage for a RAW-rendered still (in place). Null when off. Never throws. */
+    private fun runDof(staged: StagedShot, bmp: Bitmap): DofStage.Outcome? {
+        val stage = dof ?: return null
+        if (!stage.enabled) return null
+        return try {
+            stage.apply(dofRequest(stage, staged, bmp))
+        } catch (t: Throwable) {
+            Log.w(TAG, "DOF request failed", t)
+            null
+        }
+    }
+
+    private fun dofRequest(stage: DofStage, staged: StagedShot, bmp: Bitmap): DofStage.Request {
+        val shot = staged.shot
+        val ch = shot.characteristics
+        val res = shot.burst?.referenceResult ?: shot.result
+        val focal = DofMath.virtualFocalMm(shot.stopTargetMm, shot.trueEquivalentMm)
+        val n = stage.aperture
+        val focus = DofMath.focusDistance(
+            runCatching { res.get(CaptureResult.LENS_FOCUS_DISTANCE) }.getOrNull(),
+            runCatching { ch.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) }.getOrNull(),
+            focal,
+            n.toDouble()
+        )
+        val active = runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) }.getOrNull()
+        val pixels = runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) }.getOrNull()
+        val phys = runCatching { ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) }.getOrNull()
+        val aw = active?.width() ?: 0
+        val ah = active?.height() ?: 0
+        val fNumber = (
+            runCatching { res.get(CaptureResult.LENS_APERTURE) }.getOrNull()
+                ?: runCatching { ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES) }.getOrNull()?.firstOrNull()
+            )?.toDouble()
+        val activeMm = DofMath.activeWidthMm(phys?.width?.toDouble(), aw, pixels?.width ?: 0)
+        val phoneN = DofMath.phoneEquivalentAperture(fNumber, activeMm, DofMath.cropWidthFraction(aw, ah, shot.zoomRatio.toDouble()))
+        val tap = shot.meterRegion?.let { DofMath.focusInStill(it.centerX, it.centerY, aw, ah, shot.zoomRatio.toDouble()) }
+        val b = dofBudget()
+        return DofStage.Request(
+            still = bmp,
+            rotation = shot.jpegOrientation,
+            base = staged.base,
+            keep = shot.keep,
+            focalMm = focal,
+            phoneEquivalentAperture = phoneN,
+            focus = focus,
+            tap = tap,
+            tone = staged.tone,
+            hdr = if (shot.ultraHdr) staged.hdr else null,
+            threads = b.threads.coerceIn(1, DofStage.MAX_THREADS),
+            nice = b.nice,
+            queuedBehind = runCatching { dofQueuedBehind() }.getOrDefault(0),
+            lowMemory = runCatching { dofLowMemory() }.getOrDefault(false)
+        )
     }
 
     private fun storeInner(staged: StagedShot, nowMs: () -> Long): ShotResult {
@@ -485,6 +563,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val b = shot.burst
         var jpegSize: Dim? = null
         var error: String? = null
+        // B31: simulated depth of field on the rendered still, before the encode (sharp on any skip or failure).
+        val dofOut = staged.rendered?.takeIf { shot.savePhoto }?.let { runDof(staged, it) }
+        val hdrOut = dofOut?.hdr ?: staged.hdr
+        val dofLook = if (dofOut?.shot?.applied == true) "$look | simulated DOF ${DofMath.label(dofOut.shot.aperture)}" else look
         val encodeStart = nowMs()
         val savedCameraJpeg = staged.rendered == null
         var photo: PhotoOut? = null
@@ -496,7 +578,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
             try {
                 val bmp = staged.rendered
                 if (bmp != null) {
-                    photo = saveRendered(shot, bmp, base, look, staged.hdr)
+                    photo = saveRendered(shot, bmp, base, dofLook, hdrOut)
                     jpegSize = photo.size
                     colour = colour?.let { it.copy(timingsMs = it.timingsMs + ("encode_save" to (nowMs() - encodeStart))) }
                 } else {
@@ -509,7 +591,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 error = "${shot.photoFormat.label}: ${e.javaClass.simpleName}: ${e.message}"
                 false
             } finally {
-                startDepth(shot, staged.base, staged.rendered, photo != null)
+                // B31: a shot the DOF stage ran depth for has its sidecar on the way (and its still may be blurred).
+                if (dofOut?.depthHandled != true) startDepth(shot, staged.base, staged.rendered, photo != null)
                 staged.rendered?.recycle()
                 staged.rendered = null
             }
@@ -538,6 +621,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val savedAt = nowMs()
         val total = savedAt - shot.shutterAtMs
         shot.timeline?.mark(ShotTimeline.SAVED, savedAt)
+        dofOut?.let { o -> runCatching { dof?.finish(o, if (jpegOk) total else null) } }
         burstShot = burstShot?.let {
             if (it.plan.isBurst) {
                 it.copy(
@@ -581,7 +665,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val ph = photo
         val dg = dng
         val formats = shot.formats?.let { f ->
-            val hdr = staged.hdr
+            val hdr = hdrOut
             FormatsShot(
                 settings = f,
                 photoBytes = ph?.bytes,
