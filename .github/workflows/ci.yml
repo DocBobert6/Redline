@@ -108,12 +108,13 @@ jobs:
       - name: Build native RAW pipeline + burst merge + super-resolution + detail host tools
         run: |
           cmake -S app/src/test/cpp -B build/native-host -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool superres_tool detail_tool depth_post_tool
+          cmake --build build/native-host --target raw_pipeline_tool burst_merge_tool superres_tool detail_tool depth_post_tool bokeh_tool
           echo "REDLINE_RAW_TOOL=$PWD/build/native-host/raw_pipeline_tool" >> "$GITHUB_ENV"
           echo "REDLINE_BURST_TOOL=$PWD/build/native-host/burst_merge_tool" >> "$GITHUB_ENV"
           echo "REDLINE_SR_TOOL=$PWD/build/native-host/superres_tool" >> "$GITHUB_ENV"
           echo "REDLINE_DETAIL_TOOL=$PWD/build/native-host/detail_tool" >> "$GITHUB_ENV"
           echo "REDLINE_DEPTH_TOOL=$PWD/build/native-host/depth_post_tool" >> "$GITHUB_ENV"
+          echo "REDLINE_BOKEH_TOOL=$PWD/build/native-host/bokeh_tool" >> "$GITHUB_ENV"
           echo "REDLINE_REQUIRE_NATIVE=1" >> "$GITHUB_ENV"
 
       - name: Cache real-file fixtures

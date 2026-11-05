@@ -93,3 +93,16 @@ add_executable(depth_post_tool depth_post_tool.cpp ${NATIVE_SRC}/depth_post.cpp 
 target_include_directories(depth_post_tool PRIVATE ${NATIVE_SRC})
 target_compile_options(depth_post_tool PRIVATE -Wall -Wextra -Werror -O2)
 target_link_libraries(depth_post_tool PRIVATE Threads::Threads)
+
+# B31 simulated depth of field: PLAN 19.5 blur table, kernel shape, synthetic scene, guided-filter edges, gating,
+# band/thread independence and the 4000x2667 / 3000x2000 timings (CTest), and the host tool the Python parity test drives.
+add_executable(bokeh_test bokeh_test.cpp ${NATIVE_SRC}/bokeh.cpp)
+target_include_directories(bokeh_test PRIVATE ${NATIVE_SRC})
+target_compile_options(bokeh_test PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(bokeh_test PRIVATE Threads::Threads)
+add_test(NAME bokeh COMMAND bokeh_test)
+
+add_executable(bokeh_tool bokeh_tool.cpp ${NATIVE_SRC}/bokeh.cpp)
+target_include_directories(bokeh_tool PRIVATE ${NATIVE_SRC})
+target_compile_options(bokeh_tool PRIVATE -Wall -Wextra -Werror -O3)
+target_link_libraries(bokeh_tool PRIVATE Threads::Threads)
