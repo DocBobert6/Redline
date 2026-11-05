@@ -96,8 +96,11 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     implementation(libs.camerax.camera2)
     implementation(libs.camerax.lifecycle)
-    implementation(libs.litert)
-    implementation(libs.litert.gpu)
+    // B30.1: LiteRT's Play AI-pack delivery (ai-delivery) drags in WorkManager + an older Room. WorkManager's startup
+    // initializer then crashed release builds on launch (Room could not instantiate WorkDatabase after R8). Redline loads
+    // its models from assets and never uses AI packs, so drop that dependency tree entirely.
+    implementation(libs.litert) { exclude(group = "com.google.android.play", module = "ai-delivery") }
+    implementation(libs.litert.gpu) { exclude(group = "com.google.android.play", module = "ai-delivery") }
     implementation(libs.androidx.fragment)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)

@@ -179,7 +179,7 @@ jobs:
           PYTHON: ${{ steps.py312.outputs.python-path }}
 
       - name: Build test APKs
-        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest
+        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:assembleRelease
 
       - name: Run instrumented tests
         uses: reactivecircus/android-emulator-runner@v2
@@ -193,6 +193,7 @@ jobs:
           script: |
             ./gradlew --stacktrace :app:connectedDebugAndroidTest
             adb pull /sdcard/Download/RedlineCI uhdr-out
+            ci/release_launch_smoke.sh
 
       # B25: validate the emulator's Ultra HDR JPEG with libultrahdr (Apache-2.0; CI only, not part of the app). v1.4.0 misses
       # an <cstdint> include that the runner's GCC no longer pulls in transitively, hence the forced include.
