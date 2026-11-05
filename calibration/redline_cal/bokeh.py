@@ -40,7 +40,7 @@ source for every number marked [PLAN]; the rest is marked [ESTIMATE] with the re
        R(theta) = r (1 - beta (1 - cos(pi/9) / cos(phi))),  phi = ((theta - pi/2) mod 2pi/9) - pi/9,
    beta = min(0.5, 0.25 log2(N / 2.8)) [ESTIMATE: "near-circular" at f/2.8 (beta 0), the polygon shows slightly when
    stopped down; at most 3 % flat depth]. Illumination: even with a faint brighter rim, (1 + 0.15) S(r) - 0.15 S(0.8 r)
-   [ESTIMATE "faint"], no rings; the rim is skipped below a 4 px radius. Cat's-eye [PLAN 19.5 ESTIMATE]: the shape is
+   [ESTIMATE "faint"], no rings; the rim is skipped below a 4 px (output) radius. Cat's-eye [PLAN 19.5 ESTIMATE]: the shape is
    intersected with two discs of radius r centred at +-h u (u the unit radial direction), radial width fraction
    w = 1 - (1 - w_c) |v| t, h = r (1 - w); |v| = distance from the frame centre / half-diagonal; w_c = 0.65 at 24 mm
    (60-70 %) to 0.80 at 70 mm (75-85 %), linear in focal; t = clamp(log2(5.6 / N), 0, 1): full at f/2.8, half at f/4,
@@ -62,18 +62,34 @@ source for every number marked [PLAN]; the rest is marked [ESTIMATE] with the re
    a pixel's |rho| < 0.25 snaps to 0; below 1 it splits between the sharp layer (w0 = 1 - rho^2) and layer 1; above,
    between the two ladder layers around it, linearly in area (rho^2), so the blended disc has rho's second moment.
    The full-resolution radius is quantised to 1/64 px (int16, as the native code stores it). Each layer is gathered
-   with its kernel at level q (largest power of two with R_k / q >= 4, at least 1): box
-   down-sampled by q (partial edge boxes average what exists), gathered at radius R_k / q (kernel per 32 x 32 level-px
+   with its kernel at level q (largest power of two with R_k / q >= 2, at least 1; B31.1, was 4) at radius
+   sqrt((R_k / q)^2 - 1) for q > 1 (the down/up-sampling's own spread taken off the second moment): box
+   down-sampled by q (partial edge boxes average what exists), gathered at that radius (kernel per 32 x 32 level-px
    tile when the cat's-eye is on, built at the tile centre), bilinearly up-sampled. Layers of one side are summed
-   (premultiplied rgb + alpha): P_b, A_b behind, P_f, A_f in front. Composite, back to front:
+   (premultiplied rgb + one alpha per colour lane): P_b, A_b behind, P_f, A_f in front. Composite, back to front, per
+   colour lane l (each normalised by its own alpha, so a lane whose ladder position differs (CA) can never shift the
+   colour at a layer or depth seam; B31.1):
        bgN = P_b / A_b (A_b > 1e-4), else P_f / A_f (A_f > 1e-4), else the pixel     (hole fill behind the subject)
+             (a pixel that is itself in front: see "occluded background" below)
        mid = w0 c + (1 - w0) bgN                                                      (sharp layer over the background)
-       out = P_f + (1 - A_f) mid                                                      (front blur over everything)
+       out = A P_f / A_f + (1 - A) mid, A = min(A_f, 1)                              (front blur over everything)
    so the background never covers sharp foreground and the sharp subject never smears into the background; the front
-   blur spreads over the subject (physically right). A pixel with w0 = 1 and A_f < 1e-6 keeps its input value exactly.
+   blur spreads over the subject (physically right). A pixel with w0 = 1 and max A_f < 1e-6 keeps its input exactly.
+   B31.1 occluded background: a pixel in front is covered by the front blur and its own sharp share, cov = A_f + w0;
+   out = (P_f + w0 c) / cov when cov >= 1, else P_f + w0 c + (1 - cov) H with H = P_b / A_b (A_b > 1e-4), else
+   s R + (1 - s) P_f / A_f, s = smoothstep(0.02, 0.1, 1 - cov) smoothstep(0, 0.25, near), near = the share of non-front
+   pixels in the fill pyramid's cell about the pixel's blur radius (level round(log2(|rho| / 8))): a dip in coverage
+   between two front surfaces (inside a front object) is not a hole to the background. What a blurred foreground pixel lets show through
+   near its edge is the scene behind it, not the foreground's own colour (which made the foreground blur end at a hard edge on the subject: it
+   spread outward only). R is a push-pull fill of the non-front pixels (sharp and behind): their linear colour summed
+   in 8 x 8 cells (partial edge cells count what exists), pushed to 1 x 1 by 2 x 2 sums, pulled back
+   v_L = a_L m_L + (1 - a_L) up(v_L+1) (a_L = non-front share of the cell, m_L their mean), bilinear to full res.
 6. Longitudinal CA [PLAN 19.5: magenta in front, green behind, 70 mm f/2.8 only]: on at |f - 70| < 0.5 and N < 2.85,
    the colour lanes' ladder positions use |rho| (1 + e): behind focus G +0.05, R/B -0.05; in front R/B +0.05,
-   G -0.05 [ESTIMATE "slight"]; scales with the blur; the sharp weight and alpha use the nominal radius.
+   G -0.05 [ESTIMATE "slight"]; scales with the blur, faded in by smoothstep(4, 12 px) of the radius (B31.1: none on
+   the partly blurred pixels of an in-focus/out-of-focus seam); the sharp weight uses the nominal radius, each lane its own alpha
+   (B31.1: a shared alpha divided a lane's premultiplied sum by another lane's coverage, which blew up to saturated
+   green/magenta where that coverage was small: the stair-stepped fringe of the first device run).
 """
 from __future__ import annotations
 
@@ -95,13 +111,14 @@ CERT_LO, CERT_HI = 0.05, 0.2
 WORK_MAX = 1024
 MAX_COC = 0.08
 SNAP = 0.25
-R0 = 4.0
+R0 = 2.0  # B31.1: was 4 (level radius 4..8); 2..4 with the second-moment shrink below, ~5x less gather work
 TILE = 32
 RIM = 0.15
 RIM_INNER = 0.8
 RIM_MIN_R = 4.0
 BLADES = 9
 CA_EPS = 0.05
+CA_RAMP = (4.0, 12.0)  # B31.1: the CA fades in with the blur radius (px): none on the partly blurred seam pixels
 HDR_CAP_EV = 8.0
 INV_POINTS = 1024
 KLUMA = (0.2126729, 0.7151522, 0.0721750)
@@ -203,11 +220,11 @@ def shape_chord(y: float, r: float, beta: float, h: float, ux: float, uy: float)
     return xl, xr
 
 
-def kernel_terms(r: float, beta: float, h: float, ux: float, uy: float):
-    """Span terms (dy, xl, xr, weight) of the normalised kernel at level radius r."""
+def kernel_terms(r: float, beta: float, h: float, ux: float, uy: float, r_out: float | None = None):
+    """Span terms (dy, xl, xr, weight) of the normalised kernel at level radius r (rim from the output radius r_out)."""
     k = int(math.ceil(r)) + 1
     shapes = [(1.0, 1.0)]
-    if r >= RIM_MIN_R:
+    if (r if r_out is None else r_out) >= RIM_MIN_R:
         shapes = [(1.0, 1.0 + RIM), (RIM_INNER, -RIM)]
     terms = []
     for scale, wt in shapes:
@@ -233,8 +250,9 @@ def span_cov(xl: float, xr: float):
     return lo, [max(0.0, min(dx + 0.5, xr) - max(dx - 0.5, xl)) for dx in range(lo, hi + 1)]
 
 
-def kernel_dense(r: float, beta: float, h: float = 0.0, ux: float = 1.0, uy: float = 0.0) -> np.ndarray:
-    terms, k = kernel_terms(r, beta, h, ux, uy)
+def kernel_dense(r: float, beta: float, h: float = 0.0, ux: float = 1.0, uy: float = 0.0,
+                 r_out: float | None = None) -> np.ndarray:
+    terms, k = kernel_terms(r, beta, h, ux, uy, r_out)
     kk = np.zeros((2 * k + 1, 2 * k + 1))
     for dy, xl, xr, w in terms:
         lo, cov = span_cov(xl, xr)
@@ -514,6 +532,14 @@ def ladder_pos(a: np.ndarray, kmax: int) -> np.ndarray:
     return np.where(big, u, a * a)
 
 
+def level_radius(rk: float, q: int) -> float:
+    """B31.1: the level kernel radius. Box down-sampling (variance q^2/12) and bilinear up-sampling (q^2/6) widen a
+    disc gathered at level q by q^2/4 per axis (a uniform disc of radius R has R^2/4): shrink it to keep the rendered
+    second moment, sqrt((R/q)^2 - 1) for q > 1 (at least half of R/q)."""
+    r = rk / q
+    return math.sqrt(max(r * r - 1.0, 0.25 * r * r)) if q > 1 else r
+
+
 def level_of(rk: float) -> int:
     q = 1
     while rk / (2 * q) >= R0:
@@ -579,7 +605,7 @@ def layer_weights(rho: np.ndarray, kmax: int, ca: bool) -> tuple[np.ndarray, np.
         al = a
         if ca and lane < 3:
             e_b = CA_EPS if lane == 1 else -CA_EPS
-            e = np.where(behind, e_b, -e_b)
+            e = np.where(behind, e_b, -e_b) * smoothstep(CA_RAMP[0], CA_RAMP[1], a)
             al = np.where(a >= 1.0, np.maximum(a * (1.0 + e), 1.0), a)
         u = ladder_pos(al, kmax)
         for kk in range(1, kmax + 1):
@@ -587,8 +613,9 @@ def layer_weights(rho: np.ndarray, kmax: int, ca: bool) -> tuple[np.ndarray, np.
     return w0, wts
 
 
-def gather(src: np.ndarray, r: float, beta: float, f_mm: float, n: float, q: int, w: int, h: int) -> np.ndarray:
-    """Gather a level image [hl, wl, 4] with the aperture at level radius r (cat's-eye per tile)."""
+def gather(src: np.ndarray, r: float, beta: float, f_mm: float, n: float, q: int, w: int, h: int,
+           r_out: float | None = None) -> np.ndarray:
+    """Gather a level image [hl, wl, C] with the aperture at level radius r (cat's-eye per tile)."""
     hl, wl = src.shape[:2]
     out = np.zeros_like(src)
     hd = math.hypot(w, h) / 2.0
@@ -605,11 +632,11 @@ def gather(src: np.ndarray, r: float, beta: float, f_mm: float, n: float, q: int
             else:
                 hh, ux, uy = 0.0, 1.0, 0.0
                 y0, y1, x0, x1 = 0, hl, 0, wl
-            kd = kernel_dense(r, beta, hh, ux, uy)
+            kd = kernel_dense(r, beta, hh, ux, uy, r_out)
             k = kd.shape[0] // 2
-            pad = np.zeros((hl + 2 * k, wl + 2 * k, 4))
+            pad = np.zeros((hl + 2 * k, wl + 2 * k, src.shape[2]))
             pad[k:k + hl, k:k + wl] = src
-            acc = np.zeros((y1 - y0, x1 - x0, 4))
+            acc = np.zeros((y1 - y0, x1 - x0, src.shape[2]))
             for iy in range(2 * k + 1):
                 for ix in range(2 * k + 1):
                     wgt = kd[iy, ix]
@@ -638,27 +665,85 @@ def render(enc: np.ndarray, depth: np.ndarray, mask: np.ndarray | None, tone: To
     beta = blade_beta(p.aperture)
     x = linearise(enc.astype(np.float64), tone, gain_log2)
     w0, wts = layer_weights(rho, kmax, ca)
-    rgba = np.concatenate([x, np.ones((h, w, 1))], axis=2)
-    acc = {1: np.zeros((h, w, 4)), -1: np.zeros((h, w, 4))}
+    # premultiplied rgb, then one alpha per colour lane (r, g, b)
+    acc = {1: np.zeros((h, w, 6)), -1: np.zeros((h, w, 6))}
     for side in (1, -1):
         sel = (rho > 0) if side > 0 else (rho < 0)
         for kk in range(1, kmax + 1):
-            lay = np.where(sel[..., None], wts[kk], 0.0) * rgba
-            if not lay[..., 3].any():
+            wk = np.where(sel[..., None], wts[kk][..., :3], 0.0)
+            if not wk.any():
                 continue
+            lay = np.concatenate([wk * x, wk], axis=2)
             rk = ladder_radius(kk)
             q = level_of(rk)
             lv = box_down(lay, q)
-            g = gather(lv, rk / q, beta, p.focal_mm, p.aperture, q, w, h)
+            g = gather(lv, level_radius(rk, q), beta, p.focal_mm, p.aperture, q, w, h, rk)
             acc[side] += up_bilinear(g, q, w, h)
     pb, pf = acc[1], acc[-1]
-    ab, af = pb[..., 3:4], pf[..., 3:4]
+    ab, af = pb[..., 3:6], pf[..., 3:6]
+    front = (rho < 0) & (np.abs(rho) >= SNAP)
+    rear, near = rear_fill(x, front, rho) if front.any() else (x, np.zeros(rho.shape))
     fgn = np.where(af > 1e-4, pf[..., :3] / np.maximum(af, 1e-12), x)
-    bgn = np.where(ab > 1e-4, pb[..., :3] / np.maximum(ab, 1e-12), fgn)
+    bgb = pb[..., :3] / np.maximum(ab, 1e-12)
+    bgn = np.where(ab > 1e-4, bgb, fgn)
     mid = w0[..., None] * x + (1.0 - w0[..., None]) * bgn
-    out = pf[..., :3] + (1.0 - af) * mid
+    a_f = np.minimum(af, 1.0)  # B31.1: overlapping front spreads (A_f > 1) are normalised, never subtract the background
+    out = a_f * fgn + (1.0 - a_f) * mid
+    # B31.1, a pixel that is itself in front: its own sharp share w0 and the front blur cover it (cov = A_f + w0); what
+    # shows through the rest is the scene behind it: the behind blur, else the occluded background R, faded in only
+    # where the coverage really falls off (its edge; deep inside, cov wobbles around 1 and the front colour stays)
+    cov = af + w0[..., None]
+    s_edge = smoothstep(REAR_EDGE[0], REAR_EDGE[1], 1.0 - cov) * smoothstep(0.0, REAR_NEAR, near)[..., None]
+    hid = np.where(ab > 1e-4, bgb, s_edge * rear + (1.0 - s_edge) * fgn)
+    own = pf[..., :3] + w0[..., None] * x
+    out_f = np.where(cov >= 1.0, own / np.maximum(cov, 1e-12), own + (1.0 - cov) * hid)
+    out = np.where(front[..., None], out_f, out)
     res = curve_fwd(tone, out)
-    keep = (w0 >= 1.0) & (af[..., 0] < 1e-6)
+    keep = (w0 >= 1.0) & (af.max(axis=2) < 1e-6)
     res = np.where(keep[..., None], enc, res)
-    info.update(kmax=kmax, ca=ca, beta=beta, phone_factor=k_phone, max_radius=float(np.abs(rho).max()))
+    info.update(kmax=kmax, ca=ca, beta=beta, phone_factor=k_phone, max_radius=float(np.abs(rho).max()),
+                front=bool(front.any()))
     return Result(True, "", res, rho, info)
+
+
+REAR_Q = 8
+REAR_EDGE = (0.02, 0.1)  # 1 - coverage over which the occluded background fades in
+REAR_NEAR = 0.25  # share of non-front pixels near the pixel (at its blur scale) for it in full
+
+
+def box_sum(img: np.ndarray, q: int) -> np.ndarray:
+    """[H, W, C] -> [ceil(H/q), ceil(W/q), C] sums (partial edge boxes sum what exists)."""
+    h, w, c = img.shape
+    hq, wq = -(-h // q), -(-w // q)
+    pad = np.zeros((hq * q, wq * q, c))
+    pad[:h, :w] = img
+    return pad.reshape(hq, q, wq, q, c).sum(axis=(1, 3))
+
+
+def rear_fill(x: np.ndarray, front: np.ndarray, rho: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """B31.1: the occluded background behind front pixels (push-pull of the non-front pixels' linear colour), and the
+    share of non-front pixels near each pixel (the pyramid level whose cell is about the pixel's blur radius): a front
+    pixel with no non-front content within its blur is inside a front object, and nothing behind shows through it."""
+    h, w = front.shape
+    m = (~front).astype(np.float64)[..., None]
+    lv = box_sum(np.concatenate([x * m, m, np.ones_like(m)], axis=2), REAR_Q)  # C (3), W, N
+    levels = [lv]
+    while lv.shape[0] > 1 or lv.shape[1] > 1:
+        lv = box_sum(lv, 2)
+        levels.append(lv)
+    top = levels[-1]
+    v = np.where(top[..., 3:4] > 0, top[..., :3] / np.maximum(top[..., 3:4], 1e-12), 0.0)
+    for lv in reversed(levels[:-1]):
+        hl, wl = lv.shape[:2]
+        up = up_bilinear(v, 2, wl, hl)
+        a = lv[..., 3:4] / lv[..., 4:5]
+        mean = np.where(lv[..., 3:4] > 0, lv[..., :3] / np.maximum(lv[..., 3:4], 1e-12), 0.0)
+        v = a * mean + (1.0 - a) * up
+    rear = up_bilinear(v, REAR_Q, w, h)
+    sel = np.clip(np.floor(np.log2(np.maximum(np.abs(rho), 1.0) / REAR_Q) + 0.5), 0, len(levels) - 1).astype(int)
+    near = np.zeros((h, w))
+    for li in np.unique(sel):
+        lvl = levels[li]
+        share = up_bilinear((lvl[..., 3] / lvl[..., 4])[..., None], REAR_Q * 2 ** int(li), w, h)[..., 0]
+        near = np.where(sel == li, share, near)
+    return rear, near

@@ -19,6 +19,8 @@
 namespace redline {
 
 constexpr float kBokehUsable = 0.35f;
+/** BokehParams::nice: the workers take the calling thread's nice. */
+constexpr int kBokehInheritNice = -1000;
 
 /** The tone curve the still was rendered with (RenderSpec's table: log2 gained linear input curveLo..curveHi). */
 struct BokehTone {
@@ -59,6 +61,10 @@ struct BokehParams {
     int threads = 1;
     bool refine = true;            // guided-filter edge refinement (off only for tests and diagnostics)
     int band = 64;                 // row band height of the full/half resolution levels (memory vs halo overhead)
+    // B31.1: the persistent worker pool's nice for this render (kBokehInheritNice: the caller's) and whether the workers
+    // (and the caller, for the render) are pinned to the cores above the little cluster (Linux; ignored elsewhere).
+    int nice = kBokehInheritNice;
+    bool bigCores = false;
 };
 
 struct BokehStats {
@@ -69,6 +75,13 @@ struct BokehStats {
     bool ca = false, onPerson = false;
     double mapMs = 0, levelsMs = 0, bandsMs = 0, totalMs = 0, peakBytes = 0;
     double fillMs = 0, gatherMs = 0, compositeMs = 0;  // summed over levels and bands
+    // B31.1 stage timings (ms): guide box-down, guided filter, radius up-sample + layer masks, tone inversion tables,
+    // occluded-background fill, band linearisation, tone re-applied, gain map out, write-back.
+    double guideMs = 0, guidedMs = 0, upsampleMs = 0, invertMs = 0, rearMs = 0, linMs = 0, toneMs = 0, gainMs = 0, storeMs = 0;
+    bool front = false;               // pixels in front of the focus plane (the occluded-background fill ran)
+    int threads = 0, workerNice = 0, callerNice = 0, regions = 0;
+    std::uint64_t cpuMask = 0;        // CPUs the render ran on (bit per CPU id)
+    bool bigCoresAvailable = false;
 };
 
 /** In place on RGBA8 (alpha kept). Empty string = success (applied or gated; see stats), else an error. */

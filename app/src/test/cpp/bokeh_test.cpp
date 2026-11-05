@@ -648,9 +648,118 @@ void timing(int w, int h) {
                         "fill %.0f gather %.0f composite %.0f, max radius %.0f px, %d gathers, peak %.0f MB\n",
                         w, h, c.focal, static_cast<double>(c.n), static_cast<double>(c.s), threads, hw, st.totalMs, st.mapMs, st.levelsMs,
                         st.bandsMs, st.fillMs, st.gatherMs, st.compositeMs, static_cast<double>(st.maxRadius), st.layers, st.peakBytes / 1e6);
+            std::printf("  stages: guide %.0f guided filter %.0f upsample+masks %.0f invert %.0f rear %.0f lin %.0f tone %.0f gain %.0f "
+                        "store %.0f (front %d, regions %d)\n",
+                        st.guideMs, st.guidedMs, st.upsampleMs, st.invertMs, st.rearMs, st.linMs, st.toneMs, st.gainMs, st.storeMs,
+                        st.front ? 1 : 0, st.regions);
             check(st.totalMs < 60000, "timing sane");
         }
     }
+}
+
+
+// B31.1 (device run: a saturated, stair-stepped green fringe at the subject edge at 70 mm f/2.8): a neutral grey
+// subject, sharp, in front of a neutral background far behind, with the longitudinal CA on. Each colour lane is
+// normalised by its own alpha, so the seam carries no chroma beyond a small threshold (uniform background: none at
+// all; a neutral textured background: only the slight lane-footprint difference), and the green never dominates.
+void testSeamChroma() {
+    const float lo = -14, hi = 1;
+    const std::vector<float> tt = toneTable(512, lo, hi);
+    const redline::BokehTone t = tone(tt, lo, hi);
+    const int w = 600, h = 240, dw = 60, dh = 24;
+    for (int textured = 0; textured < 2; ++textured) {
+        std::vector<float> img(static_cast<std::size_t>(w) * h * 3);
+        const auto subjectAt = [&](double x, double y) { return x < 0.42 * w + 0.35 * (y - h / 2.0); };  // diagonal edge
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                float v = 0.6f;
+                if (!subjectAt(x + 0.5, y + 0.5)) v = textured ? 0.15f + 0.12f * ((x / 7 + y / 5) % 2) : 0.2f;
+                for (int c = 0; c < 3; ++c) img[(static_cast<std::size_t>(y) * w + x) * 3 + c] = v;
+            }
+        std::vector<float> depth(static_cast<std::size_t>(dw) * dh), mask(depth.size());
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                const bool s = subjectAt((x + 0.5) * w / dw, (y + 0.5) * h / dh);  // the coarse, stair-stepped depth edge
+                depth[static_cast<std::size_t>(y) * dw + x] = s ? 0.85f : 0.05f;
+                mask[static_cast<std::size_t>(y) * dw + x] = s ? 1.0f : 0.0f;
+            }
+        redline::BokehDepth d;
+        d.depth = depth.data();
+        d.mask = mask.data();
+        d.width = dw;
+        d.height = dh;
+        d.confidence = 0.9f;
+        redline::BokehParams p;
+        p.focalMm = 70;
+        p.aperture = 2.8f;
+        p.focusM = 0.6f;
+        p.focusX = 0.15f;
+        p.focusY = 0.5f;
+        p.phoneN = 20.0f;
+        p.threads = 2;
+        std::vector<float> out = img;
+        redline::BokehStats st;
+        const std::string err = redline::bokehRenderFloat(out.data(), w, h, static_cast<std::size_t>(w) * 3, t, d, p, st);
+        check(err.empty() && st.applied && st.ca, "seam scene renders with CA: " + err + st.reason);
+        double worst = 0, greenExcess = 0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+            const float* o = &out[i * 3];
+            const double mx = std::max(o[0], std::max(o[1], o[2])), mn = std::min(o[0], std::min(o[1], o[2]));
+            worst = std::max(worst, mx - mn);
+            greenExcess = std::max(greenExcess, static_cast<double>(o[1]) - std::max(o[0], o[2]));
+        }
+        std::printf("seam chroma (70mm f/2.8, CA on, %s neutral background, max radius %.0f px): max %.4f, green excess %.4f\n",
+                    textured ? "textured" : "uniform", static_cast<double>(st.maxRadius), worst, greenExcess);
+        check(worst < (textured ? 0.03 : 0.005), "neutral seam chroma below threshold");
+        check(greenExcess < (textured ? 0.02 : 0.005), "no green fringe at the seam");
+    }
+}
+
+// B31.1 (device run: a blurred near arm/leg ended at a hard edge on the in-focus subject): a bright foreground band in
+// front of a sharp background. Its blur must spread both ways across its edge (what shows through its fringe is the
+// occluded background, not its own colour): the ramp is near-symmetric about the edge.
+void testForegroundSpread() {
+    const float lo = -14, hi = 1;
+    const std::vector<float> tt = identityTable(512, lo, hi);  // encoded = linear / 2^hi: the ramp reads linearly
+    const redline::BokehTone t = tone(tt, lo, hi);
+    const int w = 400, h = 120, dw = 100, dh = 30, edge = 200;
+    std::vector<float> img(static_cast<std::size_t>(w) * h * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c) img[(static_cast<std::size_t>(y) * w + x) * 3 + c] = x >= edge ? 0.8f : 0.2f;
+    std::vector<float> depth(static_cast<std::size_t>(dw) * dh);
+    for (int y = 0; y < dh; ++y)
+        for (int x = 0; x < dw; ++x) depth[static_cast<std::size_t>(y) * dw + x] = x >= dw / 2 ? 0.95f : 0.5f;
+    redline::BokehDepth d;
+    d.depth = depth.data();
+    d.width = dw;
+    d.height = dh;
+    d.confidence = 0.9f;
+    redline::BokehParams p;
+    p.focalMm = 50;
+    p.aperture = 2.8f;
+    p.focusM = 1.0f;
+    p.focusX = 0.2f;
+    p.focusY = 0.5f;
+    p.phoneN = 24.0f;
+    p.maxCoc = 0.08f;
+    p.refine = false;
+    p.threads = 2;
+    std::vector<float> out = img;
+    redline::BokehStats st;
+    const std::string err = redline::bokehRenderFloat(out.data(), w, h, static_cast<std::size_t>(w) * 3, t, d, p, st);
+    check(err.empty() && st.applied && st.front, "foreground scene renders: " + err + st.reason);
+    const int y = h / 2;
+    auto at = [&](int x) { return static_cast<double>(out[(static_cast<std::size_t>(y) * w + x) * 3 + 1]); };
+    // distance from the edge at which the ramp reaches 10 % / 90 % of the step on each side
+    int outer = 0, inner = 0;
+    for (int x = edge - 1; x >= 0 && at(x) > 0.2 + 0.06; --x) outer = edge - x;
+    for (int x = edge; x < w && at(x) < 0.8 - 0.06; ++x) inner = x - edge + 1;
+    std::printf("foreground blur across its edge (radius %.1f px): spreads %d px over the background, %d px into itself; "
+                "edge value %.3f, 3 px inside %.3f\n",
+                static_cast<double>(st.maxRadius), outer, inner, at(edge), at(edge + 3));
+    check(inner >= outer / 2 && inner > 3, "foreground blur spreads across its own edge (no hard edge)");
+    check(at(edge + 3) < 0.75, "the occluded background shows through the foreground's fringe");
 }
 
 }  // namespace
@@ -662,6 +771,8 @@ int main(int argc, char** argv) {
     testScene();
     testCa();
     testGuided();
+    testSeamChroma();
+    testForegroundSpread();
     if (!quick) {
         timing(4000, 2667);
         timing(3000, 2000);
