@@ -7,3 +7,5 @@
 # B30 LiteRT: JNI-bound runtime classes.
 -keep class com.google.ai.edge.litert.** { *; }
 -dontwarn com.google.ai.edge.litert.**
+# B30.1: ai-delivery is excluded; LiteRT's unused AI-pack provider references it.
+-dontwarn com.google.android.play.**
