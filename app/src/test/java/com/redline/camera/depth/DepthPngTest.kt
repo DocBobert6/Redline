@@ -37,6 +37,27 @@ class DepthPngTest {
         }
     }
 
+    /** B31: the re-edit reads the sidecar back: exact samples, any PNG filter (ImageIO re-encodes with its own). */
+    @Test
+    fun decodeReadsOwnAndForeignSidecars() {
+        val w = 29
+        val h = 17
+        val px = ShortArray(w * h * 3) { i -> ((i * 7919) % 65536).toShort() }
+        val png = DepthPng.encode(w, h, px, "{}")
+        val d = DepthPng.decode(png)
+        assertEquals(w, d.width)
+        assertEquals(h, d.height)
+        assertEquals("{}", d.metadataJson)
+        for (i in px.indices) assertEquals(px[i].toInt() and 0xFFFF, d.rgb16[i])
+        assertEquals((px[3].toInt() and 0xFFFF) / 65535f, d.channel(0)[1], 1e-7f)
+        // the same pixels written by ImageIO (adaptive filters), decoded again
+        val img = ImageIO.read(ByteArrayInputStream(png))
+        val bos = java.io.ByteArrayOutputStream()
+        ImageIO.write(img, "png", bos)
+        val d2 = DepthPng.decode(bos.toByteArray())
+        for (i in px.indices) assertEquals("sample $i", px[i].toInt() and 0xFFFF, d2.rgb16[i])
+    }
+
     @Test
     fun noMetadataWithoutTheChunk() {
         assertNull(DepthPng.readText(ByteArray(8)))

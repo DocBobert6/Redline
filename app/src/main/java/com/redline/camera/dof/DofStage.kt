@@ -51,6 +51,9 @@ class DofStage(context: Context, val depth: DepthService) {
 
     @Volatile var onChange: ((DofReport) -> Unit)? = null
 
+    /** How long the save path waits for this shot's depth (the engine's GPU run is ~160 ms on the baseline phone). */
+    @Volatile var syncTimeoutMs: Long = DepthService.SYNC_TIMEOUT_MS
+
     fun setEnabled(on: Boolean) {
         enabled = on
         update { it.copy(enabled = on) }
@@ -129,7 +132,7 @@ class DofStage(context: Context, val depth: DepthService) {
         val phoneN = r.phoneEquivalentAperture!!
         working.incrementAndGet()
         try {
-            val sync = depth.runSync(r.still, r.rotation, r.base, r.nice)
+            val sync = depth.runSync(r.still, r.rotation, r.base, r.nice, syncTimeoutMs)
             val maps = sync.maps ?: return skip(sync.skip ?: DofReport.SKIP_DEPTH_FAILED, open = true)
             val withDepth: (DofShot) -> DofShot = {
                 it.copy(confidence = maps.confidence.toDouble(), depthMs = maps.depthMs, delegate = maps.delegate)
