@@ -128,8 +128,8 @@ class DofStage(context: Context, val depth: DepthService) {
             r.tone == null -> return skip(DofReport.SKIP_NO_TONE)
             r.phoneEquivalentAperture == null -> return skip(DofReport.SKIP_NO_LENS)
         }
-        val tone = r.tone!!
-        val phoneN = r.phoneEquivalentAperture!!
+        val tone: ColourPipeline.RenderTone = r.tone
+        val phoneN: Double = r.phoneEquivalentAperture
         working.incrementAndGet()
         try {
             val sync = depth.runSync(r.still, r.rotation, r.base, r.nice, syncTimeoutMs)

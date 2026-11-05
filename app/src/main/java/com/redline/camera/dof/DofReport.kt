@@ -32,7 +32,7 @@ data class DofShot(
         "base" to base,
         "applied" to applied,
         "skip_reason" to reason,
-        "aperture" to aperture.toDouble(),
+        "aperture" to r1(aperture.toDouble()),
         "focal_mm" to focalMm?.let { r1(it) },
         "focus_distance_m" to focusDistanceM?.let { r3(it) },
         "focus_distance_source" to focusSource,
@@ -69,7 +69,7 @@ data class DofReedit(
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "base" to base,
         "ok" to ok,
-        "aperture" to aperture.toDouble(),
+        "aperture" to r1(aperture.toDouble()),
         "focus_xy" to listOf(r3(focusX), r3(focusY)),
         "applied" to applied,
         "reason" to reason,
@@ -136,7 +136,7 @@ data class DofReport(
 
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "enabled" to enabled,
-        "aperture" to aperture.toDouble(),
+        "aperture" to r1(aperture.toDouble()),
         "default" to "on at ${DofMath.label(DofMath.DEFAULT_APERTURE)}; auto-off below confidence 0.35 (saved sharp)",
         "shots" to shots,
         "applied" to applied,
