@@ -307,6 +307,12 @@ object RedlineNative {
         val outWidth = v[13].toInt()
         val outHeight = v[14].toInt()
         val ms = v[15].toDouble()
+
+        /** B31.1: the matte path of the confidence (see depth_post.py): mask clarity, matte score, the two candidates. */
+        val maskClarity = v[16]
+        val matteScore = v[17]
+        val depthConfidence = v[18]
+        val matteConfidence = v[19]
     }
 
     /**
@@ -330,7 +336,7 @@ object RedlineNative {
         out: ShortArray
     ): DepthStats {
         check(load().loaded) { "native library not loaded: ${load().error}" }
-        val stats = FloatArray(16)
+        val stats = FloatArray(20)
         val err =
             nativeDepthFinish(depthOut, segOut, segW, segH, rgbCanvas, canvasW, canvasH, rect, rot, imageW, imageH, distortion, out, stats)
         check(err == null) { "depth finish: $err" }

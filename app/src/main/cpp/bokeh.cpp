@@ -1,15 +1,30 @@
 // B31 simulated depth of field. calibration/redline_cal/bokeh.py is the contract (see bokeh.h).
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE  // sched_getcpu, CPU_SET (glibc host builds; bionic and libc++ define it already)
+#endif
 #include "bokeh.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
+
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace redline {
 namespace {
@@ -24,36 +39,227 @@ constexpr double kCertGrad = 0.08;
 constexpr double kCertLo = 0.05, kCertHi = 0.2;
 constexpr int kLadderFine = 8;
 constexpr float kSnap = 0.25f;
-constexpr double kR0 = 4.0;
+constexpr double kR0 = 2.0;
 constexpr int kTile = 32;
 constexpr double kRim = 0.15;
 constexpr double kRimInner = 0.8;
 constexpr double kRimMinR = 4.0;
 constexpr int kBlades = 9;
 constexpr float kCaEps = 0.05f;
+constexpr double kCaRampLo = 4.0, kCaRampHi = 12.0;
 constexpr double kHdrCapEv = 8.0;
 constexpr int kInvPoints = 1024;
 constexpr int kMaxThreads = 8;
+constexpr int kRearQ = 8;
+constexpr double kRearEdgeLo = 0.02, kRearEdgeHi = 0.1, kRearNear = 0.25;
 constexpr double kPi = 3.14159265358979323846;
 constexpr float kLuma[3] = {0.2126729f, 0.7151522f, 0.0721750f};
 
 using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
-void parallelRows(int rows, int threads, const std::function<void(int, int)>& job) {
-    threads = std::min(std::max(threads, 1), std::min(kMaxThreads, std::max(rows, 1)));
-    if (threads == 1) {
-        job(0, rows);
-        return;
+// ------------------------------------------------------------------------------------------------ workers
+
+// B31.1: what one render's parallel regions run with, and what they saw.
+struct Exec {
+    int threads = 1;
+    int nice = kBokehInheritNice;
+    bool bigCores = false;
+    std::atomic<std::uint64_t> cpus{0};
+    std::atomic<int> niceSeen{kBokehInheritNice};
+    std::atomic<int> regions{0};
+};
+
+#if defined(__linux__)
+int threadId() { return static_cast<int>(syscall(SYS_gettid)); }
+int niceOf(int tid) {
+    errno = 0;
+    const int v = getpriority(PRIO_PROCESS, static_cast<id_t>(tid));
+    return errno != 0 ? kBokehInheritNice : v;
+}
+
+// The CPUs above the lowest-capacity cluster (cpu_capacity, else cpuinfo_max_freq), within the process' allowed set;
+// empty when the cores are all alike or fewer than two would remain.
+cpu_set_t bigCoreSet(bool& any) {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    any = false;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return allowed;
+    long cap[64];
+    long lo = LONG_MAX, hi = 0;
+    for (int c = 0; c < 64; ++c) {
+        cap[c] = -1;
+        if (!CPU_ISSET(c, &allowed)) continue;
+        char path[96];
+        long v = -1;
+        for (const char* f : {"cpu_capacity", "cpufreq/cpuinfo_max_freq"}) {
+            std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", c, f);
+            if (FILE* fp = std::fopen(path, "r")) {
+                if (std::fscanf(fp, "%ld", &v) != 1) v = -1;
+                std::fclose(fp);
+            }
+            if (v > 0) break;
+        }
+        cap[c] = v;
+        if (v > 0) {
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
     }
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<std::size_t>(threads));
-    for (int t = 0; t < threads; ++t) {
-        const int a = static_cast<int>(static_cast<long long>(rows) * t / threads);
-        const int b = static_cast<int>(static_cast<long long>(rows) * (t + 1) / threads);
-        pool.emplace_back([&job, a, b] { job(a, b); });
+    cpu_set_t big;
+    CPU_ZERO(&big);
+    if (hi <= 0 || hi == lo) return big;
+    int n = 0;
+    for (int c = 0; c < 64; ++c)
+        if (cap[c] > lo) {
+            CPU_SET(c, &big);
+            ++n;
+        }
+    any = n >= 2;
+    return big;
+}
+
+const cpu_set_t& allowedSet() {
+    static const cpu_set_t s = [] {
+        cpu_set_t a;
+        CPU_ZERO(&a);
+        sched_getaffinity(0, sizeof(a), &a);
+        return a;
+    }();
+    return s;
+}
+
+const cpu_set_t* bigSet() {
+    static bool any = false;
+    static const cpu_set_t s = bigCoreSet(any);
+    return any ? &s : nullptr;
+}
+
+void pinThread(int tid, bool big) {
+    const cpu_set_t* b = big ? bigSet() : nullptr;
+    sched_setaffinity(tid, sizeof(cpu_set_t), b != nullptr ? b : &allowedSet());
+}
+
+void markCpu(Exec& ex) {
+    const int c = sched_getcpu();
+    if (c >= 0 && c < 64) ex.cpus.fetch_or(std::uint64_t{1} << c, std::memory_order_relaxed);
+}
+#else
+int threadId() { return 0; }
+int niceOf(int) { return kBokehInheritNice; }
+void pinThread(int, bool) {}
+void markCpu(Exec&) {}
+#endif
+
+// A persistent pool: the workers live across renders, so the scheduler sees long-running busy threads (and moves them
+// to the fast cores and clocks) instead of thousands of short-lived ones; each region's nice is applied per worker
+// (Linux nice is per thread), optionally pinned to the cores above the little cluster. Regions are serialised.
+class Pool {
+public:
+    static Pool& get() {
+        static Pool* p = new Pool();  // never destroyed (workers may still be parked at exit)
+        return *p;
     }
-    for (auto& th : pool) th.join();
+
+    void run(int tasks, Exec& ex, const std::function<void(int)>& fn) {
+        if (tasks <= 0) return;
+        const int threads = std::min(std::min(std::max(ex.threads, 1), kMaxThreads), tasks);
+        ex.regions.fetch_add(1, std::memory_order_relaxed);
+        if (threads <= 1) {
+            markCpu(ex);
+            for (int i = 0; i < tasks; ++i) fn(i);
+            return;
+        }
+        std::lock_guard<std::mutex> serial(runM_);
+        ensure(threads - 1);
+        const int nice = ex.nice == kBokehInheritNice ? niceOf(threadId()) : ex.nice;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            fn_ = &fn;
+            tasks_ = tasks;
+            next_.store(0);
+            want_ = threads - 1;
+            finished_ = 0;
+            nice_ = nice;
+            big_ = ex.bigCores;
+            ex_ = &ex;
+            ++gen_;
+        }
+        cv_.notify_all();
+        markCpu(ex);
+        work(fn);
+        std::unique_lock<std::mutex> lk(m_);
+        done_.wait(lk, [&] { return finished_ == want_; });
+        fn_ = nullptr;
+        ex_ = nullptr;
+    }
+
+private:
+    void work(const std::function<void(int)>& fn) {
+        int i;
+        while ((i = next_.fetch_add(1)) < tasks_) fn(i);
+    }
+
+    void ensure(int n) {
+        while (static_cast<int>(workers_.size()) < n) {
+            const int idx = static_cast<int>(workers_.size());
+            workers_.emplace_back([this, idx] { loop(idx); });
+            workers_.back().detach();
+        }
+    }
+
+    void loop(int idx) {
+        std::uint64_t seen = 0;
+        int myNice = INT_MIN, myBig = -1;
+        const int tid = threadId();
+        for (;;) {
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&] { return gen_ != seen && idx < want_; });
+            seen = gen_;
+            const std::function<void(int)>* fn = fn_;
+            Exec* ex = ex_;
+            const int nice = nice_;
+            const int big = big_ ? 1 : 0;
+            lk.unlock();
+#if defined(__linux__)
+            if (nice != myNice && nice != kBokehInheritNice) {
+                setpriority(PRIO_PROCESS, static_cast<id_t>(tid), nice);
+                myNice = nice;
+            }
+#endif
+            if (big != myBig) {
+                pinThread(tid, big != 0);
+                myBig = big;
+            }
+            ex->niceSeen.store(niceOf(tid), std::memory_order_relaxed);
+            markCpu(*ex);
+            work(*fn);
+            lk.lock();
+            if (++finished_ == want_) done_.notify_one();
+        }
+    }
+
+    std::mutex runM_, m_;
+    std::condition_variable cv_, done_;
+    std::vector<std::thread> workers_;
+    const std::function<void(int)>* fn_ = nullptr;
+    Exec* ex_ = nullptr;
+    std::atomic<int> next_{0};
+    int tasks_ = 0, want_ = 0, finished_ = 0, nice_ = 0;
+    bool big_ = false;
+    std::uint64_t gen_ = 0;
+};
+
+// Rows [0, rows) in chunks (several per thread, taken dynamically, so a slow core does not hold the region up).
+void parallelRows(int rows, Exec& ex, const std::function<void(int, int)>& job) {
+    if (rows <= 0) return;
+    const int threads = std::min(std::max(ex.threads, 1), kMaxThreads);
+    const int chunks = threads == 1 ? 1 : std::min(rows, threads * 4);
+    Pool::get().run(chunks, ex, [&](int i) {
+        const int a = static_cast<int>(static_cast<long long>(rows) * i / chunks);
+        const int b = static_cast<int>(static_cast<long long>(rows) * (i + 1) / chunks);
+        if (b > a) job(a, b);
+    });
 }
 
 // ------------------------------------------------------------------------------------------------ optics / kernel
@@ -120,9 +326,11 @@ struct BladeRows {
     std::vector<unsigned char> valid;
     std::vector<double> xl, xr;
 
-    BladeRows(double r_, double beta_) : r(r_), beta(beta_) {
+    // rim: on when the disc's output radius (rOut, level radius x level) is at least kRimMinR (B31.1: by the output
+    // radius, so the rim does not come and go with the level a layer is gathered at); rOut < 0: r is the output radius
+    BladeRows(double r_, double beta_, double rOut = -1.0) : r(r_), beta(beta_) {
         k = static_cast<int>(std::ceil(r)) + 1;
-        if (r >= kRimMinR) {
+        if ((rOut < 0 ? r : rOut) >= kRimMinR) {
             shapes = 2;
             weight[0] = 1.0 + kRim;
             weight[1] = -kRim;
@@ -246,6 +454,33 @@ struct Curve {
         const float u = f - static_cast<float>(i);
         return std::min(std::max(t[i] + (t[i + 1] - t[i]) * u, 0.0f), 1.0f);
     }
+};
+
+// B31.1: the curve as one table on the float's exponent and top 7 mantissa bits (32768 nodes, linear in x between
+// them: relative node spacing 1/128, error far below one 8-bit step), for the per-pixel re-apply.
+class ToneLut {
+public:
+    explicit ToneLut(const Curve& c) : t_(kN + 1) {
+        for (std::uint32_t i = 0; i <= kN; ++i) {
+            const std::uint32_t b = std::min<std::uint32_t>(i, kN - 1) << 16;
+            float x;
+            std::memcpy(&x, &b, sizeof x);
+            t_[i] = i == kN ? t_[kN - 1] : (std::isfinite(x) ? c(x) : c(std::numeric_limits<float>::max()));
+        }
+    }
+    float operator()(float x) const {
+        if (!(x > 0.0f)) return 0.0f;
+        std::uint32_t b;
+        std::memcpy(&b, &x, sizeof b);
+        const std::uint32_t i = b >> 16;
+        if (i >= kN - 1) return t_[kN - 1];
+        const float f = static_cast<float>(b & 0xffffu) * (1.0f / 65536.0f);
+        return t_[i] + (t_[i + 1] - t_[i]) * f;
+    }
+
+private:
+    static constexpr std::uint32_t kN = 1u << 15;  // sign 0, 8 exponent bits, 7 mantissa bits
+    std::vector<float> t_;
 };
 
 double srgbDecode(double v) {
@@ -376,30 +611,56 @@ int ladderMax(double cap) {
     return k;
 }
 
-// (2r+1)^2 mean, clamped window, via a double integral image (one reusable buffer); float maps.
+// (2r+1)^2 mean, clamped window (divided by the pixels inside); B31.1: separable running sums in double, rows and
+// columns in parallel (the integral image it replaces was serial and the radius map's largest cost); float maps.
 struct BoxMean {
     int w, h, r;
-    std::vector<double> c;
-    BoxMean(int w_, int h_, int r_) : w(w_), h(h_), r(r_), c(static_cast<std::size_t>(w_ + 1) * (h_ + 1), 0.0) {}
+    Exec& ex;
+    std::vector<double> src, tmp;
+    BoxMean(int w_, int h_, int r_, Exec& e)
+        : w(w_), h(h_), r(r_), ex(e), src(static_cast<std::size_t>(w_) * h_), tmp(static_cast<std::size_t>(w_) * h_) {}
     template <typename F>
     std::vector<float> operator()(F f) {
-        for (int y = 0; y < h; ++y) {
-            double row = 0;
-            for (int x = 0; x < w; ++x) {
-                row += f(static_cast<std::size_t>(y) * w + x);
-                c[static_cast<std::size_t>(y + 1) * (w + 1) + x + 1] = c[static_cast<std::size_t>(y) * (w + 1) + x + 1] + row;
+        parallelRows(h, ex, [&](int a, int b) {
+            for (std::size_t i = static_cast<std::size_t>(a) * w; i < static_cast<std::size_t>(b) * w; ++i) src[i] = f(i);
+        });
+        // horizontal window sums
+        parallelRows(h, ex, [&](int a, int b) {
+            for (int y = a; y < b; ++y) {
+                const double* s = src.data() + static_cast<std::size_t>(y) * w;
+                double* o = tmp.data() + static_cast<std::size_t>(y) * w;
+                double run = 0;
+                for (int x = 0; x < std::min(r, w); ++x) run += s[x];
+                for (int x = 0; x < w; ++x) {
+                    if (x + r < w) run += s[x + r];
+                    if (x - r - 1 >= 0) run -= s[x - r - 1];
+                    o[x] = run;
+                }
             }
-        }
+        });
         std::vector<float> out(static_cast<std::size_t>(w) * h);
-        for (int y = 0; y < h; ++y) {
-            const int y0 = std::max(y - r, 0), y1 = std::min(y + r + 1, h);
-            for (int x = 0; x < w; ++x) {
-                const int x0 = std::max(x - r, 0), x1 = std::min(x + r + 1, w);
-                const double s = c[static_cast<std::size_t>(y1) * (w + 1) + x1] - c[static_cast<std::size_t>(y0) * (w + 1) + x1] -
-                                 c[static_cast<std::size_t>(y1) * (w + 1) + x0] + c[static_cast<std::size_t>(y0) * (w + 1) + x0];
-                out[static_cast<std::size_t>(y) * w + x] = static_cast<float>(s / ((y1 - y0) * (x1 - x0)));
+        // vertical window sums over column strips, divided by the window's pixel count
+        const int strips = (w + 63) / 64;
+        parallelRows(strips, ex, [&](int a, int b) {
+            std::vector<double> run(64);
+            for (int sIdx = a; sIdx < b; ++sIdx) {
+                const int x0 = sIdx * 64, x1 = std::min(x0 + 64, w);
+                std::fill(run.begin(), run.end(), 0.0);
+                for (int y = 0; y < std::min(r, h); ++y)
+                    for (int x = x0; x < x1; ++x) run[x - x0] += tmp[static_cast<std::size_t>(y) * w + x];
+                for (int y = 0; y < h; ++y) {
+                    const int ya = std::max(y - r, 0), yb = std::min(y + r + 1, h);
+                    if (y + r < h)
+                        for (int x = x0; x < x1; ++x) run[x - x0] += tmp[static_cast<std::size_t>(y + r) * w + x];
+                    if (y - r - 1 >= 0)
+                        for (int x = x0; x < x1; ++x) run[x - x0] -= tmp[static_cast<std::size_t>(y - r - 1) * w + x];
+                    for (int x = x0; x < x1; ++x) {
+                        const int xa = std::max(x - r, 0), xb = std::min(x + r + 1, w);
+                        out[static_cast<std::size_t>(y) * w + x] = static_cast<float>(run[x - x0] / ((yb - ya) * (xb - xa)));
+                    }
+                }
             }
-        }
+        });
         return out;
     }
 };
@@ -418,7 +679,7 @@ struct Still {
 };
 
 std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParams& p, std::vector<float>& map, int& ww, int& hh,
-                          BokehStats& st) {
+                          BokehStats& st, Exec& ex) {
     const int w = im.w, h = im.h;
     const int fw = std::max(1, (std::max(w, h) + p.workMax - 1) / p.workMax);
     ww = (w + fw - 1) / fw;
@@ -426,15 +687,19 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
     // guide: the encoded RGB box-averaged to the working grid (partial edge boxes)
     std::vector<float> guide[3];
     {
+        const auto tg = Clock::now();
         std::vector<double> acc(static_cast<std::size_t>(ww) * hh * 3, 0.0), cnt(static_cast<std::size_t>(ww) * hh, 0.0);
-        for (int y = 0; y < h; ++y) {
-            const int gy = y / fw;
-            for (int x = 0; x < w; ++x) {
-                const std::size_t i = static_cast<std::size_t>(gy) * ww + x / fw;
-                for (int c = 0; c < 3; ++c) acc[i * 3 + c] += im.enc(x, y, c);
-                cnt[i] += 1.0;
+        parallelRows(hh, ex, [&](int ga, int gb) {
+            for (int y = ga * fw; y < std::min(gb * fw, h); ++y) {
+                const int gy = y / fw;
+                for (int x = 0; x < w; ++x) {
+                    const std::size_t i = static_cast<std::size_t>(gy) * ww + x / fw;
+                    for (int c = 0; c < 3; ++c) acc[i * 3 + c] += im.enc(x, y, c);
+                    cnt[i] += 1.0;
+                }
             }
-        }
+        });
+        st.guideMs += msSince(tg);
         for (int c = 0; c < 3; ++c) {
             guide[c].resize(cnt.size());
             for (std::size_t i = 0; i < cnt.size(); ++i) guide[c][i] = static_cast<float>(acc[i * 3 + c] / cnt[i]);
@@ -491,7 +756,12 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
         std::vector<float> cw = resizeMap(cert.data(), d.width, d.height, ww, hh);
         for (float& v : cw) v = std::min(std::max(v, 0.0f), 1.0f);
         // He et al. colour guided filter on p = rho / cap, c p and c (the guide's inverse covariance shared)
-        BoxMean box(ww, hh, gr);
+        const auto tgf = Clock::now();
+        BoxMean box(ww, hh, gr, ex);
+        // per-pixel loops of the filter over the working rows in parallel
+        const auto pfor = [&](const std::function<void(std::size_t, std::size_t)>& f) {
+            parallelRows(hh, ex, [&](int ra, int rb) { f(static_cast<std::size_t>(ra) * ww, static_cast<std::size_t>(rb) * ww); });
+        };
         std::vector<float> mi[3];
         for (int c = 0; c < 3; ++c) mi[c] = box([&](std::size_t i) { return static_cast<double>(guide[c][i]); });
         std::vector<float> inv[6];  // symmetric inverse of (Sigma + eps U): 00 01 02 11 12 22
@@ -501,7 +771,8 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
             for (int k = 0; k < 6; ++k)
                 sg[k] = box([&](std::size_t i) { return static_cast<double>(guide[pi[k]][i]) * guide[pj[k]][i]; });
             for (auto& v : inv) v.resize(rho.size());
-            for (std::size_t i = 0; i < rho.size(); ++i) {
+            pfor([&](std::size_t i0, std::size_t i1) {
+            for (std::size_t i = i0; i < i1; ++i) {
                 const double m0 = mi[0][i], m1 = mi[1][i], m2 = mi[2][i];
                 const double a00 = sg[0][i] - m0 * m0 + kGfEps, a01 = sg[1][i] - m0 * m1, a02 = sg[2][i] - m0 * m2;
                 const double a11 = sg[3][i] - m1 * m1 + kGfEps, a12 = sg[4][i] - m1 * m2, a22 = sg[5][i] - m2 * m2 + kGfEps;
@@ -515,6 +786,7 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
                 inv[4][i] = static_cast<float>(c12 / det);
                 inv[5][i] = static_cast<float>(c22 / det);
             }
+            });
         }
         auto gf = [&](const std::function<double(std::size_t)>& pf) {
             const std::vector<float> mp = box(pf);
@@ -522,7 +794,8 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
             for (int c = 0; c < 3; ++c) cv[c] = box([&](std::size_t i) { return static_cast<double>(guide[c][i]) * pf(i); });
             std::vector<float> ca[3], cb(rho.size());
             for (int c = 0; c < 3; ++c) ca[c].resize(rho.size());
-            for (std::size_t i = 0; i < rho.size(); ++i) {
+            pfor([&](std::size_t i0, std::size_t i1) {
+            for (std::size_t i = i0; i < i1; ++i) {
                 const double m0 = mi[0][i], m1 = mi[1][i], m2 = mi[2][i], mpv = mp[i];
                 const double v0 = cv[0][i] - m0 * mpv, v1 = cv[1][i] - m1 * mpv, v2 = cv[2][i] - m2 * mpv;
                 const double x0 = inv[0][i] * v0 + inv[1][i] * v1 + inv[2][i] * v2;
@@ -533,23 +806,29 @@ std::string radiusMapImpl(const Still& im, const BokehDepth& d, const BokehParam
                 ca[2][i] = static_cast<float>(x2);
                 cb[i] = static_cast<float>(mpv - (x0 * m0 + x1 * m1 + x2 * m2));
             }
+            });
             const std::vector<float> mb = box([&](std::size_t i) { return static_cast<double>(cb[i]); });
             std::vector<double> q(rho.size());
-            for (std::size_t i = 0; i < rho.size(); ++i) q[i] = mb[i];
-            for (int c = 0; c < 3; ++c) {
-                const std::vector<float> ma = box([&](std::size_t i) { return static_cast<double>(ca[c][i]); });
-                for (std::size_t i = 0; i < rho.size(); ++i) q[i] += static_cast<double>(ma[i]) * guide[c][i];
-            }
+            std::vector<float> ma[3];
+            for (int c = 0; c < 3; ++c) ma[c] = box([&](std::size_t i) { return static_cast<double>(ca[c][i]); });
+            pfor([&](std::size_t i0, std::size_t i1) {
+                for (std::size_t i = i0; i < i1; ++i)
+                    q[i] = mb[i] + static_cast<double>(ma[0][i]) * guide[0][i] + static_cast<double>(ma[1][i]) * guide[1][i] +
+                           static_cast<double>(ma[2][i]) * guide[2][i];
+            });
             return q;
         };
         const std::vector<double> qp = gf([&](std::size_t i) { return rho[i] / cap; });
         const std::vector<double> qcp = gf([&](std::size_t i) { return cw[i] * rho[i] / cap; });
         const std::vector<double> qc = gf([&](std::size_t i) { return static_cast<double>(cw[i]); });
-        for (std::size_t i = 0; i < rho.size(); ++i) {
-            const double t = smoothstep(kCertLo, kCertHi, qc[i]);
-            const double q = t * qcp[i] / std::max(qc[i], kCertLo) + (1.0 - t) * qp[i];
-            map[i] = static_cast<float>(std::min(std::max(q * cap, -cap), cap));
-        }
+        pfor([&](std::size_t i0, std::size_t i1) {
+            for (std::size_t i = i0; i < i1; ++i) {
+                const double t = smoothstep(kCertLo, kCertHi, qc[i]);
+                const double q = t * qcp[i] / std::max(qc[i], kCertLo) + (1.0 - t) * qp[i];
+                map[i] = static_cast<float>(std::min(std::max(q * cap, -cap), cap));
+            }
+        });
+        st.guidedMs = msSince(tgf);
     }
     for (std::size_t i = 0; i < rho.size(); ++i) mx = std::max(mx, std::fabs(map[i]));
     // the guided filter's float maps (3 guide, 3 means, p, mean p, 3 + 6 moments) and the double integral
@@ -576,24 +855,34 @@ struct Layer {
     std::unique_ptr<BladeRows> blade;
 };
 
+// B31.1: the level kernel's radius. The box down-sample (variance q^2 / 12) and the bilinear up-sample (q^2 / 6) widen
+// a disc gathered at level q by q^2 / 4 per axis; a uniform disc of radius R has R^2 / 4, so the level disc is shrunk
+// to keep the rendered disc's second moment: r = sqrt((R / q)^2 - 1) for q > 1.
+double levelRadius(double rk, int q) {
+    const double r = rk / q;
+    return q > 1 ? std::sqrt(std::max(r * r - 1.0, 0.25 * r * r)) : r;
+}
+
 int levelOf(double rk) {
     int q = 1;
     while (rk / (2 * q) >= kR0) q *= 2;
     return q;
 }
 
-// Level-resolution rows [y0, y0 + rows) of width wl, padded by pad zero pixels each side, 4 floats per pixel, with
-// flags on the 32 x 32 tiles (global tile grid) that hold anything. Kept all-zero between uses: clear() re-zeroes
-// only the flagged tiles, so a sparse layer costs what it covers.
+// Level-resolution rows [y0, y0 + rows) of width wl, padded by pad zero pixels each side, nc floats per pixel
+// (premultiplied r, g, b, then one alpha (nc 4) or one alpha per colour lane (nc 6, the CA case)), with flags on the
+// 32 x 32 tiles (global tile grid) that hold anything. Kept all-zero between uses: clear() re-zeroes only the flagged
+// tiles, so a sparse layer costs what it covers.
 struct TileBuf {
-    int y0 = 0, rows = 0, cap = 0, wl = 0, pad = 0, tilesX = 0, ty0 = 0, tyN = 0;
+    int y0 = 0, rows = 0, cap = 0, wl = 0, pad = 0, tilesX = 0, ty0 = 0, tyN = 0, nc = 4;
     std::vector<float> v;
     std::vector<unsigned char> flag;
-    void init(int y0_, int rows_, int wl_, int pad_) {
+    void init(int y0_, int rows_, int wl_, int pad_, int nc_) {
         wl = wl_;
         pad = pad_;
         cap = rows_;
-        v.assign(static_cast<std::size_t>(rows_) * (wl + 2 * pad) * 4, 0.0f);
+        nc = nc_;
+        v.assign(static_cast<std::size_t>(rows_) * (wl + 2 * pad) * nc, 0.0f);
         tilesX = (wl + kTile - 1) / kTile;
         rebase(y0_, rows_);
     }
@@ -605,9 +894,9 @@ struct TileBuf {
         tyN = rows > 0 ? (y0 + rows - 1) / kTile - ty0 + 1 : 0;
         flag.assign(static_cast<std::size_t>(std::max(tyN, 0)) * tilesX, 0);
     }
-    float* row(int y) { return v.data() + (static_cast<std::size_t>(y - y0) * (wl + 2 * pad) + pad) * 4; }
-    const float* row(int y) const { return v.data() + (static_cast<std::size_t>(y - y0) * (wl + 2 * pad) + pad) * 4; }
-    void mark(int x, int y) { flag[static_cast<std::size_t>(y / kTile - ty0) * tilesX + x / kTile] = 1; }
+    float* row(int y) { return v.data() + (static_cast<std::size_t>(y - y0) * (wl + 2 * pad) + pad) * nc; }
+    const float* row(int y) const { return v.data() + (static_cast<std::size_t>(y - y0) * (wl + 2 * pad) + pad) * nc; }
+    void mark(int x, int y) { __atomic_store_n(&flag[static_cast<std::size_t>(y / kTile - ty0) * tilesX + x / kTile], 1, __ATOMIC_RELAXED); }
     bool tile(int tx, int ty) const {
         if (tx < 0 || tx >= tilesX || ty < ty0 || ty >= ty0 + tyN) return false;
         return flag[static_cast<std::size_t>(ty - ty0) * tilesX + tx] != 0;
@@ -628,7 +917,7 @@ struct TileBuf {
     }
     void clear() {
         forTiles([&](int xa, int xb, int ya, int yb) {
-            for (int y = ya; y < yb; ++y) std::fill(row(y) + static_cast<std::size_t>(xa) * 4, row(y) + static_cast<std::size_t>(xb) * 4, 0.0f);
+            for (int y = ya; y < yb; ++y) std::fill(row(y) + static_cast<std::size_t>(xa) * nc, row(y) + static_cast<std::size_t>(xb) * nc, 0.0f);
         });
         std::fill(flag.begin(), flag.end(), 0);
     }
@@ -637,18 +926,19 @@ struct TileBuf {
 
 class Renderer {
 public:
-    Renderer(const Still& im, const BokehTone& tone, const BokehParams& p, BokehStats& st)
-        : im_(im), tone_(tone), curve_(tone), p_(p), st_(st) {}
+    Renderer(const Still& im, const BokehTone& tone, const BokehParams& p, BokehStats& st, Exec& ex)
+        : im_(im), tone_(tone), curve_(tone), toneLut_(curve_), p_(p), st_(st), ex_(ex) {}
 
     std::string run(const BokehDepth& d) {
         const auto t0 = Clock::now();
-        std::string err = radiusMapImpl(im_, d, p_, map_, mw_, mh_, st_);
+        std::string err = radiusMapImpl(im_, d, p_, map_, mw_, mh_, st_, ex_);
         if (!err.empty()) return err;
         w_ = im_.w;
         h_ = im_.h;
         kmax_ = ladderMax(st_.capRadius);
         if (kmax_ > 62) return "blur cap too large";
         ca_ = caActive(p_.focalMm, p_.aperture);
+        nc_ = ca_ ? 6 : 4;
         beta_ = bokehBladeBeta(p_.aperture);
         tiled_ = catStrength(p_.aperture) > 0;
         hd_ = std::hypot(static_cast<double>(w_), static_cast<double>(h_)) / 2.0;
@@ -659,13 +949,14 @@ public:
             rad_.push_back(ladderRadius(k));
             rad2_.push_back(rad_.back() * rad_.back());
         }
-        // the full-resolution signed radius, 1/64 px (int16; see the reference)
+        const auto tu = Clock::now();
+        // the full-resolution signed radius, 1/64 px (int16; see the reference), bilinear from the working grid
         {
             Axis mx, my;
             mx.plan(mw_, w_);
             my.plan(mh_, h_);
             radQ_.resize(static_cast<std::size_t>(w_) * h_);
-            parallelRows(h_, p_.threads, [&](int a, int b) {
+            parallelRows(h_, ex_, [&](int a, int b) {
                 for (int y = a; y < b; ++y) {
                     const float* r0 = map_.data() + static_cast<std::size_t>(my.i0[y]) * mw_;
                     const float* r1 = map_.data() + static_cast<std::size_t>(my.i1[y]) * mw_;
@@ -691,31 +982,49 @@ public:
                 const double e[3] = {0.0, kCaEps, -kCaEps};
                 for (int c = 0; c < 3; ++c) {
                     double u = 0.0;
-                    if (a >= kSnap) u = a < 1.0 ? a * a : pos(c == 0 ? a : std::max(a * (1.0 + e[c]), 1.0));
+                    // B31.1: the CA fades in with the blur (none below kCaRampLo px, full from kCaRampHi), so the
+                    // partly blurred pixels of an in-focus/out-of-focus seam are not split by colour
+                    const double ec = e[c] * smoothstep(kCaRampLo, kCaRampHi, a);
+                    if (a >= kSnap) u = a < 1.0 ? a * a : pos(c == 0 ? a : std::max(a * (1.0 + ec), 1.0));
                     uLut_[c][static_cast<std::size_t>(i)] = static_cast<float>(u);
                 }
             }
         }
-        // per 32 x 32 tile of the still: the layers any pixel in it can feed (nominal ladder position -1 .. +2, which
-        // covers the colour lanes' shift and the blend with the next layer)
+        // per 32 x 32 tile of the still: exactly the layers its pixels feed on any lane (floor(u) and floor(u) + 1 of
+        // the lowest and highest lane), and whether it holds a pixel in front of the focus plane
         tilesW_ = (w_ + kTile - 1) / kTile;
         tilesH_ = (h_ + kTile - 1) / kTile;
         layerMask_.assign(static_cast<std::size_t>(tilesW_) * tilesH_, 0);
-        parallelRows(tilesH_, p_.threads, [&](int a, int b) {
+        std::atomic<bool> anyFront{false};
+        parallelRows(tilesH_, ex_, [&](int a, int b) {
+            bool fr = false;
             for (int ty = a; ty < b; ++ty)
                 for (int y = ty * kTile; y < std::min((ty + 1) * kTile, h_); ++y)
                     for (int x = 0; x < w_; ++x) {
-                        const int qi = std::abs(static_cast<int>(radQ_[static_cast<std::size_t>(y) * w_ + x]));
+                        const int rq = radQ_[static_cast<std::size_t>(y) * w_ + x];
+                        const int qi = std::abs(rq);
                         const float un = uLut_[0][static_cast<std::size_t>(qi)];
                         if (un <= 0.0f) continue;
-                        const int k = static_cast<int>(un);
+                        float ulo = un, uhi = un;
+                        if (ca_) {
+                            for (int c = 1; c < 3; ++c) {
+                                ulo = std::min(ulo, uLut_[c][static_cast<std::size_t>(qi)]);
+                                uhi = std::max(uhi, uLut_[c][static_cast<std::size_t>(qi)]);
+                            }
+                        }
+                        fr = fr || rq < 0;
                         std::uint64_t m = 0;
-                        for (int j = std::max(k - 1, 1); j <= std::min(k + 2, kmax_); ++j) m |= std::uint64_t{1} << j;
+                        for (int j = std::max(static_cast<int>(ulo), 1); j <= std::min(static_cast<int>(uhi) + 1, kmax_); ++j)
+                            m |= std::uint64_t{1} << j;
                         layerMask_[static_cast<std::size_t>(ty) * tilesW_ + x / kTile] |= m;
                     }
+            if (fr) anyFront.store(true);
         });
+        front_ = anyFront.load();
         st_.peakBytes = std::max(st_.peakBytes, static_cast<double>(radQ_.size()) * 2);
+        st_.upsampleMs = msSince(tu);
         st_.mapMs = msSince(t0);
+        const auto ti = Clock::now();
         inv_ = inverseTable(tone_);
         if (im_.rgba != nullptr)
             for (int i = 0; i < 256; ++i) lut_[i] = invAt(inv_, i * (1.0f / 255.0f));
@@ -742,13 +1051,20 @@ public:
             gTouch_.assign(n, 0);
             log2Lk_ = lk_ > 0 ? std::log2(lk_) : 0.0;
         }
+        st_.invertMs = msSince(ti);
+        if (front_) {
+            const auto tr = Clock::now();
+            rearFill();
+            st_.rearMs = msSince(tr);
+        }
+        st_.front = front_;
         for (int k = 1; k <= kmax_; ++k) {
             Layer l;
             l.k = k;
             l.R = rad_[static_cast<std::size_t>(k)];
             l.q = levelOf(l.R);
-            l.r = l.R / l.q;
-            l.blade = std::make_unique<BladeRows>(l.r, beta_);
+            l.r = levelRadius(l.R, l.q);
+            l.blade = std::make_unique<BladeRows>(l.r, beta_, l.R);
             layers_.push_back(std::move(l));
         }
         const auto t1 = Clock::now();
@@ -758,9 +1074,11 @@ public:
         bands();
         st_.bandsMs = msSince(t2);
         if (gout_) {
+            const auto tg = Clock::now();
             const std::size_t n = gSum_.size();
             for (std::size_t i = 0; i < n; ++i)
                 tone_.gainOut[i] = gTouch_[i] && gCnt_[i] > 0 ? static_cast<float>(gSum_[i] / gCnt_[i]) : tone_.gainLog2[i];
+            st_.gainMs += msSince(tg);
         }
         st_.totalMs = msSince(t0);
         st_.applied = true;
@@ -768,8 +1086,6 @@ public:
     }
 
 private:
-    float radAt(int x, int y) const { return radQ_[static_cast<std::size_t>(y) * w_ + x] * (1.0f / 64.0f); }
-
     // Encoded -> linear (curve input units) with the HDR continuation, one pixel.
     void linAt(int x, int y, float* o) const {
         if (im_.rgba != nullptr) {
@@ -799,6 +1115,18 @@ private:
         o[0] *= s;
         o[1] *= s;
         o[2] *= s;
+    }
+
+    // The band's linear pixels when the row is held there, else computed.
+    void lin(int x, int y, float* o) const {
+        if (y >= linY0_ && y < linY1_) {
+            const float* s = linBand_.data() + (static_cast<std::size_t>(y - linY0_) * w_ + x) * 3;
+            o[0] = s[0];
+            o[1] = s[1];
+            o[2] = s[2];
+            return;
+        }
+        linAt(x, y, o);
     }
 
     // B31 gain out: the log2 HDR gain of a linear (curve input) luma y, the B25 GainTable continuation.
@@ -846,7 +1174,7 @@ private:
         return k + std::min(std::max((a * a - r0) / (r1 - r0), 0.0), 1.0);
     }
 
-    // Ladder positions per lane (r, g, b, alpha) of the quantised radius |q| on its side (0: sharp).
+    // Ladder positions per colour lane (r, g, b) and the nominal one ([3]) of the quantised radius |q| on its side.
     void lanes(int qi, bool behind, float u[4]) const {
         const std::size_t i = static_cast<std::size_t>(qi);
         u[3] = uLut_[0][i];
@@ -860,48 +1188,178 @@ private:
         u[1] = behind ? up : dn;
     }
 
+    // B31.1: the occluded background behind front pixels (see rear_fill in the reference): push-pull of the non-front
+    // pixels' linear colour from 8 x 8 cells.
+    void rearFill() {
+        const int q = kRearQ;
+        const int cw = (w_ + q - 1) / q, chh = (h_ + q - 1) / q;
+        struct Lv {
+            int w, h;
+            std::vector<double> c;  // C r g b, W, N per cell
+        };
+        std::vector<Lv> lv;
+        lv.push_back({cw, chh, std::vector<double>(static_cast<std::size_t>(cw) * chh * 5, 0.0)});
+        {
+            Lv& l0 = lv[0];
+            parallelRows(chh, ex_, [&](int a, int b) {
+                for (int cy = a; cy < b; ++cy)
+                    for (int y = cy * q; y < std::min((cy + 1) * q, h_); ++y) {
+                        const std::int16_t* rr = radQ_.data() + static_cast<std::size_t>(y) * w_;
+                        for (int cx = 0; cx < cw; ++cx) {
+                            float s0 = 0, s1 = 0, s2 = 0;
+                            int nw = 0;
+                            const int xa = cx * q, xb = std::min(xa + q, w_);
+                            for (int x = xa; x < xb; ++x) {
+                                const int rq = rr[x];
+                                if (rq < 0 && uLut_[0][static_cast<std::size_t>(-rq)] > 0.0f) continue;
+                                float c[3];
+                                linAt(x, y, c);
+                                s0 += c[0];
+                                s1 += c[1];
+                                s2 += c[2];
+                                ++nw;
+                            }
+                            double* o = l0.c.data() + (static_cast<std::size_t>(cy) * cw + cx) * 5;
+                            o[0] += s0;
+                            o[1] += s1;
+                            o[2] += s2;
+                            o[3] += nw;
+                            o[4] += xb - xa;
+                        }
+                    }
+            });
+        }
+        while (lv.back().w > 1 || lv.back().h > 1) {
+            const Lv& f = lv.back();
+            Lv n{(f.w + 1) / 2, (f.h + 1) / 2, {}};
+            n.c.assign(static_cast<std::size_t>(n.w) * n.h * 5, 0.0);
+            for (int y = 0; y < f.h; ++y)
+                for (int x = 0; x < f.w; ++x)
+                    for (int k = 0; k < 5; ++k) n.c[(static_cast<std::size_t>(y / 2) * n.w + x / 2) * 5 + k] += f.c[(static_cast<std::size_t>(y) * f.w + x) * 5 + k];
+            lv.push_back(std::move(n));
+        }
+        // the non-front share per cell of every level (read at the level about a front pixel's blur radius)
+        nearLv_.clear();
+        for (std::size_t li = 0; li < lv.size(); ++li) {
+            NearLevel nl;
+            nl.w = lv[li].w;
+            nl.h = lv[li].h;
+            nl.share.resize(static_cast<std::size_t>(nl.w) * nl.h);
+            for (std::size_t i = 0; i < nl.share.size(); ++i) nl.share[i] = static_cast<float>(lv[li].c[i * 5 + 3] / lv[li].c[i * 5 + 4]);
+            nl.ax.planUp(nl.w, w_, q << li);
+            nl.ay.planUp(nl.h, h_, q << li);
+            nearLv_.push_back(std::move(nl));
+        }
+        std::vector<float> v(3);
+        {
+            const double* t = lv.back().c.data();
+            for (int k = 0; k < 3; ++k) v[static_cast<std::size_t>(k)] = t[3] > 0 ? static_cast<float>(t[k] / t[3]) : 0.0f;
+        }
+        int vw = 1, vh = 1;
+        for (int li = static_cast<int>(lv.size()) - 2; li >= 0; --li) {
+            const Lv& l = lv[static_cast<std::size_t>(li)];
+            Axis ax, ay;
+            ax.planUp(vw, l.w, 2);
+            ay.planUp(vh, l.h, 2);
+            std::vector<float> nv(static_cast<std::size_t>(l.w) * l.h * 3);
+            for (int y = 0; y < l.h; ++y)
+                for (int x = 0; x < l.w; ++x) {
+                    const double* c = l.c.data() + (static_cast<std::size_t>(y) * l.w + x) * 5;
+                    const double a = c[3] / c[4];
+                    for (int k = 0; k < 3; ++k) {
+                        const auto at = [&](int yy, int xx) { return v[(static_cast<std::size_t>(yy) * vw + xx) * 3 + k]; };
+                        const float wx = ax.w[static_cast<std::size_t>(x)], wy = ay.w[static_cast<std::size_t>(y)];
+                        const int x0 = ax.i0[static_cast<std::size_t>(x)], x1 = ax.i1[static_cast<std::size_t>(x)];
+                        const int y0 = ay.i0[static_cast<std::size_t>(y)], y1 = ay.i1[static_cast<std::size_t>(y)];
+                        const double up = (at(y0, x0) * (1 - wx) + at(y0, x1) * wx) * (1 - wy) + (at(y1, x0) * (1 - wx) + at(y1, x1) * wx) * wy;
+                        const double mean = c[3] > 0 ? c[k] / c[3] : 0.0;
+                        nv[(static_cast<std::size_t>(y) * l.w + x) * 3 + k] = static_cast<float>(a * mean + (1.0 - a) * up);
+                    }
+                }
+            v.swap(nv);
+            vw = l.w;
+            vh = l.h;
+        }
+        rear_.swap(v);
+        rearW_ = vw;
+        rearH_ = vh;
+        rearX_.planUp(vw, w_, q);
+        rearY_.planUp(vh, h_, q);
+    }
+
+    // The non-front share near (x, y) at the scale of blur radius a (px).
+    float nearAt(int x, int y, double a) const {
+        const int n = static_cast<int>(nearLv_.size());
+        const int li = std::min(std::max(static_cast<int>(std::floor(std::log2(std::max(a, 1.0) / kRearQ) + 0.5)), 0), n - 1);
+        const NearLevel& l = nearLv_[static_cast<std::size_t>(li)];
+        const int x0 = l.ax.i0[static_cast<std::size_t>(x)], x1 = l.ax.i1[static_cast<std::size_t>(x)];
+        const int y0 = l.ay.i0[static_cast<std::size_t>(y)], y1 = l.ay.i1[static_cast<std::size_t>(y)];
+        const float wx = l.ax.w[static_cast<std::size_t>(x)], wy = l.ay.w[static_cast<std::size_t>(y)];
+        const auto at = [&](int yy, int xx) { return l.share[static_cast<std::size_t>(yy) * l.w + xx]; };
+        return (at(y0, x0) * (1 - wx) + at(y0, x1) * wx) * (1 - wy) + (at(y1, x0) * (1 - wx) + at(y1, x1) * wx) * wy;
+    }
+
+    void rearAt(int x, int y, float* o) const {
+        const int x0 = rearX_.i0[static_cast<std::size_t>(x)], x1 = rearX_.i1[static_cast<std::size_t>(x)];
+        const int y0 = rearY_.i0[static_cast<std::size_t>(y)], y1 = rearY_.i1[static_cast<std::size_t>(y)];
+        const float wx = rearX_.w[static_cast<std::size_t>(x)], wy = rearY_.w[static_cast<std::size_t>(y)];
+        for (int k = 0; k < 3; ++k) {
+            const auto at = [&](int yy, int xx) { return rear_[(static_cast<std::size_t>(yy) * rearW_ + xx) * 3 + k]; };
+            o[k] = (at(y0, x0) * (1 - wx) + at(y0, x1) * wx) * (1 - wy) + (at(y1, x0) * (1 - wx) + at(y1, x1) * wx) * wy;
+        }
+    }
+
     // Layer k's premultiplied input on both sides from full-res rows [fy0, fy1), box-averaged into level q.
     void fill(const Layer& L, int fy0, int fy1, TileBuf* side[2]) {
         const auto tf = Clock::now();
         const int q = L.q, k = L.k;
         const float kf = static_cast<float>(k);
-        // threads on whole tile rows of the level (disjoint flags)
-        const int ly0 = fy0 / q, ly1 = (fy1 - 1) / q + 1;
-        const int t0 = ly0 / kTile, t1 = (ly1 - 1) / kTile + 1;
+        const int nc = nc_;
+        // threads on groups of full-res rows that never share a level pixel (max(q, 32) rows, aligned); tile flags
+        // shared between groups are set with relaxed atomic stores
+        const int g = std::max(q, kTile);
+        const int t0 = fy0 / g, t1 = (fy1 - 1) / g + 1;
         const std::uint64_t bit = std::uint64_t{1} << k;
-        parallelRows(t1 - t0, p_.threads, [&](int a, int b) {
+        parallelRows(t1 - t0, ex_, [&](int a, int b) {
             for (int ty = t0 + a; ty < t0 + b; ++ty) {
-                const int ya = std::max(ty * kTile * q, fy0), yb = std::min((ty + 1) * kTile * q, fy1);
+                const int ya = std::max(ty * g, fy0), yb = std::min((ty + 1) * g, fy1);
                 for (int fty = ya / kTile; fty * kTile < yb; ++fty) {
                     const int y0 = std::max(fty * kTile, ya), y1 = std::min((fty + 1) * kTile, yb);
                     for (int ftx = 0; ftx < tilesW_; ++ftx) {
                         if (!(layerMask_[static_cast<std::size_t>(fty) * tilesW_ + ftx] & bit)) continue;
                         const int x0 = ftx * kTile, x1 = std::min(x0 + kTile, w_);
                         for (int y = y0; y < y1; ++y) {
+                            const std::int16_t* rr = radQ_.data() + static_cast<std::size_t>(y) * w_;
                             for (int x = x0; x < x1; ++x) {
-                                const int rq = radQ_[static_cast<std::size_t>(y) * w_ + x];
+                                const int rq = rr[x];
                                 const int qi = std::abs(rq);
                                 const float un = uLut_[0][static_cast<std::size_t>(qi)];
-                                if (un <= 0.0f || un < kf - 2.0f || un > kf + 2.0f) continue;
+                                if (un <= 0.0f || un < kf - 1.5f || un > kf + 1.5f) continue;
                                 const bool behind = rq > 0;
                                 float u[4];
                                 lanes(qi, behind, u);
-                                float wl[4];
+                                float wl[3];
                                 bool any = false;
-                                for (int l = 0; l < 4; ++l) {
+                                for (int l = 0; l < 3; ++l) {
                                     wl[l] = std::max(0.0f, 1.0f - std::fabs(u[l] - kf));
                                     any = any || wl[l] > 0.0f;
                                 }
                                 if (!any) continue;
                                 float c[3];
-                                linAt(x, y, c);
+                                lin(x, y, c);
                                 TileBuf& B = *side[behind ? 0 : 1];
                                 const int lx = x / q, lyy = y / q;
-                                float* o = B.row(lyy) + static_cast<std::size_t>(lx) * 4;
+                                float* o = B.row(lyy) + static_cast<std::size_t>(lx) * nc;
                                 o[0] += wl[0] * c[0];
                                 o[1] += wl[1] * c[1];
                                 o[2] += wl[2] * c[2];
-                                o[3] += wl[3];
+                                if (nc == 4) {
+                                    o[3] += wl[0];
+                                } else {
+                                    o[3] += wl[0];
+                                    o[4] += wl[1];
+                                    o[5] += wl[2];
+                                }
                                 B.mark(lx, lyy);
                             }
                         }
@@ -917,7 +1375,7 @@ private:
                         float* r = side[s]->row(ly);
                         for (int lx = xa; lx < xb; ++lx) {
                             const float inv = 1.0f / static_cast<float>(std::min(q, w_ - lx * q) * ny);
-                            for (int c = 0; c < 4; ++c) r[static_cast<std::size_t>(lx) * 4 + c] *= inv;
+                            for (int c = 0; c < nc; ++c) r[static_cast<std::size_t>(lx) * nc + c] *= inv;
                         }
                     }
                 });
@@ -939,6 +1397,41 @@ private:
             have[idx] = 1;
         }
         return cache[idx];
+    }
+
+    // One output row segment [x0, x1) of the gather (NC floats per pixel).
+    template <int NC>
+    static void gatherRow(const Kernel& K, const TileBuf& in, int hl, int y, int x0, int x1, float* orow) {
+        for (const Term& t : K.terms) {
+            const int sy = y - t.dy;
+            if (sy < 0 || sy >= hl) continue;
+            const float* src = in.row(sy);
+            const float wgt = t.w;
+            if (t.lo == t.hi) {
+                const float c = wgt * t.cl;
+                for (int x = x0; x < x1; ++x) {
+                    const float* s = src + static_cast<std::ptrdiff_t>(x - t.lo) * NC;
+                    float* o = orow + static_cast<std::size_t>(x) * NC;
+                    for (int l = 0; l < NC; ++l) o[l] += c * s[l];
+                }
+                continue;
+            }
+            float acc[NC];
+            for (int l = 0; l < NC; ++l) acc[l] = 0.0f;
+            for (int j = x0 - t.hi + 1; j <= x0 - t.lo - 1; ++j)
+                for (int l = 0; l < NC; ++l) acc[l] += src[static_cast<std::ptrdiff_t>(j) * NC + l];
+            const float cl = t.cl, chh = t.ch;
+            for (int x = x0; x < x1; ++x) {
+                const float* sl = src + static_cast<std::ptrdiff_t>(x - t.lo) * NC;
+                const float* sh = src + static_cast<std::ptrdiff_t>(x - t.hi) * NC;
+                const float* sd = src + static_cast<std::ptrdiff_t>(x - t.hi + 1) * NC;
+                float* o = orow + static_cast<std::size_t>(x) * NC;
+                for (int l = 0; l < NC; ++l) {
+                    o[l] += wgt * (acc[l] + cl * sl[l] + chh * sh[l]);
+                    acc[l] += sl[l] - sd[l];
+                }
+            }
+        }
     }
 
     // Accumulates into out rows [oy0, oy1) (a TileBuf without padding) the gather of `in` with layer L.
@@ -964,7 +1457,8 @@ private:
                 out.mark(tx * kTile, std::max(ty * kTile, oy0));
             }
         st_.layers++;
-        parallelRows(oy1 - oy0, p_.threads, [&](int a, int b) {
+        const bool six = nc_ == 6;
+        parallelRows(oy1 - oy0, ex_, [&](int a, int b) {
             for (int y = oy0 + a; y < oy0 + b; ++y) {
                 const int ty = y / kTile;
                 float* orow = out.row(y);
@@ -980,34 +1474,10 @@ private:
                         while (tx1 < tilesX && wr[tx1]) ++tx1;
                     const Kernel& K = cache[tiled_ ? static_cast<std::size_t>(ty - ty0) * tilesX + tx : 0];
                     const int x0 = tx * kTile, x1 = std::min(tx1 * kTile, wl);
-                    for (const Term& t : K.terms) {
-                        const int sy = y - t.dy;
-                        if (sy < 0 || sy >= hl) continue;
-                        const float* src = in.row(sy);
-                        const float wgt = t.w;
-                        if (t.lo == t.hi) {
-                            const float c = wgt * t.cl;
-                            for (int x = x0; x < x1; ++x) {
-                                const float* s = src + static_cast<std::ptrdiff_t>(x - t.lo) * 4;
-                                float* o = orow + static_cast<std::size_t>(x) * 4;
-                                for (int l = 0; l < 4; ++l) o[l] += c * s[l];
-                            }
-                            continue;
-                        }
-                        float acc[4] = {0, 0, 0, 0};
-                        for (int j = x0 - t.hi + 1; j <= x0 - t.lo - 1; ++j)
-                            for (int l = 0; l < 4; ++l) acc[l] += src[static_cast<std::ptrdiff_t>(j) * 4 + l];
-                        const float cl = t.cl, chh = t.ch;
-                        for (int x = x0; x < x1; ++x) {
-                            const float* sl = src + static_cast<std::ptrdiff_t>(x - t.lo) * 4;
-                            const float* sh = src + static_cast<std::ptrdiff_t>(x - t.hi) * 4;
-                            const float* sd = src + static_cast<std::ptrdiff_t>(x - t.hi + 1) * 4;
-                            float* o = orow + static_cast<std::size_t>(x) * 4;
-                            for (int l = 0; l < 4; ++l) {
-                                o[l] += wgt * (acc[l] + cl * sl[l] + chh * sh[l]);
-                                acc[l] += sl[l] - sd[l];
-                            }
-                        }
+                    if (six) {
+                        gatherRow<6>(K, in, hl, y, x0, x1, orow);
+                    } else {
+                        gatherRow<4>(K, in, hl, y, x0, x1, orow);
                     }
                     tx = tx1;
                 }
@@ -1047,11 +1517,11 @@ private:
             lv.q = q;
             lv.wl = wl;
             lv.hl = hl;
-            lv.acc[0].init(0, hl, wl, 0);
-            lv.acc[1].init(0, hl, wl, 0);
+            lv.acc[0].init(0, hl, wl, 0, nc_);
+            lv.acc[1].init(0, hl, wl, 0, nc_);
             TileBuf in[2];
-            in[0].init(0, hl, wl, maxK(q) + 2);
-            in[1].init(0, hl, wl, maxK(q) + 2);
+            in[0].init(0, hl, wl, maxK(q) + 2, nc_);
+            in[1].init(0, hl, wl, maxK(q) + 2, nc_);
             TileBuf* sides[2] = {&in[0], &in[1]};
             levelBytes_ += lv.acc[0].bytes() * 2;
             st_.peakBytes = std::max(st_.peakBytes, levelBytes_ + in[0].bytes() * 2 + static_cast<double>(radQ_.size()) * 2);
@@ -1069,17 +1539,23 @@ private:
         }
     }
 
-    static void bilinear(const TileBuf& acc, const Axis& ax, const Axis& ay, int x, int y, float* P) {
+    template <int NC>
+    static void bilinearT(const TileBuf& acc, const Axis& ax, const Axis& ay, int x, int y, float* P) {
         const int x0 = ax.i0[static_cast<std::size_t>(x)], x1 = ax.i1[static_cast<std::size_t>(x)];
         const float* r0 = acc.row(ay.i0[static_cast<std::size_t>(y)]);
         const float* r1 = acc.row(ay.i1[static_cast<std::size_t>(y)]);
         const float wx = ax.w[static_cast<std::size_t>(x)], wy = ay.w[static_cast<std::size_t>(y)];
-        for (int l = 0; l < 4; ++l) {
-            const float t = r0[x0 * 4 + l] * (1 - wx) + r0[x1 * 4 + l] * wx;
-            const float v = r1[x0 * 4 + l] * (1 - wx) + r1[x1 * 4 + l] * wx;
+        for (int l = 0; l < NC; ++l) {
+            const float t = r0[x0 * NC + l] * (1 - wx) + r0[x1 * NC + l] * wx;
+            const float v = r1[x0 * NC + l] * (1 - wx) + r1[x1 * NC + l] * wx;
             P[l] += t * (1 - wy) + v * wy;
         }
     }
+
+    struct Pending {
+        int y0 = 0, rows = 0, next = 0;
+        std::vector<float> px;  // rows x w x 3 linear results (NaN: untouched)
+    };
 
     // Levels 1 and 2 in row bands, then the composite.
     void bands() {
@@ -1116,47 +1592,73 @@ private:
             ry0 &= ~1;
             ry1 = std::min(ry1 + (ry1 & 1), h_);
         };
+        const int nc = nc_;
         // buffers reused across bands (kept zero)
         const int maxRows = std::min(h_, band + 4 * std::max(K1, K2) + 16);
         TileBuf in1[2], in2[2], acc1[2], acc2[2];
         for (int s = 0; s < 2; ++s) {
-            in1[s].init(0, maxRows, w_, K1 + 2);
-            acc1[s].init(0, band, w_, 0);
+            in1[s].init(0, maxRows, w_, K1 + 2, nc);
+            acc1[s].init(0, band, w_, 0, nc);
             if (has2) {
-                in2[s].init(0, maxRows / 2 + 2, wl2, K2 + 2);
-                acc2[s].init(0, band / 2 + 4, wl2, 0);
+                in2[s].init(0, maxRows / 2 + 2, wl2, K2 + 2, nc);
+                acc2[s].init(0, band / 2 + 4, wl2, 0, nc);
             }
         }
-        double bytes = levelBytes_ + static_cast<double>(radQ_.size()) * 2;
+        linBand_.assign(static_cast<std::size_t>(maxRows + 2) * w_ * 3, 0.0f);
+        double bytes = levelBytes_ + static_cast<double>(radQ_.size()) * 2 + static_cast<double>(linBand_.size()) * 4;
         for (int s = 0; s < 2; ++s) bytes += in1[s].bytes() + in2[s].bytes() + acc1[s].bytes() + acc2[s].bytes();
         // The still is written in place, so a finished row is held back until no later band reads it.
-        std::vector<std::pair<int, std::vector<float>>> pending;
+        std::vector<Pending> pending, spare;
         auto flush = [&](int below) {
+            const auto ts = Clock::now();
+            for (Pending& pb : pending) {
+                const int stop = std::min(pb.y0 + pb.rows, below);
+                if (stop > pb.next) {
+                    const int a0 = pb.next;
+                    parallelRows(stop - a0, ex_, [&](int a, int b) {
+                        for (int y = a0 + a; y < a0 + b; ++y) {
+                            const float* r = pb.px.data() + static_cast<std::size_t>(y - pb.y0) * w_ * 3;
+                            for (int x = 0; x < w_; ++x)
+                                if (!std::isnan(r[x * 3])) store(x, y, r + x * 3);
+                        }
+                    });
+                    pb.next = stop;
+                }
+            }
             std::size_t keep = 0;
             for (std::size_t i = 0; i < pending.size(); ++i) {
-                auto& pr = pending[i];
-                if (pr.first < below) {
-                    for (int x = 0; x < w_; ++x) {
-                        const float* o = pr.second.data() + static_cast<std::size_t>(x) * 3;
-                        if (!std::isnan(o[0])) store(x, pr.first, o);
-                    }
+                if (pending[i].next >= pending[i].y0 + pending[i].rows) {
+                    spare.push_back(std::move(pending[i]));
                 } else {
-                    if (keep != i) pending[keep] = std::move(pr);
+                    if (keep != i) pending[keep] = std::move(pending[i]);
                     ++keep;
                 }
             }
             pending.resize(keep);
+            st_.storeMs += msSince(ts);
         };
-        std::vector<float> outBand(static_cast<std::size_t>(band) * w_ * 3);
         std::vector<float> gBand(gout_ ? static_cast<std::size_t>(band) * w_ : 0);
         std::vector<std::uint8_t> tBand(gout_ ? static_cast<std::size_t>(band) * w_ : 0);
-        bytes += static_cast<double>(outBand.size()) * 4 * 2;
+        bytes += static_cast<double>(band) * w_ * 3 * 4 * 3;
         st_.peakBytes = std::max(st_.peakBytes, bytes);
         for (int Y0 = 0; Y0 < h_; Y0 += band) {
             const int Y1 = std::min(Y0 + band, h_);
             const int bandRows = Y1 - Y0;
             int ly0, ly1, ry0, ry1;
             region(Y0, Y1, ly0, ly1, ry0, ry1);
+            // the band's linear pixels (read by the fills and the composite), before any of its rows is overwritten
+            {
+                const auto tl = Clock::now();
+                linY0_ = linY1_ = 0;
+                const int la = ry0, lb = std::min(ry1, ry0 + maxRows + 2);
+                parallelRows(lb - la, ex_, [&](int a, int b) {
+                    for (int y = la + a; y < la + b; ++y)
+                        for (int x = 0; x < w_; ++x) linAt(x, y, linBand_.data() + (static_cast<std::size_t>(y - la) * w_ + x) * 3);
+                });
+                linY0_ = la;
+                linY1_ = lb;
+                st_.linMs += msSince(tl);
+            }
             for (int s = 0; s < 2; ++s) {
                 acc1[s].clear();
                 acc1[s].rebase(Y0, bandRows);
@@ -1187,7 +1689,16 @@ private:
                     }
                 }
             }
-            std::fill(outBand.begin(), outBand.end(), std::numeric_limits<float>::quiet_NaN());
+            Pending pb;
+            if (!spare.empty()) {
+                pb = std::move(spare.back());
+                spare.pop_back();
+            }
+            pb.y0 = Y0;
+            pb.rows = bandRows;
+            pb.next = Y0;
+            pb.px.resize(static_cast<std::size_t>(band) * w_ * 3);
+            std::fill(pb.px.begin(), pb.px.end(), std::numeric_limits<float>::quiet_NaN());
             const auto tc = Clock::now();
             struct Src {
                 const TileBuf* acc;
@@ -1202,7 +1713,8 @@ private:
                 for (const Level& lv : levels_) srcs.push_back({&lv.acc[sd], &lv.ax, &lv.ay, sd});
             }
             const int xt = tilesW_;
-            parallelRows(bandRows, p_.threads, [&](int a, int b) {
+            const bool six = nc == 6;
+            parallelRows(bandRows, ex_, [&](int a, int b) {
                 std::vector<unsigned char> fl(srcs.size() * static_cast<std::size_t>(xt));
                 for (int i = a; i < b; ++i) {
                     const int y = Y0 + i;
@@ -1220,8 +1732,11 @@ private:
                             anyFront = anyFront || (f && sr.side == 1);
                         }
                     }
+                    const std::int16_t* rr = radQ_.data() + static_cast<std::size_t>(y) * w_;
+                    float* orow = pb.px.data() + static_cast<std::size_t>(i) * w_ * 3;
                     for (int x = 0; x < w_; ++x) {
-                        const float un = uLut_[0][static_cast<std::size_t>(std::abs(static_cast<int>(radQ_[static_cast<std::size_t>(y) * w_ + x])))];
+                        const int rq = rr[x];
+                        const float un = uLut_[0][static_cast<std::size_t>(std::abs(rq))];
                         const float w0 = std::max(0.0f, 1.0f - un);
                         const std::size_t gi = static_cast<std::size_t>(i) * w_ + x;
                         if (gout_) {
@@ -1233,29 +1748,64 @@ private:
                             continue;
                         }
                         const int t = x / kTile;
-                        float P[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+                        float P[2][6] = {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}};
                         for (std::size_t si = 0; si < srcs.size(); ++si) {
                             if (!fl[si * xt + t]) continue;
                             const Src& sr = srcs[si];
                             if (sr.side == 0 && w0 >= 1.0f) continue;  // the background does not show through a sharp pixel
-                            bilinear(*sr.acc, *sr.ax, *sr.ay, x, y, P[sr.side]);
+                            if (six) {
+                                bilinearT<6>(*sr.acc, *sr.ax, *sr.ay, x, y, P[sr.side]);
+                            } else {
+                                bilinearT<4>(*sr.acc, *sr.ax, *sr.ay, x, y, P[sr.side]);
+                            }
                         }
-                        const float ab = P[0][3], af = P[1][3];
-                        if (w0 >= 1.0f && af < 1e-6f) {  // untouched: keep the input exactly
+                        float af[3], ab[3];
+                        for (int l = 0; l < 3; ++l) {
+                            af[l] = P[1][six ? 3 + l : 3];
+                            ab[l] = P[0][six ? 3 + l : 3];
+                        }
+                        const float afMax = std::max(af[0], std::max(af[1], af[2]));
+                        if (w0 >= 1.0f && afMax < 1e-6f) {  // untouched: keep the input exactly
                             if (gout_) gBand[gi] = gainUnchanged(x, y);
                             continue;
                         }
                         float c[3];
-                        linAt(x, y, c);
-                        float* o = outBand.data() + (static_cast<std::size_t>(i) * w_ + x) * 3;
+                        lin(x, y, c);
+                        const bool fr = rq < 0 && un > 0.0f;
+                        float rc[3] = {0, 0, 0};
+                        float nearS = 0.0f;
+                        if (fr) {
+                            rearAt(x, y, rc);
+                            nearS = static_cast<float>(smoothstep(0.0, kRearNear, nearAt(x, y, -rq / 64.0)));
+                        }
+                        float* o = orow + static_cast<std::size_t>(x) * 3;
                         double yb = 0.0;
                         for (int l = 0; l < 3; ++l) {
-                            const float fgn = af > 1e-4f ? P[1][l] / af : c[l];
-                            const float bgn = ab > 1e-4f ? P[0][l] / ab : fgn;
-                            const float mid = w0 * c[l] + (1.0f - w0) * bgn;
-                            const float lin = P[1][l] + (1.0f - af) * mid;
-                            yb += kLuma[l] * static_cast<double>(lin);
-                            o[l] = curve_(lin);
+                            const float fgn = af[l] > 1e-4f ? P[1][l] / af[l] : c[l];
+                            const float bgb = ab[l] > 1e-4f ? P[0][l] / ab[l] : fgn;
+                            float lv;
+                            if (!fr) {
+                                const float mid = w0 * c[l] + (1.0f - w0) * bgb;
+                                const float a1 = std::min(af[l], 1.0f);  // overlapping front spreads are normalised
+                                lv = a1 * fgn + (1.0f - a1) * mid;
+                            } else {
+                                // a pixel in front: covered by the front blur and its own sharp share; the rest shows
+                                // what is behind it (the behind blur, else the occluded background at its edge)
+                                const float cov = af[l] + w0;
+                                const float own = P[1][l] + w0 * c[l];
+                                if (cov >= 1.0f) {
+                                    lv = own / cov;
+                                } else {
+                                    float hid = bgb;
+                                    if (!(ab[l] > 1e-4f)) {
+                                        const float se = static_cast<float>(smoothstep(kRearEdgeLo, kRearEdgeHi, 1.0 - cov)) * nearS;
+                                        hid = se * rc[l] + (1.0f - se) * fgn;
+                                    }
+                                    lv = own + (1.0f - cov) * hid;
+                                }
+                            }
+                            yb += kLuma[l] * static_cast<double>(lv);
+                            o[l] = lv;
                         }
                         if (gout_) {
                             gBand[gi] = gainOfLuma(yb);
@@ -1264,7 +1814,25 @@ private:
                     }
                 }
             });
+            st_.compositeMs += msSince(tc);
+            // tone re-applied (B31.1: its own pass, timed)
+            {
+                const auto tt = Clock::now();
+                parallelRows(bandRows, ex_, [&](int a, int b) {
+                    for (int i = a; i < b; ++i) {
+                        float* r = pb.px.data() + static_cast<std::size_t>(i) * w_ * 3;
+                        for (int x = 0; x < w_ * 3; x += 3) {
+                            if (std::isnan(r[x])) continue;
+                            r[x] = toneLut_(r[x]);
+                            r[x + 1] = toneLut_(r[x + 1]);
+                            r[x + 2] = toneLut_(r[x + 2]);
+                        }
+                    }
+                });
+                st_.toneMs += msSince(tt);
+            }
             if (gout_) {
+                const auto tg = Clock::now();
                 const int gw = tone_.gainW;
                 for (int i = 0; i < bandRows; ++i) {
                     const std::size_t row = static_cast<std::size_t>(cellY_[static_cast<std::size_t>(Y0 + i)]) * gw;
@@ -1276,11 +1844,9 @@ private:
                         gTouch_[ci] |= tBand[gi];
                     }
                 }
+                st_.gainMs += msSince(tg);
             }
-            st_.compositeMs += msSince(tc);
-            for (int i = 0; i < bandRows; ++i)
-                pending.emplace_back(Y0 + i, std::vector<float>(outBand.begin() + static_cast<std::ptrdiff_t>(i) * w_ * 3,
-                                                                outBand.begin() + static_cast<std::ptrdiff_t>(i + 1) * w_ * 3));
+            pending.push_back(std::move(pb));
             int nly0, nly1, nry0 = h_, nry1;
             if (Y1 < h_) region(Y1, std::min(Y1 + band, h_), nly0, nly1, nry0, nry1);
             flush(nry0);
@@ -1301,16 +1867,18 @@ private:
     const Still& im_;
     const BokehTone& tone_;
     Curve curve_;
+    ToneLut toneLut_;
     const BokehParams& p_;
     BokehStats& st_;
+    Exec& ex_;
     std::vector<float> map_;
     std::vector<std::int16_t> radQ_;
     std::vector<double> rad_, rad2_;
-    int mw_ = 0, mh_ = 0, w_ = 0, h_ = 0, kmax_ = 1, tilesW_ = 0, tilesH_ = 0;
+    int mw_ = 0, mh_ = 0, w_ = 0, h_ = 0, kmax_ = 1, tilesW_ = 0, tilesH_ = 0, nc_ = 4;
     std::vector<std::uint64_t> layerMask_;
     std::vector<float> uLut_[3];
     Axis gX_, gY_;
-    bool ca_ = false, tiled_ = false, hdr_ = false, gout_ = false;
+    bool ca_ = false, tiled_ = false, hdr_ = false, gout_ = false, front_ = false;
     std::vector<int> cellX_, cellY_;
     std::vector<double> gSum_;
     std::vector<int> gCnt_;
@@ -1321,6 +1889,17 @@ private:
     float lut_[256] = {};
     std::vector<Layer> layers_;
     std::vector<Level> levels_;
+    std::vector<float> linBand_;
+    int linY0_ = 0, linY1_ = 0;
+    std::vector<float> rear_;
+    int rearW_ = 1, rearH_ = 1;
+    struct NearLevel {
+        int w = 1, h = 1;
+        std::vector<float> share;
+        Axis ax, ay;
+    };
+    std::vector<NearLevel> nearLv_;
+    Axis rearX_, rearY_;
 };
 
 std::string validate(const Still& im, const BokehTone& t, const BokehDepth& d, const BokehParams& p) {
@@ -1352,8 +1931,33 @@ std::string renderImpl(Still& im, const BokehTone& tone, const BokehDepth& d, co
         st.phoneFactor = 0;
         return "";
     }
-    Renderer r(im, tone, p, st);
-    return r.run(d);
+    Exec ex;
+    ex.threads = std::min(std::max(p.threads, 1), kMaxThreads);
+    ex.nice = p.nice;
+    ex.bigCores = p.bigCores;
+#if defined(__linux__)
+    // the calling thread joins every region: pin it with the workers for the render, then restore its mask
+    cpu_set_t prev;
+    CPU_ZERO(&prev);
+    const int tid = threadId();
+    const bool pinned = p.bigCores && bigSet() != nullptr && sched_getaffinity(tid, sizeof(prev), &prev) == 0;
+    if (pinned) pinThread(tid, true);
+#endif
+    std::string res;
+    {
+        Renderer r(im, tone, p, st, ex);
+        res = r.run(d);
+    }
+#if defined(__linux__)
+    if (pinned) sched_setaffinity(tid, sizeof(prev), &prev);
+    st.bigCoresAvailable = bigSet() != nullptr;
+#endif
+    st.threads = ex.threads;
+    st.cpuMask = ex.cpus.load();
+    st.workerNice = ex.niceSeen.load();
+    st.callerNice = niceOf(threadId());
+    st.regions = ex.regions.load();
+    return res;
 }
 
 }  // namespace
@@ -1410,7 +2014,9 @@ std::string bokehRadiusMap(const float* rgb, int width, int height, std::size_t 
     im.w = width;
     im.h = height;
     if (depth.depth == nullptr || depth.width < 3 || depth.height < 3) return "depth map missing";
-    return radiusMapImpl(im, depth, p, map, mapW, mapH, stats);
+    Exec ex;
+    ex.threads = std::min(std::max(p.threads, 1), kMaxThreads);
+    return radiusMapImpl(im, depth, p, map, mapW, mapH, stats, ex);
 }
 
 std::string bokehRender(std::uint8_t* rgba, int width, int height, std::size_t strideBytes, const BokehTone& tone, const BokehDepth& depth,
