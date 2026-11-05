@@ -34,6 +34,7 @@ import com.redline.camera.capture.SaveFormatsUi
 import com.redline.camera.capture.SuperResReport
 import com.redline.camera.colour.ColourPipelineReport
 import com.redline.camera.depth.DepthReport
+import com.redline.camera.dof.DofReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
@@ -59,6 +60,8 @@ fun CapabilityScreen(
     onToggleBurst: (() -> Unit)? = null,
     onToggleSuperRes: (() -> Unit)? = null,
     onToggleDepth: (() -> Unit)? = null,
+    onToggleDof: (() -> Unit)? = null,
+    onOpenReedit: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
 ) {
@@ -212,6 +215,9 @@ fun CapabilityScreen(
                 }
                 item {
                     SuperResCard(state.superRes, onToggleSuperRes)
+                }
+                item {
+                    DofCard(state.dof, onToggleDof, onOpenReedit)
                 }
                 item {
                     DepthCard(state.depth, onToggleDepth)
@@ -539,6 +545,34 @@ private fun DepthCard(r: DepthReport, onToggle: (() -> Unit)?) {
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(DEPTH_TOGGLE_TAG)) {
                 Text("Turn depth ${if (r.enabled) "off" else "on"} (default on; runs after the photo is saved)")
+            }
+        }
+    }
+}
+
+const val DOF_SECTION_TITLE = "Simulated depth of field"
+const val DOF_TOGGLE_TAG = "dof_toggle"
+const val DOF_STATUS_TAG = "dof_status"
+const val DOF_REEDIT_TAG = "dof_reedit"
+
+/** B31: simulated depth of field on/off (default on), its status line, and the re-edit screen. */
+@Composable
+private fun DofCard(r: DofReport, onToggle: (() -> Unit)?, onReedit: (() -> Unit)?) {
+    SectionCard(DOF_SECTION_TITLE) {
+        Text(r.statusLine(), modifier = Modifier.testTag(DOF_STATUS_TAG))
+        Text(
+            "Stills rendered from RAW get the chosen aperture's blur (dial on the viewfinder); low depth confidence, rapid fire " +
+                "or memory pressure save the still sharp. ${r.vignetteNote}.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(DOF_TOGGLE_TAG)) {
+                Text("Turn simulated DOF ${if (r.enabled) "off" else "on"} (default on)")
+            }
+        }
+        if (onReedit != null) {
+            OutlinedButton(onClick = onReedit, modifier = Modifier.padding(top = 8.dp).testTag(DOF_REEDIT_TAG)) {
+                Text("Re-edit aperture / focus of a recent shot")
             }
         }
     }

@@ -5,6 +5,8 @@ import android.content.ClipData
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -26,8 +28,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import com.redline.camera.capability.CameraFacts
@@ -41,6 +45,7 @@ import com.redline.camera.capability.DeviceProfileProbe
 import com.redline.camera.capability.Dim
 import com.redline.camera.capability.FactoryCalibration
 import com.redline.camera.capability.FeaturePolicy
+import com.redline.camera.capability.JsonParse
 import com.redline.camera.capability.QuirksRepository
 import com.redline.camera.capability.ReportFile
 import com.redline.camera.capability.SelfTest
@@ -62,6 +67,9 @@ import com.redline.camera.colour.DetailSettings
 import com.redline.camera.colour.ProfileChoice
 import com.redline.camera.depth.DepthReport
 import com.redline.camera.depth.DepthService
+import com.redline.camera.dof.DofMath
+import com.redline.camera.dof.DofReport
+import com.redline.camera.dof.DofStage
 import com.redline.camera.look.CubeLut
 import com.redline.camera.look.LookPreviewRenderer
 import com.redline.camera.look.LookPreviewReport
@@ -79,6 +87,8 @@ import com.redline.camera.ui.DETAIL_SHARPEN
 import com.redline.camera.ui.DETAIL_VIGNETTE
 import com.redline.camera.ui.ManualActions
 import com.redline.camera.ui.ManualUi
+import com.redline.camera.ui.ReeditScreen
+import com.redline.camera.ui.ReeditUi
 import com.redline.camera.ui.TouchBoxUi
 import com.redline.camera.ui.ViewfinderScreen
 import com.redline.camera.viewfinder.LookRenderSize
@@ -108,7 +118,7 @@ import kotlin.math.sqrt
  * camera at the same time: the preview is closed (and its close awaited) before a self-test run, then reopened.
  */
 class MainActivity : ComponentActivity() {
-    private enum class Screen { VIEWFINDER, CAPABILITY }
+    private enum class Screen { VIEWFINDER, CAPABILITY, REEDIT }
 
     private val state = mutableStateOf(CapabilityState())
     private val profileState = mutableStateOf<DeviceProfile?>(null)
@@ -233,6 +243,14 @@ class MainActivity : ComponentActivity() {
     private var superResSetting = true
     private var depthSetting = DepthReport.DEFAULT_ON
     private lateinit var depthService: DepthService
+
+    /** B31: simulated depth of field (app lifetime, shares the depth lane), its setting and aperture, and re-edit. */
+    private lateinit var dofStage: DofStage
+    private var dofSetting = DofReport.DEFAULT_ON
+    private val dofAperture = mutableFloatStateOf(DofMath.DEFAULT_APERTURE)
+    private val reedit = mutableStateOf(ReeditUi())
+    private var reeditRotation = 0
+    private val reeditExec: ExecutorService = Executors.newSingleThreadExecutor()
     private var superResChecked = false
 
     /** The look path is used when the user wants it, start-up checks passed and nothing failed at runtime. */
@@ -354,6 +372,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onPreviewFps(fps: Double, warm: Boolean) {
+            if (warm) dofStage.previewFps(fps)
             update { s ->
                 val m = s.viewfinder ?: ViewfinderMetrics()
                 val min = if (warm) minOf(m.previewFpsMin ?: fps, fps) else m.previewFpsMin
@@ -466,6 +485,13 @@ class MainActivity : ComponentActivity() {
         depthService.setEnabled(depthSetting)
         depthService.onChange = { r -> runOnUiThread { state.value = state.value.copy(depth = r) } }
         controller.setDepth(depthService, depthSetting)
+        dofSetting = prefs.getBoolean(PREF_DOF, DofReport.DEFAULT_ON)
+        dofAperture.floatValue = DofMath.snap(prefs.getFloat(PREF_DOF_APERTURE, DofMath.DEFAULT_APERTURE))
+        dofStage = DofStage.shared(this)
+        dofStage.setAperture(dofAperture.floatValue)
+        dofStage.onChange = { r -> runOnUiThread { state.value = state.value.copy(dof = r) } }
+        dofStage.setEnabled(dofSetting)
+        controller.setDof(dofStage)
         lookSetting = prefs.getBoolean(PREF_LOOK_PREVIEW, true)
         lookStrength = prefs.getFloat(PREF_LOOK_STRENGTH, 1f).coerceIn(0f, 1f)
         detailSetting = DetailSettings(
@@ -704,6 +730,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         // The depth lane outlives the activity (app lifetime); only drop this instance's listener.
         depthService.onChange = null
+        dofStage.onChange = null
+        reeditExec.shutdown()
         mainHandler.removeCallbacks(checksFallback)
         mainHandler.removeCallbacks(lookPrepareTimeout)
         // The renderer owns the camera's SurfaceTexture on the look path: release it once the camera has closed.
@@ -751,6 +779,18 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Content() {
         BackHandler(enabled = screen.value == Screen.CAPABILITY) { showViewfinder() }
+        BackHandler(enabled = screen.value == Screen.REEDIT) { showCapability() }
+        if (screen.value == Screen.REEDIT) {
+            ReeditScreen(
+                ui = reedit.value,
+                onSelect = ::selectReedit,
+                onApertureStep = { d -> reedit.value = reedit.value.copy(aperture = DofMath.step(reedit.value.aperture, d)) },
+                onFocus = { u, v -> reedit.value = reedit.value.copy(focusU = u, focusV = v) },
+                onRender = ::renderReedit,
+                onBack = ::showCapability
+            )
+            return
+        }
         if (screen.value == Screen.VIEWFINDER) {
             val setup = setupState.value
             ViewfinderScreen(
@@ -792,7 +832,10 @@ class MainActivity : ComponentActivity() {
                 onPreviewView = { previewView = it },
                 lookBadge = if (state.value.lookPreview.active) LOOK_BADGE else null,
                 onTapFrame = if (setup?.touch?.enabled == true && streaming.value) ::tapFrame else null,
-                touchBox = touchFocus.value?.let { touchBox(it) }
+                touchBox = touchFocus.value?.let { touchBox(it) },
+                aperture = dofAperture.floatValue,
+                dofOn = state.value.dof.enabled,
+                onApertureStep = ::stepAperture
             )
         } else {
             CapabilityScreen(
@@ -824,6 +867,8 @@ class MainActivity : ComponentActivity() {
                 onToggleBurst = if (state.value.burst.available == true) ::toggleBurst else null,
                 onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
                 onToggleDepth = ::toggleDepth,
+                onToggleDof = ::toggleDof,
+                onOpenReedit = ::showReedit,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
                     {
                         burstStressPending = true
@@ -1513,6 +1558,88 @@ class MainActivity : ComponentActivity() {
         controller.setDepth(depthService, depthSetting)
     }
 
+    /** B31: simulated depth of field on/off (default on); takes effect at the next shot. */
+    private fun toggleDof() {
+        dofSetting = !dofSetting
+        prefs.edit { putBoolean(PREF_DOF, dofSetting) }
+        dofStage.setEnabled(dofSetting)
+    }
+
+    /** B31: the aperture dial, one third of a stop per step (persisted; the next shot uses it). */
+    private fun stepAperture(delta: Int) {
+        val n = DofMath.step(dofAperture.floatValue, delta)
+        dofAperture.floatValue = n
+        prefs.edit { putFloat(PREF_DOF_APERTURE, n) }
+        dofStage.setAperture(n)
+    }
+
+    // ------------------------------------------------------------------------------------------------ B31 re-edit
+
+    private fun showReedit() {
+        screen.value = Screen.REEDIT
+        syncCamera()
+        reedit.value = ReeditUi(aperture = dofAperture.floatValue, status = "Loading...")
+        reeditExec.execute {
+            val shots = dofStage.stored()
+            runOnUiThread {
+                reedit.value = reedit.value.copy(shots = shots.map { it.base }, status = null)
+                shots.firstOrNull()?.let { selectReedit(it.base) }
+            }
+        }
+    }
+
+    private fun selectReedit(base: String) {
+        reedit.value = reedit.value.copy(selected = base, preview = null, status = "Loading $base...")
+        reeditExec.execute {
+            val stored = dofStage.stored().firstOrNull { it.base == base }
+            val rot = runCatching {
+                (JsonParse.parse(depthService.metaFile(base).readText()) as Map<*, *>)["rotation"] as Number
+            }.getOrNull()?.toInt() ?: 0
+            val preview = runCatching { reeditPreview(depthService.sharpFile(base).absolutePath, rot) }.getOrNull()
+            runOnUiThread {
+                reeditRotation = rot
+                val (u, v) = DofMath.stillToUpright(stored?.focusX ?: 0.5, stored?.focusY ?: 0.5, rot)
+                reedit.value = reedit.value.copy(
+                    preview = preview?.asImageBitmap(),
+                    aperture = stored?.aperture ?: reedit.value.aperture,
+                    focusU = u,
+                    focusV = v,
+                    status = if (preview == null) "Could not read the sharp copy" else null
+                )
+            }
+        }
+    }
+
+    /** The sharp copy, downsampled to <= [REEDIT_PREVIEW_PX] on the long side and turned upright. */
+    private fun reeditPreview(path: String, rot: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= REEDIT_PREVIEW_PX) sample *= 2
+        val bmp = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+        if (rot % 360 == 0) return bmp
+        val m = Matrix().apply { postRotate(rot.toFloat()) }
+        return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true).also { if (it !== bmp) bmp.recycle() }
+    }
+
+    private fun renderReedit() {
+        val ui = reedit.value
+        val base = ui.selected ?: return
+        val (fx, fy) = DofMath.uprightToStill(ui.focusU, ui.focusV, reeditRotation)
+        reedit.value = ui.copy(busy = true, status = "Rendering ${DofMath.label(ui.aperture)}...")
+        reeditExec.execute {
+            val r = dofStage.reedit(base, ui.aperture, fx, fy)
+            runOnUiThread {
+                val msg = when {
+                    !r.ok -> "Failed: ${r.reason}"
+                    r.applied -> "Saved ${r.savedAs} (bokeh ${r.bokehMs} ms)"
+                    else -> "Saved ${r.savedAs} sharp: ${r.reason}"
+                }
+                reedit.value = reedit.value.copy(busy = false, status = msg)
+            }
+        }
+    }
+
     private fun superResEnabled(): Boolean = state.value.superRes.enabled && colourEnabled()
 
     private fun syncSuperRes() {
@@ -1820,6 +1947,9 @@ class MainActivity : ComponentActivity() {
         private const val PREF_BURST_MERGE = "burst_merge"
         private const val PREF_SUPER_RES = "super_resolution"
         private const val PREF_DEPTH = "depth_enabled"
+        private const val PREF_DOF = "dof_enabled"
+        private const val PREF_DOF_APERTURE = "dof_aperture"
+        private const val REEDIT_PREVIEW_PX = 1600
         private const val PREF_DETAIL_VIGNETTE = "detail_vignette"
         private const val PREF_DETAIL_SHARPEN = "detail_sharpen"
         private const val PREF_DETAIL_GRAIN = "detail_grain"
