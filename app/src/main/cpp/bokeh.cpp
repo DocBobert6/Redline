@@ -726,6 +726,22 @@ public:
             xk_ = std::exp2(tone_.kneeEv);
             lk_ = srgbDecode(curve_(static_cast<float>(xk_)));
         }
+        gout_ = hdr_ && tone_.gainOut != nullptr;
+        if (gout_) {
+            const int gw = tone_.gainW, gh = tone_.gainH;
+            const bool quarter = gw == (w_ + 3) / 4 && gh == (h_ + 3) / 4;
+            cellX_.resize(static_cast<std::size_t>(w_));
+            cellY_.resize(static_cast<std::size_t>(h_));
+            for (int x = 0; x < w_; ++x)
+                cellX_[static_cast<std::size_t>(x)] = quarter ? x / 4 : std::min(gw - 1, static_cast<int>(static_cast<long long>(x) * gw / w_));
+            for (int y = 0; y < h_; ++y)
+                cellY_[static_cast<std::size_t>(y)] = quarter ? y / 4 : std::min(gh - 1, static_cast<int>(static_cast<long long>(y) * gh / h_));
+            const std::size_t n = static_cast<std::size_t>(gw) * static_cast<std::size_t>(gh);
+            gSum_.assign(n, 0.0);
+            gCnt_.assign(n, 0);
+            gTouch_.assign(n, 0);
+            log2Lk_ = lk_ > 0 ? std::log2(lk_) : 0.0;
+        }
         for (int k = 1; k <= kmax_; ++k) {
             Layer l;
             l.k = k;
@@ -741,6 +757,11 @@ public:
         const auto t2 = Clock::now();
         bands();
         st_.bandsMs = msSince(t2);
+        if (gout_) {
+            const std::size_t n = gSum_.size();
+            for (std::size_t i = 0; i < n; ++i)
+                tone_.gainOut[i] = gTouch_[i] && gCnt_[i] > 0 ? static_cast<float>(gSum_[i] / gCnt_[i]) : tone_.gainLog2[i];
+        }
         st_.totalMs = msSince(t0);
         st_.applied = true;
         return "";
@@ -778,6 +799,37 @@ private:
         o[0] *= s;
         o[1] *= s;
         o[2] *= s;
+    }
+
+    // B31 gain out: the log2 HDR gain of a linear (curve input) luma y, the B25 GainTable continuation.
+    float gainOfLuma(double y) const {
+        if (!(y > xk_)) return 0.0f;
+        const double lsdr = srgbDecode(curve_(static_cast<float>(y)));
+        if (!(lsdr > 0.0)) return 0.0f;
+        return static_cast<float>(std::max(0.0, log2Lk_ + tone_.slope * (std::log2(y) - tone_.kneeEv) - std::log2(lsdr)));
+    }
+
+    // B31 gain out: an unchanged pixel's own gain, estimated as the input map (bilinear) where its SDR luma is above the
+    // knee and 0 below it (only read for cells that also hold a changed pixel).
+    float gainUnchanged(int x, int y) const {
+        float c[3];
+        if (im_.rgba != nullptr) {
+            const std::uint8_t* px = im_.rgba + static_cast<std::size_t>(y) * im_.stride + static_cast<std::size_t>(x) * 4;
+            c[0] = lut_[px[0]];
+            c[1] = lut_[px[1]];
+            c[2] = lut_[px[2]];
+        } else {
+            const float* px = im_.rgb + static_cast<std::size_t>(y) * im_.stride + static_cast<std::size_t>(x) * 3;
+            for (int l = 0; l < 3; ++l) c[l] = invAt(inv_, px[l]);
+        }
+        const double yl = kLuma[0] * static_cast<double>(c[0]) + kLuma[1] * static_cast<double>(c[1]) + kLuma[2] * static_cast<double>(c[2]);
+        if (!(yl > xk_)) return 0.0f;
+        const float* g0 = tone_.gainLog2 + static_cast<std::size_t>(gY_.i0[y]) * tone_.gainW;
+        const float* g1 = tone_.gainLog2 + static_cast<std::size_t>(gY_.i1[y]) * tone_.gainW;
+        const float wx = gX_.w[x], wy = gY_.w[y];
+        const float a = g0[gX_.i0[x]] * (1 - wx) + g0[gX_.i1[x]] * wx;
+        const float b = g1[gX_.i0[x]] * (1 - wx) + g1[gX_.i1[x]] * wx;
+        return std::max(0.0f, a * (1 - wy) + b * wy);
     }
 
     double pos(double a) const {  // ladderPos with the tables
@@ -1096,6 +1148,8 @@ private:
             pending.resize(keep);
         };
         std::vector<float> outBand(static_cast<std::size_t>(band) * w_ * 3);
+        std::vector<float> gBand(gout_ ? static_cast<std::size_t>(band) * w_ : 0);
+        std::vector<std::uint8_t> tBand(gout_ ? static_cast<std::size_t>(band) * w_ : 0);
         bytes += static_cast<double>(outBand.size()) * 4 * 2;
         st_.peakBytes = std::max(st_.peakBytes, bytes);
         for (int Y0 = 0; Y0 < h_; Y0 += band) {
@@ -1169,7 +1223,15 @@ private:
                     for (int x = 0; x < w_; ++x) {
                         const float un = uLut_[0][static_cast<std::size_t>(std::abs(static_cast<int>(radQ_[static_cast<std::size_t>(y) * w_ + x])))];
                         const float w0 = std::max(0.0f, 1.0f - un);
-                        if (w0 >= 1.0f && !anyFront) continue;
+                        const std::size_t gi = static_cast<std::size_t>(i) * w_ + x;
+                        if (gout_) {
+                            tBand[gi] = 0;
+                            gBand[gi] = 0.0f;
+                        }
+                        if (w0 >= 1.0f && !anyFront) {
+                            if (gout_) gBand[gi] = gainUnchanged(x, y);
+                            continue;
+                        }
                         const int t = x / kTile;
                         float P[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
                         for (std::size_t si = 0; si < srcs.size(); ++si) {
@@ -1179,19 +1241,42 @@ private:
                             bilinear(*sr.acc, *sr.ax, *sr.ay, x, y, P[sr.side]);
                         }
                         const float ab = P[0][3], af = P[1][3];
-                        if (w0 >= 1.0f && af < 1e-6f) continue;  // untouched: keep the input exactly
+                        if (w0 >= 1.0f && af < 1e-6f) {  // untouched: keep the input exactly
+                            if (gout_) gBand[gi] = gainUnchanged(x, y);
+                            continue;
+                        }
                         float c[3];
                         linAt(x, y, c);
                         float* o = outBand.data() + (static_cast<std::size_t>(i) * w_ + x) * 3;
+                        double yb = 0.0;
                         for (int l = 0; l < 3; ++l) {
                             const float fgn = af > 1e-4f ? P[1][l] / af : c[l];
                             const float bgn = ab > 1e-4f ? P[0][l] / ab : fgn;
                             const float mid = w0 * c[l] + (1.0f - w0) * bgn;
-                            o[l] = curve_(P[1][l] + (1.0f - af) * mid);
+                            const float lin = P[1][l] + (1.0f - af) * mid;
+                            yb += kLuma[l] * static_cast<double>(lin);
+                            o[l] = curve_(lin);
+                        }
+                        if (gout_) {
+                            gBand[gi] = gainOfLuma(yb);
+                            tBand[gi] = 1;
                         }
                     }
                 }
             });
+            if (gout_) {
+                const int gw = tone_.gainW;
+                for (int i = 0; i < bandRows; ++i) {
+                    const std::size_t row = static_cast<std::size_t>(cellY_[static_cast<std::size_t>(Y0 + i)]) * gw;
+                    for (int x = 0; x < w_; ++x) {
+                        const std::size_t gi = static_cast<std::size_t>(i) * w_ + x;
+                        const std::size_t ci = row + cellX_[static_cast<std::size_t>(x)];
+                        gSum_[ci] += gBand[gi];
+                        ++gCnt_[ci];
+                        gTouch_[ci] |= tBand[gi];
+                    }
+                }
+            }
             st_.compositeMs += msSince(tc);
             for (int i = 0; i < bandRows; ++i)
                 pending.emplace_back(Y0 + i, std::vector<float>(outBand.begin() + static_cast<std::ptrdiff_t>(i) * w_ * 3,
@@ -1225,7 +1310,12 @@ private:
     std::vector<std::uint64_t> layerMask_;
     std::vector<float> uLut_[3];
     Axis gX_, gY_;
-    bool ca_ = false, tiled_ = false, hdr_ = false;
+    bool ca_ = false, tiled_ = false, hdr_ = false, gout_ = false;
+    std::vector<int> cellX_, cellY_;
+    std::vector<double> gSum_;
+    std::vector<int> gCnt_;
+    std::vector<std::uint8_t> gTouch_;
+    double log2Lk_ = 0;
     double beta_ = 0, hd_ = 1, xk_ = 0, lk_ = 1, levelBytes_ = 0;
     std::vector<float> inv_;
     float lut_[256] = {};

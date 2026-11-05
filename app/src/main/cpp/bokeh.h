@@ -31,6 +31,11 @@ struct BokehTone {
     float slope = 0.0f;
     const float* gainLog2 = nullptr;
     int gainW = 0, gainH = 0;
+    // Optional output (B31 integration): the mean log2 HDR gain per cell of the gainLog2 grid, recomputed from the blurred
+    // linear result with the same continuation (log2 L_k + p (log2 y - knee) - log2 L_sdr(y), 0 at or below the knee), so
+    // the Ultra HDR gain map lifts the bloomed highlights the blurred base shows. Cells no changed pixel falls in keep
+    // their input value. Needs the HDR continuation (gainLog2, slope > 0); untouched when the render is gated.
+    float* gainOut = nullptr;
 };
 
 /** The B30 maps at their own resolution (still orientation): inverse depth 0..1 (1 near), person mask (nullable). */

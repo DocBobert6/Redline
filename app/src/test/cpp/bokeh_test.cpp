@@ -432,6 +432,45 @@ void testScene() {
         const double incHdr = discInc(t, &th);
         std::printf("highlight disc increment with the HDR gain map: %.4f\n", incHdr);
         check(incHdr > 1.2 * incLin, "HDR continuation brightens highlight discs");
+
+        // B31 gain out: the gain map recomputed from the blurred linear result. Cells inside the sharp subject keep their
+        // input value exactly; the dark blurred background (below the knee) drops to 0; the result does not depend on
+        // the thread count or the band height.
+        std::vector<float> gin = gain;
+        const int sc0 = s.sx0 * 150 / s.w + 2, sc1 = s.sx1 * 150 / s.w - 2, sr0 = s.sy0 * 100 / s.h + 2, sr1 = s.sy1 * 100 / s.h - 2;
+        for (int y = sr0; y < sr1; ++y)
+            for (int x = sc0; x < sc1; ++x) gin[static_cast<std::size_t>(y) * 150 + x] = 1.25f;
+        auto gainRun = [&](int threads, int band) {
+            std::vector<float> a = s.img, go(gin.size(), -1.0f);
+            redline::BokehTone tg = th;
+            tg.gainLog2 = gin.data();
+            tg.gainOut = go.data();
+            redline::BokehParams pg = ph;
+            pg.threads = threads;
+            pg.band = band;
+            redline::BokehStats sg;
+            const std::string e = redline::bokehRenderFloat(a.data(), s.w, s.h, static_cast<std::size_t>(s.w) * 3, tg, d, pg, sg);
+            check(e.empty() && sg.applied, "gain-out render: " + e + sg.reason);
+            return go;
+        };
+        const std::vector<float> g1 = gainRun(1, 64), g3 = gainRun(3, 32);
+        bool finite = true, same = true;
+        for (std::size_t i = 0; i < g1.size(); ++i) {
+            finite = finite && std::isfinite(g1[i]) && g1[i] >= 0.0f;
+            same = same && std::fabs(g1[i] - g3[i]) < 1e-5f;
+        }
+        check(finite, "gain out finite and >= 0");
+        check(same, "gain out independent of threads and bands");
+        bool kept = true;
+        for (int y = sr0; y < sr1; ++y)
+            for (int x = sc0; x < sc1; ++x) kept = kept && g1[static_cast<std::size_t>(y) * 150 + x] == 1.25f;
+        check(kept, "gain out keeps the sharp subject's cells");
+        // a dark background cell far from the highlights (they sit in the top sixth to quarter of the frame)
+        const int by = (s.sy0 * 100 / s.h) - 3, bx = 3;
+        std::printf("gain out: dark background cell %.3f (input %.3f), highlight cell max %.3f\n", g1[static_cast<std::size_t>(by) * 150 + bx],
+                    gin[static_cast<std::size_t>(by) * 150 + bx], *std::max_element(g1.begin(), g1.end()));
+        check(gin[static_cast<std::size_t>(by) * 150 + bx] > 1.0f && g1[static_cast<std::size_t>(by) * 150 + bx] == 0.0f,
+              "gain out recomputed below the knee");
     }
 
     // RGBA path == float path within one code value

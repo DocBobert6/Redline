@@ -368,7 +368,13 @@ object RedlineNative {
         val slope: Float = 0f,
         val gainLog2: FloatArray? = null,
         val gainW: Int = 0,
-        val gainH: Int = 0
+        val gainH: Int = 0,
+        /**
+         * Optional output ([gainW] x [gainH]): the mean log2 HDR gain per cell recomputed from the blurred linear result
+         * (same continuation), so an Ultra HDR gain map stays consistent with the blurred base. Written only when the
+         * render is applied with the HDR continuation; cells no changed pixel falls in keep their input value.
+         */
+        val gainOut: FloatArray? = null
     )
 
     /** B31: the B30 maps at their resolution (still orientation): inverse depth 0..1 (1 near), person mask, confidence. */
@@ -423,7 +429,7 @@ object RedlineNative {
         val stats = FloatArray(16)
         val err = nativeBokehRender(
             still, lensV, tone.curve, toneV, tone.gainLog2, tone.gainW, tone.gainH, depth.depth, depth.mask,
-            depth.confidenceMap, depth.width, depth.height, workMax, threads, stats
+            depth.confidenceMap, depth.width, depth.height, workMax, threads, stats, tone.gainOut
         )
         if (err != null && err.startsWith("skip: ")) return BokehResult(stats, err.removePrefix("skip: "))
         check(err == null) { "bokeh: $err" }
@@ -1006,7 +1012,8 @@ object RedlineNative {
         depthH: Int,
         workMax: Int,
         threads: Int,
-        stats: FloatArray
+        stats: FloatArray,
+        gainOut: FloatArray?
     ): String?
 
     @JvmStatic
