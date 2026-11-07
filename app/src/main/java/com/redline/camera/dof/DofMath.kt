@@ -96,17 +96,12 @@ object DofMath {
     }
 
     /**
-     * A point in the field of view ([fx], [fy], active-array normalised, sensor orientation: the touch-focus region's
-     * centre) to the still (0..1 of the stop's 3:2 crop at [zoom]), clamped.
+     * B31.1: the touch-focus point in the still (0..1). The tap is stored as a frame region (TouchMapping: normalised in
+     * the stop's 3:2 frame, sensor orientation), and that frame is the still (the RAW crop at the stop's zoom, or the
+     * super-resolution output grid), so its centre is the still point as is, clamped. (alpha.1 mapped it through the
+     * zoomed RAW crop a second time, which pushed every tap toward the edges at 35-70 mm: the wrong focus plane.)
      */
-    fun focusInStill(fx: Double, fy: Double, activeW: Int, activeH: Int, zoom: Double): Pair<Double, Double> {
-        val w = if (activeW > 0) activeW else 4000
-        val h = if (activeH > 0) activeH else 3000
-        val c = ColourMath.rawCrop(w, h, zoom)
-        val x = (fx * w - c[0]) / c[2]
-        val y = (fy * h - c[1]) / c[3]
-        return x.coerceIn(0.0, 1.0) to y.coerceIn(0.0, 1.0)
-    }
+    fun tapInStill(frameX: Double, frameY: Double): Pair<Double, Double> = frameX.coerceIn(0.0, 1.0) to frameY.coerceIn(0.0, 1.0)
 
     /**
      * A point on the upright picture ([u], [v], 0..1) to the still's own pixel orientation, the still being turned
@@ -125,6 +120,83 @@ object DofMath {
         180 -> (1 - x) to (1 - y)
         270 -> y to (1 - x)
         else -> x to y
+    }
+
+    /**
+     * B31.1: the default focus point when there is no tap: on the main person. The person mask's pixels >= 0.5 are split
+     * into connected regions (4-neighbour); the region with the largest area x centrality (1 - distance of its centroid
+     * from the frame centre / half-diagonal, at least 0.2) is the subject, and the point is its pixel nearest its own
+     * centroid, so it is always on the person (a plain centroid of two people, or of a person with a near arm or leg in
+     * the frame, can land on the background between them). Null below [MIN_PERSON_COVERAGE] of the frame.
+     */
+    fun personFocusPoint(mask: FloatArray?, w: Int, h: Int): Pair<Double, Double>? {
+        if (mask == null || w <= 0 || h <= 0 || mask.size < w * h) return null
+        val label = IntArray(w * h) { -1 }
+        var total = 0
+        var best: Pair<Double, Double>? = null
+        var bestScore = -1.0
+        val stack = IntArray(w * h)
+        var next = 0
+        for (start in 0 until w * h) {
+            if (mask[start] < 0.5f || label[start] >= 0) continue
+            val id = next++
+            var top = 0
+            stack[top++] = start
+            label[start] = id
+            val members = ArrayList<Int>()
+            var sx = 0.0
+            var sy = 0.0
+            while (top > 0) {
+                val i = stack[--top]
+                members.add(i)
+                val x = i % w
+                val y = i / w
+                sx += x + 0.5
+                sy += y + 0.5
+                for (k in 0 until 4) {
+                    val nx = x + if (k == 0) {
+                        -1
+                    } else if (k == 1) {
+                        1
+                    } else {
+                        0
+                    }
+                    val ny = y + if (k == 2) {
+                        -1
+                    } else if (k == 3) {
+                        1
+                    } else {
+                        0
+                    }
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+                    val j = ny * w + nx
+                    if (label[j] < 0 && mask[j] >= 0.5f) {
+                        label[j] = id
+                        stack[top++] = j
+                    }
+                }
+            }
+            total += members.size
+            val cx = sx / members.size
+            val cy = sy / members.size
+            val d = Math.hypot(cx / w - 0.5, cy / h - 0.5) / Math.hypot(0.5, 0.5)
+            val score = members.size * maxOf(0.2, 1.0 - d)
+            if (score > bestScore) {
+                bestScore = score
+                var bi = members[0]
+                var bd = Double.MAX_VALUE
+                for (i in members) {
+                    val dd = Math.hypot(i % w + 0.5 - cx, i / w + 0.5 - cy)
+                    if (dd < bd) {
+                        bd = dd
+                        bi = i
+                    }
+                }
+                best = (bi % w + 0.5) / w to (bi / w + 0.5) / h
+            }
+        }
+        if (total < MIN_PERSON_COVERAGE * w * h || total == 0) return null
+        return best
     }
 
     /** Centroid (0..1) of the person mask's pixels >= 0.5, or null below [MIN_PERSON_COVERAGE]. */

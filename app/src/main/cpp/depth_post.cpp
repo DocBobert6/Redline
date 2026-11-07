@@ -12,6 +12,11 @@ constexpr float kRangeLo = 0.15f, kRangeHi = 0.5f;
 constexpr float kEdgeQ = 0.95f, kEdgeMin = 0.02f, kEdgeGradLimit = 0.08f;
 constexpr int kRing = 8;
 constexpr float kLetterbox = 0.5f;
+// B31.1 matte path (see analyseDepth)
+constexpr float kMaskSupport = 0.05f;
+constexpr float kMatteCovLo = 0.05f, kMatteCovHi = 0.25f;
+constexpr float kClarityLo = 0.4f, kClarityHi = 0.7f;
+constexpr float kMatteNearLo = 0.1f, kMatteNearHi = 0.3f;
 
 float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 
@@ -211,7 +216,25 @@ DepthAnalysis analyseDepth(const float* depth, const float* mask, const float* r
             a.personScore = clamp01((a.personNearer - 0.5f) / 0.4f);
         }
     }
-    a.confidence = a.rangeScore * (0.4f + 0.6f * a.edgeScore) * a.personScore;
+    // B31.1: the matte path. A person-dominant frame with a clear mask is usable even when the depth term collapses
+    // (person filling most of the frame, a near floor or wall around them: the ring is about as near as the person),
+    // because the mask itself keeps the subject sharp; a person clearly behind their surroundings still fails.
+    {
+        double sum = 0;
+        std::size_t sup = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (mask[i] > kMaskSupport) {
+                sum += 4.0 * mask[i] * (1.0 - mask[i]);
+                ++sup;
+            }
+        }
+        a.maskClarity = sup > 0 ? static_cast<float>(1.0 - sum / static_cast<double>(sup)) : 0.0f;
+        const float nearOk = a.personNearer < 0 ? 1.0f : smoothstep(kMatteNearLo, kMatteNearHi, a.personNearer);
+        a.matteScore = smoothstep(kMatteCovLo, kMatteCovHi, a.personCoverage) * smoothstep(kClarityLo, kClarityHi, a.maskClarity) * nearOk;
+    }
+    a.depthConfidence = a.rangeScore * (0.4f + 0.6f * a.edgeScore) * a.personScore;
+    a.matteConfidence = a.matteScore * (0.5f + 0.5f * std::max(a.rangeScore, a.edgeScore));
+    a.confidence = std::max(a.depthConfidence, a.matteConfidence);
     a.usable = a.confidence >= kDepthUsable;
     if (confMap != nullptr) {
         for (std::size_t i = 0; i < n; ++i) {

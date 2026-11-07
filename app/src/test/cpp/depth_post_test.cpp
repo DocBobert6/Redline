@@ -99,6 +99,44 @@ void analysisCues() {
     expect(a.personNearer < 0.05f && !a.usable, "person behind the background: not usable");
 }
 
+// B31.1: the matte path. The device run auto-offed person shots at ~1 m (a person filling much of the frame, or lying on
+// a floor that is as near as they are: person-nearer ~0.5, person term 0).
+void matteCases() {
+    const int w = 200, h = 120;
+    std::vector<float> depth(w * h), mask(w * h, 0.0f), rgb(w * h * 3), conf(w * h);
+    // A person on a floor seen from above: the floor rises toward the camera under and around them; a clean mask over
+    // 65 % of the frame; image edges where the mask is.
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const bool in = x >= 20 && x < 180 && y >= 10 && y < 110;
+            depth[y * w + x] = 0.5f + 1.0f * static_cast<float>(y) / h;
+            mask[y * w + x] = in ? 1.0f : 0.0f;
+            const float v = in ? 0.75f : 0.2f;
+            rgb[(y * w + x) * 3] = rgb[(y * w + x) * 3 + 1] = rgb[(y * w + x) * 3 + 2] = v;
+        }
+    }
+    redline::DepthAnalysis a = redline::analyseDepth(depth.data(), mask.data(), rgb.data(), w, h, conf.data());
+    std::printf("depth_post: person-dominant on a near floor: conf %.3f (depth %.3f, matte %.3f) coverage %.3f nearer %.3f clarity %.3f\n",
+                a.confidence, a.depthConfidence, a.matteConfidence, a.personCoverage, a.personNearer, a.maskClarity);
+    expect(a.depthConfidence < 0.35f, "the depth term alone collapses (person about as near as the floor)");
+    expect(a.usable && a.matteScore > 0.9f, "person-dominant frame with a clear mask: usable");
+    // A flat wall: no person, nothing to separate.
+    for (int i = 0; i < w * h; ++i) {
+        depth[i] = 1.0f + 0.002f * static_cast<float>(i % w) / w;
+        mask[i] = 0.0f;
+        rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0.5f;
+    }
+    a = redline::analyseDepth(depth.data(), mask.data(), rgb.data(), w, h, conf.data());
+    expect(!a.usable && a.matteScore == 0.0f, "flat wall: not usable");
+    // The wall with an undecided "person" (the segmenter unsure: 0.45..0.6 over a third of the frame): no matte.
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) mask[y * w + x] = x < 70 ? 0.45f + 0.15f * static_cast<float>((x + y) % 2) : 0.0f;
+    }
+    a = redline::analyseDepth(depth.data(), mask.data(), rgb.data(), w, h, conf.data());
+    std::printf("depth_post: flat wall + undecided mask: conf %.3f clarity %.3f matte %.3f\n", a.confidence, a.maskClarity, a.matteScore);
+    expect(!a.usable && a.maskClarity < 0.4f, "flat wall with an undecided mask: not usable");
+}
+
 void finishOrients() {
     const int w = 600, h = 400;
     for (int rot : {0, 90, 180, 270}) {
@@ -174,6 +212,7 @@ int main() {
     canvasFits();
     prepRotates();
     analysisCues();
+    matteCases();
     finishOrients();
     warpKeepsCentre();
     timing();

@@ -14,8 +14,15 @@ probability, 256x144) on a downscaled copy of the rendered still. This module de
    - person: when the segmenter finds a person (1-90 % of the frame), the share of person pixels nearer than the median
      of an 8-pixel ring around them; a person behind their background means the depth is wrong exactly where bokeh
      matters most.
-   confidence = smoothstep(0.15, 0.5, range) * (0.4 + 0.6 * edges) * person. ``usable`` = confidence >= 0.35: below
-   that, B31 renders no bokeh (PLAN 7.4: "don't apply when depth confidence is low").
+   depth confidence = smoothstep(0.15, 0.5, range) * (0.4 + 0.6 * edges) * person.
+   B31.1 matte path (the first device run auto-offed 5 of 7 shots, person shots at ~1 m among them: a person filling
+   most of the frame, or on a floor that is as near as they are, gives person-nearer ~0.5 and a person term of 0):
+   matte = smoothstep(0.05, 0.25, coverage) * smoothstep(0.4, 0.7, clarity) * smoothstep(0.1, 0.3, nearer) (nearer
+   absent: 1), clarity = 1 - mean 4 m (1 - m) over the mask's support (m > 0.05); matte confidence =
+   matte * (0.5 + 0.5 * max(range, edges)). confidence = max(depth, matte). The 0.35 threshold is unchanged: a flat wall
+   (no person) still fails on range, and a person behind their background (nearer < 0.1) still fails.
+   ``usable`` = confidence >= 0.35: below that, B31 renders no bokeh (PLAN 7.4: "don't apply when depth confidence
+   is low").
    Per pixel: min(1 - clamp(|grad depth| / 0.08), 1 - 4 m (1 - m)): low on depth edges and on an undecided mask.
 
 Percentiles are nearest-rank on the sorted values: index floor(q * (n - 1) + 0.5).
@@ -28,6 +35,10 @@ import numpy as np
 
 USABLE = 0.35
 RANGE_LO, RANGE_HI = 0.15, 0.5
+MASK_SUPPORT = 0.05
+MATTE_COV = (0.05, 0.25)
+CLARITY = (0.4, 0.7)
+MATTE_NEAR = (0.1, 0.3)
 EDGE_Q = 0.95
 EDGE_MIN = 0.02
 EDGE_GRAD_LIMIT = 0.08
@@ -107,6 +118,10 @@ class Analysis:
     person_score: float
     conf_map: np.ndarray
     norm: np.ndarray
+    mask_clarity: float = 0.0
+    matte_score: float = 0.0
+    depth_confidence: float = 0.0
+    matte_confidence: float = 0.0
 
 
 def analyse(depth: np.ndarray, mask: np.ndarray, rgb: np.ndarray) -> Analysis:
@@ -137,11 +152,21 @@ def analyse(depth: np.ndarray, mask: np.ndarray, rgb: np.ndarray) -> Analysis:
             bg = pct(dn[ring], 0.5)
             person_nearer = float((dn[person] > bg).mean())
             person_score = min(max((person_nearer - 0.5) / 0.4, 0.0), 1.0)
-    conf = range_score * (0.4 + 0.6 * edge_score) * person_score
+    # B31.1 matte path: a person-dominant frame with a clear mask is usable even when the depth term collapses (the
+    # person fills most of the frame, or the floor/wall around them is about as near: person-nearer ~0.5 gave 0);
+    # the mask keeps the subject sharp. A person clearly behind their surroundings (nearer < 0.1) still fails.
+    sup = mask > MASK_SUPPORT
+    m = mask.astype(np.float64)
+    clarity = float(1.0 - (4 * m[sup] * (1 - m[sup])).mean()) if sup.any() else 0.0
+    near_ok = 1.0 if person_nearer is None else smoothstep(MATTE_NEAR[0], MATTE_NEAR[1], person_nearer)
+    matte = smoothstep(MATTE_COV[0], MATTE_COV[1], coverage) * smoothstep(CLARITY[0], CLARITY[1], clarity) * near_ok
+    depth_conf = range_score * (0.4 + 0.6 * edge_score) * person_score
+    matte_conf = matte * (0.5 + 0.5 * max(range_score, edge_score))
+    conf = max(depth_conf, matte_conf)
     m = mask.astype(np.float64)
     cmap = np.minimum(1 - np.clip(gd / EDGE_GRAD_LIMIT, 0, 1), 1 - 4 * m * (1 - m))
     return Analysis(conf, conf >= USABLE, p2, p98, spread, range_score, edge_agree, edge_score, coverage, person_nearer,
-                    person_score, cmap.astype(np.float32), dn.astype(np.float32))
+                    person_score, cmap.astype(np.float32), dn.astype(np.float32), clarity, matte, depth_conf, matte_conf)
 
 
 # ---------------------------------------------------------------------------------------------- prep / finish (B30)

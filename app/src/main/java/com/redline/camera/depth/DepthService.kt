@@ -402,7 +402,11 @@ class DepthService(context: Context, private val cpuOnly: Boolean = false) {
         "edge_score" to s.edgeScore.toDouble(),
         "person_coverage" to s.personCoverage.toDouble(),
         "person_nearer" to s.personNearer?.toDouble(),
-        "person_score" to s.personScore.toDouble()
+        "person_score" to s.personScore.toDouble(),
+        "mask_clarity" to s.maskClarity.toDouble(),
+        "matte_score" to s.matteScore.toDouble(),
+        "depth_confidence" to s.depthConfidence.toDouble(),
+        "matte_confidence" to s.matteConfidence.toDouble()
     )
 
     private fun syncMaps(

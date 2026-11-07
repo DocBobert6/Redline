@@ -106,7 +106,6 @@ class DofSaveTest {
                 hdr = hdr(),
                 threads = 2,
                 nice = 5,
-                queuedBehind = 0,
                 lowMemory = false
             )
         )

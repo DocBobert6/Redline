@@ -650,14 +650,16 @@ class ViewfinderController(
     }
 
     /**
-     * B31: simulated depth of field on the save path (null = off). Its depth and bokeh work runs under the worker
-     * governor (3 threads at nice 5 while a capture backs the queue up, else up to [DofStage.MAX_THREADS]); a shot with
-     * others queued behind it (rapid fire) or under system memory pressure is saved sharp instead of delayed.
+     * B31.1: simulated depth of field off the save path (null = off). The sharp photo is saved first; [DofStage] blurs
+     * it on a background queue once the pipeline is idle and rewrites the same photo in place (nice 10 / 3 threads
+     * while the viewfinder shows, else nice 5 / 4); under system memory pressure the shot stays sharp.
      */
     fun setDof(stage: DofStage?) {
-        saver.dofBudget = { budget(DofStage.MAX_THREADS) }
-        saver.dofQueuedBehind = { maxOf(0, loadProcessing - 1) + loadCapturing }
-        saver.dofLowMemory = { systemLowOnMemory() }
+        if (stage != null) {
+            stage.pipelineBusy = { loadProcessing > 0 || loadCapturing > 0 }
+            stage.viewfinderActive = { viewfinderActive }
+            stage.lowMemory = { systemLowOnMemory() }
+        }
         saver.dof = stage
     }
 

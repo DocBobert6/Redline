@@ -24,7 +24,9 @@ import com.redline.camera.colour.ColourShot
 import com.redline.camera.depth.DepthReport
 import com.redline.camera.depth.DepthService
 import com.redline.camera.dof.DofMath
+import com.redline.camera.dof.DofReport
 import com.redline.camera.dof.DofStage
+import com.redline.camera.dof.MediaReplace
 import com.redline.camera.nativebridge.RedlineNative
 import com.redline.camera.viewfinder.NormRect
 import java.io.ByteArrayInputStream
@@ -176,17 +178,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
     @Volatile var depth: DepthService? = null
 
     /**
-     * B31: simulated depth of field on the save path ([DofStage.apply] before the encode, on the store lane). Off until
-     * the caller sets it. [dofBudget] (threads, nice) is the worker governor's for this work; [dofQueuedBehind] the
-     * shots queued behind the one saving; [dofLowMemory] the system's low-memory flag.
+     * B31: simulated depth of field. B31.1: off the save path: the sharp photo is saved as without DOF, then the
+     * rendered still goes to [DofStage.enqueue] (a background queue that rewrites the same MediaStore item); the store
+     * lane never waits for depth or bokeh. Off until the caller sets it.
      */
     @Volatile var dof: DofStage? = null
-
-    @Volatile var dofBudget: () -> WorkerBudget = { WorkerBudget(DofStage.MAX_THREADS, WorkerGovernor.IDLE_NICE, loaded = false) }
-
-    @Volatile var dofQueuedBehind: () -> Int = { 0 }
-
-    @Volatile var dofLowMemory: () -> Boolean = { false }
 
     /** Render then store on the calling thread (the two lanes in one). Never throws; always calls [StillShot.release]. */
     fun save(shot: StillShot, nowMs: () -> Long): ShotResult = store(render(shot, nowMs), nowMs)
@@ -492,15 +488,66 @@ class StillSaver(context: Context, private val version: String, private val pipe
         }.onFailure { Log.w(TAG, "depth hand-off failed", it) }
     }
 
-    /** B31: the DOF stage for a RAW-rendered still (in place). Null when off. Never throws. */
-    private fun runDof(staged: StagedShot, bmp: Bitmap): DofStage.Outcome? {
+    /**
+     * B31.1: hands a saved, RAW-rendered photo to the background DOF queue. True: the queue owns [StagedShot.rendered]
+     * (the caller must not recycle it) and will run depth for the shot. Never throws; never waits for DOF work.
+     */
+    private fun handToDof(staged: StagedShot, photo: PhotoOut): DofStage.Job? {
         val stage = dof ?: return null
         if (!stage.enabled) return null
+        val bmp = staged.rendered ?: return null
+        val shot = staged.shot
         return try {
-            stage.apply(dofRequest(stage, staged, bmp))
+            val req = dofRequest(stage, staged, bmp)
+            if (!shot.keep) {
+                stage.skip(req, DofReport.notKeptReason(shot.stress))
+                return null
+            }
+            val uri = photo.uri
+            if (uri == null) {
+                stage.skip(req, DofReport.SKIP_NO_PHOTO)
+                return null
+            }
+            val base = staged.base
+            val look = staged.look
+            val mime = photo.mime
+            val job = DofStage.Job(req, shot.shutterAtMs) { b, hdr, suffix ->
+                rewriteRendered(shot, uri, mime, b, base, "$look | $suffix", hdr)
+            }
+            if (stage.enqueue(job)) job else null
         } catch (t: Throwable) {
-            Log.w(TAG, "DOF request failed", t)
+            Log.w(TAG, "DOF hand-off failed", t)
             null
+        }
+    }
+
+    /** B31.1: the blurred still re-encoded the way [saveRendered] wrote the photo, into the same MediaStore item. */
+    private fun rewriteRendered(
+        shot: StillShot,
+        uri: Uri,
+        mime: String,
+        bmp: Bitmap,
+        base: String,
+        look: String,
+        hdr: ColourPipeline.HdrMap?
+    ): DofStage.ReplaceResult {
+        val t0 = SystemClock.elapsedRealtime()
+        val original = ExifInterface(ByteArrayInputStream(shot.jpeg))
+        val size = Dim(bmp.width, bmp.height)
+        val heif = mime == PhotoFormat.HEIF.mime
+        val tmp = File.createTempFile("$base-dof", if (heif) ".heic" else ".jpg", app.cacheDir)
+        try {
+            if (heif) {
+                PhotoHeif.write(bmp, shot.jpegOrientation, HEIF_QUALITY, exifBlock(base, original, shot, size, look), tmp)
+            } else {
+                PhotoJpeg.write(bmp, if (shot.ultraHdr) hdr?.bytes else null, tmp, JPEG_QUALITY) { f ->
+                    writeExif(f, original, shot, size, look, CaptureMath.exifOrientation(shot.jpegOrientation))
+                }
+            }
+            val r = MediaReplace.rewrite(resolver, uri, tmp)
+            return DofStage.ReplaceResult(r.ok, SystemClock.elapsedRealtime() - t0, r.error)
+        } finally {
+            tmp.delete()
         }
     }
 
@@ -527,8 +574,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
             )?.toDouble()
         val activeMm = DofMath.activeWidthMm(phys?.width?.toDouble(), aw, pixels?.width ?: 0)
         val phoneN = DofMath.phoneEquivalentAperture(fNumber, activeMm, DofMath.cropWidthFraction(aw, ah, shot.zoomRatio.toDouble()))
-        val tap = shot.meterRegion?.let { DofMath.focusInStill(it.centerX, it.centerY, aw, ah, shot.zoomRatio.toDouble()) }
-        val b = dofBudget()
+        // B31.1: the tap is a frame region, and the frame is the still (no second crop mapping)
+        val tap = shot.meterRegion?.let { DofMath.tapInStill(it.centerX, it.centerY) }
         return DofStage.Request(
             still = bmp,
             rotation = shot.jpegOrientation,
@@ -540,10 +587,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
             tap = tap,
             tone = staged.tone,
             hdr = if (shot.ultraHdr) staged.hdr else null,
-            threads = b.threads.coerceIn(1, DofStage.MAX_THREADS),
-            nice = b.nice,
-            queuedBehind = runCatching { dofQueuedBehind() }.getOrDefault(0),
-            lowMemory = runCatching { dofLowMemory() }.getOrDefault(false)
+            // the queue sets the budget and the memory state when the job runs
+            threads = DofStage.MAX_THREADS,
+            nice = WorkerGovernor.IDLE_NICE,
+            lowMemory = false,
+            stress = shot.stress
         )
     }
 
@@ -563,10 +611,9 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val b = shot.burst
         var jpegSize: Dim? = null
         var error: String? = null
-        // B31: simulated depth of field on the rendered still, before the encode (sharp on any skip or failure).
-        val dofOut = staged.rendered?.takeIf { shot.savePhoto }?.let { runDof(staged, it) }
-        val hdrOut = dofOut?.hdr ?: staged.hdr
-        val dofLook = if (dofOut?.shot?.applied == true) "$look | simulated DOF ${DofMath.label(dofOut.shot.aperture)}" else look
+        // B31.1: no DOF here: the sharp photo is saved now, the DOF queue rewrites it later (see handToDof)
+        val hdrOut = staged.hdr
+        var dofJob: DofStage.Job? = null
         val encodeStart = nowMs()
         val savedCameraJpeg = staged.rendered == null
         var photo: PhotoOut? = null
@@ -578,7 +625,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
             try {
                 val bmp = staged.rendered
                 if (bmp != null) {
-                    photo = saveRendered(shot, bmp, base, dofLook, hdrOut)
+                    photo = saveRendered(shot, bmp, base, look, hdrOut)
                     jpegSize = photo.size
                     colour = colour?.let { it.copy(timingsMs = it.timingsMs + ("encode_save" to (nowMs() - encodeStart))) }
                 } else {
@@ -591,8 +638,14 @@ class StillSaver(context: Context, private val version: String, private val pipe
                 error = "${shot.photoFormat.label}: ${e.javaClass.simpleName}: ${e.message}"
                 false
             } finally {
-                // B31: a shot the DOF stage ran depth for has its sidecar on the way (and its still may be blurred).
-                if (dofOut?.depthHandled != true) startDepth(shot, staged.base, staged.rendered, photo != null)
+                // B31.1: a shot handed to the DOF queue gets its depth there (the queue owns its still now)
+                val saved = photo
+                dofJob = if (saved != null && staged.rendered != null) handToDof(staged, saved) else null
+                if (dofJob != null) {
+                    staged.rendered = null
+                } else {
+                    startDepth(shot, staged.base, staged.rendered, photo != null)
+                }
                 staged.rendered?.recycle()
                 staged.rendered = null
             }
@@ -621,7 +674,7 @@ class StillSaver(context: Context, private val version: String, private val pipe
         val savedAt = nowMs()
         val total = savedAt - shot.shutterAtMs
         shot.timeline?.mark(ShotTimeline.SAVED, savedAt)
-        dofOut?.let { o -> runCatching { dof?.finish(o, if (jpegOk) total else null) } }
+        dofJob?.sharpSaveMs = total
         burstShot = burstShot?.let {
             if (it.plan.isBurst) {
                 it.copy(
@@ -722,6 +775,9 @@ class StillSaver(context: Context, private val version: String, private val pipe
     private class PhotoOut(
         val size: Dim,
         val bytes: Long,
+        /** B31.1: the MediaStore item (null for a not-kept shot, deleted after its write) and its type. */
+        val uri: Uri? = null,
+        val mime: String = "image/jpeg",
         val ultraHdr: Boolean = false,
         val ultraHdrSkip: String? = null,
         /** Gain map bitmap + metadata, ms (the encode itself is in the photo's encode time). */
@@ -758,10 +814,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
             val r = PhotoJpeg.write(bmp, if (shot.ultraHdr) hdr?.bytes else null, tmp, JPEG_QUALITY) { f ->
                 writeExif(f, original, shot, size, look, CaptureMath.exifOrientation(shot.jpegOrientation))
             }
-            insert("$base.jpg", "image/jpeg", shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            val uri = insert("$base.jpg", "image/jpeg", shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
             return PhotoOut(
                 size,
                 tmp.length(),
+                uri = uri,
                 ultraHdr = r.ultraHdr,
                 ultraHdrSkip = r.skip ?: if (shot.ultraHdr && hdr?.bytes == null) hdr?.skip else null,
                 gainmapMs = r.gainmapMs,
@@ -786,11 +843,12 @@ class StillSaver(context: Context, private val version: String, private val pipe
             val t0 = SystemClock.elapsedRealtime()
             val r = PhotoHeif.write(bmp, shot.jpegOrientation, HEIF_QUALITY, exif, tmp)
             val t1 = SystemClock.elapsedRealtime()
-            insert("$base.${PhotoFormat.HEIF.ext}", PhotoFormat.HEIF.mime, shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
+            val uri =
+                insert("$base.${PhotoFormat.HEIF.ext}", PhotoFormat.HEIF.mime, shot.keep) { os -> tmp.inputStream().use { it.copyTo(os) } }
             val t2 = SystemClock.elapsedRealtime()
             val m = LinkedHashMap(r.toMap())
             m["heif_save_ms"] = linkedMapOf("exif_block" to exifMs, "write" to t1 - t0, "media_store" to t2 - t1)
-            return PhotoOut(size, tmp.length(), heif = m)
+            return PhotoOut(size, tmp.length(), uri = uri, mime = PhotoFormat.HEIF.mime, heif = m)
         } finally {
             tmp.delete()
         }
@@ -929,8 +987,11 @@ class StillSaver(context: Context, private val version: String, private val pipe
         override fun flush() = out.flush()
     }
 
-    /** Pending insert, write, publish; a stress shot is deleted after the full write instead of published. */
-    private fun insert(name: String, mime: String, keep: Boolean, write: (OutputStream) -> Unit) {
+    /**
+     * Pending insert, write, publish; a stress shot is deleted after the full write instead of published. Returns the
+     * published item (null for a deleted stress shot).
+     */
+    private fun insert(name: String, mime: String, keep: Boolean, write: (OutputStream) -> Unit): Uri? {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
@@ -944,9 +1005,10 @@ class StillSaver(context: Context, private val version: String, private val pipe
             os.use(write)
             if (keep) {
                 resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            } else {
-                resolver.delete(uri, null, null)
+                return uri
             }
+            resolver.delete(uri, null, null)
+            return null
         } catch (e: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw e

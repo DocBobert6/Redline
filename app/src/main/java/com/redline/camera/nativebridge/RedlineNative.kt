@@ -307,6 +307,12 @@ object RedlineNative {
         val outWidth = v[13].toInt()
         val outHeight = v[14].toInt()
         val ms = v[15].toDouble()
+
+        /** B31.1: the matte path of the confidence (see depth_post.py): mask clarity, matte score, the two candidates. */
+        val maskClarity = v[16]
+        val matteScore = v[17]
+        val depthConfidence = v[18]
+        val matteConfidence = v[19]
     }
 
     /**
@@ -330,7 +336,7 @@ object RedlineNative {
         out: ShortArray
     ): DepthStats {
         check(load().loaded) { "native library not loaded: ${load().error}" }
-        val stats = FloatArray(16)
+        val stats = FloatArray(20)
         val err =
             nativeDepthFinish(depthOut, segOut, segW, segH, rgbCanvas, canvasW, canvasH, rect, rot, imageW, imageH, distortion, out, stats)
         check(err == null) { "depth finish: $err" }
@@ -387,6 +393,11 @@ object RedlineNative {
         val confidence: Float
     )
 
+    private const val BOKEH_STATS = 36
+
+    /** bokeh.h kBokehInheritNice. */
+    private const val INHERIT_NICE = -1000
+
     /** What [bokehRender] did: [applied] false with [reason] when gated (the still is untouched). */
     class BokehResult(v: FloatArray, val reason: String?) {
         val applied = v[0] > 0.5f
@@ -405,6 +416,31 @@ object RedlineNative {
         val bandsMs = v[13].toDouble()
         val totalMs = v[14].toDouble()
         val peakMb = v[15].toDouble()
+
+        /** B31.1 per-stage timings (ms) and where the render ran. */
+        val stagesMs: Map<String, Double> = linkedMapOf(
+            "guide" to v[16].toDouble(),
+            "guided_filter" to v[17].toDouble(),
+            "upsample_masks" to v[18].toDouble(),
+            "tone_invert" to v[19].toDouble(),
+            "occluded_fill" to v[20].toDouble(),
+            "linearise" to v[21].toDouble(),
+            "layers_fill" to v[22].toDouble(),
+            "gather" to v[23].toDouble(),
+            "composite" to v[24].toDouble(),
+            "tone_reapply" to v[25].toDouble(),
+            "gain_map" to v[26].toDouble(),
+            "write_back" to v[27].toDouble()
+        )
+        val threads = v[28].toInt()
+        val workerNice = v[29].toInt()
+
+        /** CPUs the render ran on (ids). */
+        val cpus: List<Int> = (0 until 24).filter { (v[30].toInt() shr it) and 1 == 1 }
+        val bigCoresAvailable = v[31] > 0.5f
+        val front = v[32] > 0.5f
+        val callerNice = v[33].toInt()
+        val regions = v[34].toInt()
     }
 
     /**
@@ -418,7 +454,11 @@ object RedlineNative {
         tone: BokehTone,
         depth: BokehDepth,
         threads: Int = 1,
-        workMax: Int = 1024
+        workMax: Int = 1024,
+        /** B31.1: the worker pool's nice for this render (null: the calling thread's). */
+        nice: Int? = null,
+        /** B31.1: pin the workers (and the caller, for the render) to the cores above the little cluster. */
+        bigCores: Boolean = false
     ): BokehResult {
         check(load().loaded) { "native library not loaded: ${load().error}" }
         val lensV = floatArrayOf(
@@ -426,10 +466,10 @@ object RedlineNative {
             lens.farDistanceM, lens.maxCoc, depth.confidence
         )
         val toneV = floatArrayOf(tone.curveLo, tone.curveHi, tone.kneeEv, tone.slope)
-        val stats = FloatArray(16)
+        val stats = FloatArray(BOKEH_STATS)
         val err = nativeBokehRender(
             still, lensV, tone.curve, toneV, tone.gainLog2, tone.gainW, tone.gainH, depth.depth, depth.mask,
-            depth.confidenceMap, depth.width, depth.height, workMax, threads, stats, tone.gainOut
+            depth.confidenceMap, depth.width, depth.height, workMax, threads, stats, tone.gainOut, nice ?: INHERIT_NICE, bigCores
         )
         if (err != null && err.startsWith("skip: ")) return BokehResult(stats, err.removePrefix("skip: "))
         check(err == null) { "bokeh: $err" }
@@ -1013,7 +1053,9 @@ object RedlineNative {
         workMax: Int,
         threads: Int,
         stats: FloatArray,
-        gainOut: FloatArray?
+        gainOut: FloatArray?,
+        nice: Int,
+        bigCores: Boolean
     ): String?
 
     @JvmStatic
