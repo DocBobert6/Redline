@@ -89,6 +89,7 @@ class VideoController(private val context: Context, private val listener: Listen
     private var plan: TonemapPlan? = null
     private var streamSize: Dim? = null
     private var sensorOrientation = 90
+    private var afModes: List<Int> = emptyList()
     private var realtimeClock = false
     private var recorder: VideoRecorder? = null
     private var recordStartMs = 0L
@@ -153,6 +154,7 @@ class VideoController(private val context: Context, private val listener: Listen
             return
         }
         sensorOrientation = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toList().orEmpty()
         realtimeClock = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
         val modes = ch.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.toList().orEmpty()
         val tp = TonemapPlan.choose(modes, ch.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS))
@@ -343,7 +345,10 @@ class VideoController(private val context: Context, private val listener: Listen
 
     private fun applyRequest(b: CaptureRequest.Builder, setup: ViewfinderSetup, zoomRatio: Float) {
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(FPS, FPS))
-        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        // Only modes the camera lists (a fixed-focus camera keeps the template's AF mode).
+        if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO in afModes) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        }
         val tp = plan
         when (tp?.mode) {
             TonemapModes.CONTRAST_CURVE -> tp.curve?.let { c ->

@@ -1,12 +1,16 @@
 package com.redline.camera
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Intent
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
+import android.util.Log
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -14,10 +18,12 @@ import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.redline.camera.capability.Json
 import com.redline.camera.ui.MODE_VIDEO_TAG
 import com.redline.camera.ui.RECORD_TAG
 import com.redline.camera.ui.RECORD_TIMER_TAG
 import com.redline.camera.video.VideoReport
+import java.io.File
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -119,12 +125,28 @@ class VideoRecordTest {
         } finally {
             mmr.release()
         }
-        // What the emulator measured, for the CI log.
-        android.util.Log.i("RedlineVideoTest", r.toMap().toString())
+        // What the emulator measured, for the CI log ("Emulator measurements" prints Downloads/RedlineCI/*.json).
+        val json = Json.value(report().toMap() + mapOf("tracks_in_file" to mimes))
+        Log.i(TAG, "REDLINE_CI_VIDEO $json")
+        val f = File(context.cacheDir, "video.json").apply { writeText(json) }
+        runCatching { toDownloads(f, "redline_ci_video.json") }.onFailure { Log.w(TAG, "could not copy to Downloads", it) }
+    }
+
+    private fun toDownloads(f: File, name: String) {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/RedlineCI")
+        }
+        val r = context.contentResolver
+        r.delete(MediaStore.Downloads.EXTERNAL_CONTENT_URI, "${MediaStore.MediaColumns.DISPLAY_NAME}=?", arrayOf(name))
+        val uri = r.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("MediaStore insert failed")
+        r.openOutputStream(uri)!!.use { os -> f.inputStream().use { it.copyTo(os) } }
     }
 
     companion object {
         private const val TIMEOUT_MS = 30_000L
         private const val RECORD_MS = 3_200L
+        private const val TAG = "RedlineVideoCI"
     }
 }
