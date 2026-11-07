@@ -122,7 +122,9 @@ class DofStage(context: Context, val depth: DepthService) {
         /** B31.1: a stress run shot (B22 burst stress when true; with [keep] false and this false, the B13 run). */
         val stress: Boolean = false,
         /** B31.1: pin the bokeh workers to the cores above the little cluster. */
-        val bigCores: Boolean = true
+        val bigCores: Boolean = true,
+        /** B40: the tap is older than the current AF scene ([DofMath.tapStale]): not reused for the focus plane. */
+        val tapStale: Boolean = false
     )
 
     /** B31.1: what rewriting the saved photo in place did. */
@@ -371,7 +373,10 @@ class DofStage(context: Context, val depth: DepthService) {
             if (!maps.usable) {
                 return skip("low confidence (%.2f < 0.35)".format(maps.confidence), handled = true, open = true, extra = withDepth)
             }
-            val (point, fx, fy) = focusPoint(r.tap, maps)
+            val choice = DofMath.chooseFocus(r.tap, r.tapStale, maps.depth, maps.mask, maps.width, maps.height, r.focus)
+            val point = choice.point
+            val fx = choice.x
+            val fy = choice.y
             // The sharp render for re-edit (a copy; the bokeh works in place on the still).
             val copy = try {
                 r.still.copy(Bitmap.Config.ARGB_8888, false)
@@ -437,6 +442,10 @@ class DofStage(context: Context, val depth: DepthService) {
                 focusPoint = point,
                 focusX = fx,
                 focusY = fy,
+                tapXy = r.tap,
+                tapDepth = choice.tapDepth,
+                personDepth = choice.personDepth,
+                personGapDiag = choice.personGapDiag,
                 phoneEquivalentAperture = phoneN,
                 confidence = maps.confidence.toDouble(),
                 depthMs = maps.depthMs,
@@ -468,13 +477,6 @@ class DofStage(context: Context, val depth: DepthService) {
         if (o.windowOpen) working.decrementAndGet()
         val s = o.shot ?: return
         update { it.record(s.copy(shutterToSavedMs = shutterToSavedMs)) }
-    }
-
-    private fun focusPoint(tap: Pair<Double, Double>?, maps: DepthService.SyncDepth): Triple<String, Double, Double> {
-        if (tap != null) return Triple(DofMath.POINT_TAP, tap.first, tap.second)
-        val c = DofMath.personFocusPoint(maps.mask, maps.width, maps.height)
-        if (c != null) return Triple(DofMath.POINT_PERSON, c.first, c.second)
-        return Triple(DofMath.POINT_CENTRE, 0.5, 0.5)
     }
 
     private class GainIn(val values: FloatArray, val w: Int, val h: Int, val slope: Float)

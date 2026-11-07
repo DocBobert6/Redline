@@ -33,6 +33,44 @@ object DofMath {
     const val POINT_PERSON = "person_centroid"
     const val POINT_CENTRE = "centre"
 
+    /** B40: a tap just beside a person while the AF distance matches the person: the person region is the focus plane. */
+    const val POINT_TAP_SNAPPED = "tap_snapped_person"
+
+    /** B40: a tap older than the current AF scene, not reused: the person region instead. */
+    const val POINT_TAP_STALE_PERSON = "tap_stale_person"
+
+    /** B40: a person region whose nearest pixel is within this share of the frame diagonal of the tap can take it. */
+    const val SNAP_RADIUS_DIAG = 0.06
+
+    /** B40: the person's anchored depth is the median depth of its region's pixels within this share of the diagonal. */
+    const val SNAP_ANCHOR_DIAG = 0.12
+
+    /** B40: a region smaller than this share of the frame is mask noise, never a snap target. */
+    const val SNAP_MIN_REGION = 0.002
+
+    /**
+     * B40: the nominal depth scale for the AF comparison: diopters at the frame's nearest depth (the far end, the 2 %
+     * percentile, is infinity, as in the bokeh's anchoring). The relative depth has no metric scale of its own, so the
+     * comparison is in log diopters, where the scale only shifts both candidates alike except near the far end.
+     */
+    const val SNAP_NEAR_DIOPTERS = 1.0
+
+    /** B40: the floor (diopters, 50 m) of the comparison, so the far end and an infinity AF reading stay finite. */
+    const val SNAP_FLOOR_DIOPTERS = 0.02
+
+    /** The bokeh's far anchor percentile and focus window (bokeh.cpp kBgPct, kFocusWin). */
+    const val BG_PCT = 0.02
+    const val FOCUS_WIN = 0.02
+
+    /** B40: a plain tap older than this at the press is stale for DOF (the AF scene has moved on). */
+    const val TAP_STALE_MS = 8000L
+
+    /** B40: a plain tap is stale once the camera has panned this share of the scene-change reset threshold. */
+    const val TAP_STALE_PAN_SHARE = 0.5
+
+    /** B40: at most this many candidate pixels (nearest first) get the focus-window check. */
+    const val SNAP_MAX_CHECKS = 4000
+
     /** A person mask must cover at least this share of the frame for its centroid to be the focus point. */
     const val MIN_PERSON_COVERAGE = 0.02
 
@@ -216,5 +254,167 @@ object DofMath {
         }
         if (n < MIN_PERSON_COVERAGE * w * h || n == 0L) return null
         return (sx / n / w) to (sy / n / h)
+    }
+
+    /**
+     * B40: whether a tap is older than the current AF scene and must not be reused for DOF. A long-press ([locked], the
+     * photographer's AF lock) is never stale; a plain tap is stale when [ageMs] (press minus its AF cycle start) is over
+     * [TAP_STALE_MS], when the AF went back to scanning after the tap's cycle finished ([afRescanned]), or when the camera
+     * panned [TAP_STALE_PAN_SHARE] of the way to the scene_pan reset ([panShare]). A tap the scene_pan / scene_ev reset
+     * already cleared never reaches the still.
+     */
+    fun tapStale(ageMs: Long?, locked: Boolean, afRescanned: Boolean = false, panShare: Double = 0.0): Boolean {
+        if (locked) return false
+        if (afRescanned) return true
+        if (ageMs != null && ageMs > TAP_STALE_MS) return true
+        return panShare.isFinite() && panShare >= TAP_STALE_PAN_SHARE
+    }
+
+    /** B40: the focus point chosen for a still, with what the tap snap compared (null where it did not get that far). */
+    data class FocusChoice(
+        val point: String,
+        val x: Double,
+        val y: Double,
+        /** Relative depth (0..1, nearer is larger) at the tap and the person's anchored depth near it. */
+        val tapDepth: Double? = null,
+        val personDepth: Double? = null,
+        /** Nearest person pixel to the tap, as a share of the frame diagonal. */
+        val personGapDiag: Double? = null
+    )
+
+    /** The person mask's 4-connected regions of pixels >= 0.5 (pixel indices), in scan order. */
+    fun personRegions(mask: FloatArray, w: Int, h: Int): List<IntArray> {
+        val out = ArrayList<IntArray>()
+        val seen = BooleanArray(w * h)
+        val stack = IntArray(w * h)
+        for (start in 0 until w * h) {
+            if (mask[start] < 0.5f || seen[start]) continue
+            var top = 0
+            stack[top++] = start
+            seen[start] = true
+            val members = ArrayList<Int>()
+            while (top > 0) {
+                val i = stack[--top]
+                members.add(i)
+                val x = i % w
+                val y = i / w
+                if (x > 0 && !seen[i - 1] && mask[i - 1] >= 0.5f) {
+                    seen[i - 1] = true
+                    stack[top++] = i - 1
+                }
+                if (x < w - 1 && !seen[i + 1] && mask[i + 1] >= 0.5f) {
+                    seen[i + 1] = true
+                    stack[top++] = i + 1
+                }
+                if (y > 0 && !seen[i - w] && mask[i - w] >= 0.5f) {
+                    seen[i - w] = true
+                    stack[top++] = i - w
+                }
+                if (y < h - 1 && !seen[i + w] && mask[i + w] >= 0.5f) {
+                    seen[i + w] = true
+                    stack[top++] = i + w
+                }
+            }
+            out.add(members.toIntArray())
+        }
+        return out
+    }
+
+    /** Median of a window of [FOCUS_WIN] x the long side around ([fx], [fy]), as the bokeh samples its focus depth. */
+    fun windowMedian(m: FloatArray, w: Int, h: Int, fx: Double, fy: Double): Double {
+        var r = max(1, Math.round(FOCUS_WIN * max(w, h)).toInt())
+        r = minOf(r, (w - 1) / 2, (h - 1) / 2)
+        val cx = Math.floor(fx * w).toInt().coerceIn(r, w - 1 - r)
+        val cy = Math.floor(fy * h).toInt().coerceIn(r, h - 1 - r)
+        val win = ArrayList<Float>()
+        for (y in cy - r..cy + r) for (x in cx - r..cx + r) win.add(m[y * w + x])
+        win.sort()
+        return win[(win.size - 1) / 2].toDouble()
+    }
+
+    private fun percentile(v: FloatArray, n: Int, q: Double): Double {
+        val c = v.copyOf(n)
+        c.sort()
+        return c[(q * (n - 1)).toInt().coerceIn(0, n - 1)].toDouble()
+    }
+
+    /** Relative depth (nearer larger) to the nominal diopters of the AF comparison ([SNAP_NEAR_DIOPTERS] at [near]). */
+    private fun nominalDiopters(r: Double, far: Double, near: Double): Double =
+        max((r - far) / max(near - far, 1e-3), 0.0) * SNAP_NEAR_DIOPTERS
+
+    /**
+     * B40: the focus point for a still. No tap: the person ([personFocusPoint]), else the centre. A [stale] tap is not
+     * reused: the person, else the tap after all (it still anchors the AF distance better than the centre).
+     *
+     * A fresh tap off the person snaps to the person when a person region's nearest pixel is within [SNAP_RADIUS_DIAG]
+     * of the frame diagonal of it AND the AF distance ([focus], LENS_FOCUS_DISTANCE) is closer to the person's anchored
+     * depth (the median depth of the region's pixels within [SNAP_ANCHOR_DIAG] of the tap) than to the depth at the tap
+     * (the bokeh's own window median): the AF followed the person and the tap landed beside them (a moving subject, a
+     * near miss), and anchoring the AF distance at the tap would put the plane on the background. Compared in log
+     * diopters on the bokeh's own anchoring (the 2 % far percentile at infinity), with the nominal scale
+     * [SNAP_NEAR_DIOPTERS]. Without a usable AF distance (the hyperfocal default) the tap is kept. The snapped point is
+     * the region pixel nearest the tap whose focus window is on the person and whose depth is the anchored depth, so the
+     * bokeh's own sample (and its person protection) lands on the person.
+     */
+    fun chooseFocus(
+        tap: Pair<Double, Double>?,
+        stale: Boolean,
+        depth: FloatArray?,
+        mask: FloatArray?,
+        w: Int,
+        h: Int,
+        focus: FocusDistance?
+    ): FocusChoice {
+        val person = personFocusPoint(mask, w, h)
+        if (tap == null || stale) {
+            if (person != null) return FocusChoice(if (tap == null) POINT_PERSON else POINT_TAP_STALE_PERSON, person.first, person.second)
+            if (tap != null) return FocusChoice(POINT_TAP, tap.first, tap.second)
+            return FocusChoice(POINT_CENTRE, 0.5, 0.5)
+        }
+        val keep = FocusChoice(POINT_TAP, tap.first, tap.second)
+        if (depth == null || mask == null || w < 3 || h < 3 || depth.size < w * h || mask.size < w * h) return keep
+        val tx = Math.floor(tap.first * w).toInt().coerceIn(0, w - 1)
+        val ty = Math.floor(tap.second * h).toInt().coerceIn(0, h - 1)
+        val diag = Math.hypot(w.toDouble(), h.toDouble())
+        val rTap = windowMedian(depth, w, h, tap.first, tap.second)
+        if (mask[ty * w + tx] >= 0.5f) return keep.copy(tapDepth = rTap, personGapDiag = 0.0)
+        var region: IntArray? = null
+        var gap = Double.MAX_VALUE
+        for (reg in personRegions(mask, w, h)) {
+            if (reg.size < SNAP_MIN_REGION * w * h) continue
+            for (i in reg) {
+                val d = Math.hypot(i % w - tx.toDouble(), i / w - ty.toDouble())
+                if (d < gap) {
+                    gap = d
+                    region = reg
+                }
+            }
+        }
+        val reg = region ?: return keep.copy(tapDepth = rTap)
+        val gapDiag = gap / diag
+        if (gapDiag > SNAP_RADIUS_DIAG) return keep.copy(tapDepth = rTap, personGapDiag = gapDiag)
+        val near = reg.filter { Math.hypot(it % w - tx.toDouble(), it / w - ty.toDouble()) <= SNAP_ANCHOR_DIAG * diag }
+        val vals = near.map { depth[it] }.sorted()
+        val rPerson = vals[(vals.size - 1) / 2].toDouble()
+        val compared = keep.copy(tapDepth = rTap, personDepth = rPerson, personGapDiag = gapDiag)
+        val af = focus?.diopters
+        if (focus == null || focus.source == SOURCE_HYPERFOCAL || af == null || !af.isFinite() || af <= 0.0) return compared
+        val n = w * h
+        val far = percentile(depth, n, BG_PCT)
+        val nearest = percentile(depth, n, 1.0 - BG_PCT)
+        val lnAf = ln(max(af, SNAP_FLOOR_DIOPTERS))
+        val dPerson = abs(lnAf - ln(max(nominalDiopters(rPerson, far, nearest), SNAP_FLOOR_DIOPTERS)))
+        val dTap = abs(lnAf - ln(max(nominalDiopters(rTap, far, nearest), SNAP_FLOOR_DIOPTERS)))
+        if (dPerson >= dTap) return compared
+        // the snapped point: on the person (its focus window's mask median), at the anchored depth, nearest the tap
+        val tol = 0.05
+        val dist = { i: Int -> Math.hypot(i % w - tx.toDouble(), i / w - ty.toDouble()) }
+        val cands = reg.filter { abs(depth[it] - rPerson) <= tol }.sortedBy(dist)
+        val pick = cands.asSequence().take(SNAP_MAX_CHECKS).firstOrNull { i ->
+            val px = (i % w + 0.5) / w
+            val py = (i / w + 0.5) / h
+            windowMedian(mask, w, h, px, py) >= 0.5 && abs(windowMedian(depth, w, h, px, py) - rPerson) <= tol
+        } ?: cands.firstOrNull() ?: near.minBy(dist)
+        return compared.copy(point = POINT_TAP_SNAPPED, x = (pick % w + 0.5) / w, y = (pick / w + 0.5) / h)
     }
 }

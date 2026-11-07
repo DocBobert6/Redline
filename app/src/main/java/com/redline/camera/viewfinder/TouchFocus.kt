@@ -486,6 +486,9 @@ class SceneChange(
         if (radPerSec > panRateRadPerSec) panRad += radPerSec * min(dtSec, 0.5)
         return panRad > panFraction * hfovRad
     }
+
+    /** B40: how far deliberate panning since the tap has gone toward the reset (1 = the reset), 0 without a field of view. */
+    fun panShare(hfovRad: Double): Double = if (hfovRad > 0) panRad / (panFraction * hfovRad) else 0.0
 }
 
 /**

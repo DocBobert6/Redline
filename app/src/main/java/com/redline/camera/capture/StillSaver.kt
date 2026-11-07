@@ -81,6 +81,8 @@ class StillShot(
     val releaseRaw: (keep: ByteBuffer?) -> Unit = {},
     /** B24b: the tapped region (frame-normalised, sensor orientation) the render meters with, or null (no tap). */
     val meterRegion: NormRect? = null,
+    /** B40: the tap is older than the current AF scene (DofMath.tapStale): DOF focuses on the person instead. */
+    val tapStale: Boolean = false,
     /** B25: the formats this shot is saved in (effective settings); null = B24 behaviour (JPEG, DNG per [saveDng]). */
     val formats: SaveSettings.Effective? = null,
     /** B25: the DNG's samples are the burst merge's, x this factor (1 = a camera frame). */
@@ -591,7 +593,8 @@ class StillSaver(context: Context, private val version: String, private val pipe
             threads = DofStage.MAX_THREADS,
             nice = WorkerGovernor.IDLE_NICE,
             lowMemory = false,
-            stress = shot.stress
+            stress = shot.stress,
+            tapStale = shot.tapStale
         )
     }
 
