@@ -720,9 +720,53 @@ def box_sum(img: np.ndarray, q: int) -> np.ndarray:
     return pad.reshape(hq, q, wq, q, c).sum(axis=(1, 3))
 
 
+def nearest_fill(cells: np.ndarray) -> np.ndarray:
+    """B40: [H, W, 5] cell sums (C r g b, W, N) -> [H, W, 3] mean non-front colour, an empty cell (W = 0) taking its
+    nearest non-empty cell's: two-pass chamfer propagation of the nearest source (exact squared cell distances, strict
+    improvement only, fixed neighbour order), as bokeh.cpp does. The B31.1 push-pull blended every cell with its coarser
+    levels by the non-front share, so behind a front edge it pulled in colour from far away (a bright wall beyond a
+    mid-grey door) and lit a rim brighter than both the subject and the background beside it."""
+    ch, cw = cells.shape[:2]
+    src = np.where(cells[..., 3].reshape(-1) > 0, np.arange(ch * cw), -1)
+
+    def d2(i: int, j: int) -> int:
+        dx, dy = i % cw - j % cw, i // cw - j // cw
+        return dx * dx + dy * dy
+
+    def relax(i: int, nx: int, ny: int) -> None:
+        if nx < 0 or ny < 0 or nx >= cw or ny >= ch:
+            return
+        c = src[ny * cw + nx]
+        if c < 0:
+            return
+        if src[i] < 0 or d2(i, c) < d2(i, src[i]):
+            src[i] = c
+
+    for y in range(ch):
+        for x in range(cw):
+            i = y * cw + x
+            relax(i, x - 1, y)
+            relax(i, x - 1, y - 1)
+            relax(i, x, y - 1)
+            relax(i, x + 1, y - 1)
+    for y in range(ch - 1, -1, -1):
+        for x in range(cw - 1, -1, -1):
+            i = y * cw + x
+            relax(i, x + 1, y)
+            relax(i, x + 1, y + 1)
+            relax(i, x, y + 1)
+            relax(i, x - 1, y + 1)
+    flat = cells.reshape(-1, 5)
+    out = np.zeros((ch * cw, 3))
+    ok = src >= 0
+    out[ok] = flat[src[ok], :3] / flat[src[ok], 3:4]
+    return out.reshape(ch, cw, 3)
+
+
 def rear_fill(x: np.ndarray, front: np.ndarray, rho: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """B31.1: the occluded background behind front pixels (push-pull of the non-front pixels' linear colour), and the
-    share of non-front pixels near each pixel (the pyramid level whose cell is about the pixel's blur radius): a front
+    """B31.1: the occluded background behind front pixels (B40: each empty 8 x 8 cell takes its nearest non-empty
+    cell's mean non-front linear colour, see nearest_fill), and the share of non-front pixels near each pixel (the
+    pyramid level whose cell is about the pixel's blur radius): a front
     pixel with no non-front content within its blur is inside a front object, and nothing behind shows through it."""
     h, w = front.shape
     m = (~front).astype(np.float64)[..., None]
@@ -731,14 +775,7 @@ def rear_fill(x: np.ndarray, front: np.ndarray, rho: np.ndarray) -> tuple[np.nda
     while lv.shape[0] > 1 or lv.shape[1] > 1:
         lv = box_sum(lv, 2)
         levels.append(lv)
-    top = levels[-1]
-    v = np.where(top[..., 3:4] > 0, top[..., :3] / np.maximum(top[..., 3:4], 1e-12), 0.0)
-    for lv in reversed(levels[:-1]):
-        hl, wl = lv.shape[:2]
-        up = up_bilinear(v, 2, wl, hl)
-        a = lv[..., 3:4] / lv[..., 4:5]
-        mean = np.where(lv[..., 3:4] > 0, lv[..., :3] / np.maximum(lv[..., 3:4], 1e-12), 0.0)
-        v = a * mean + (1.0 - a) * up
+    v = nearest_fill(levels[0])
     rear = up_bilinear(v, REAR_Q, w, h)
     sel = np.clip(np.floor(np.log2(np.maximum(np.abs(rho), 1.0) / REAR_Q) + 0.5), 0, len(levels) - 1).astype(int)
     near = np.zeros((h, w))

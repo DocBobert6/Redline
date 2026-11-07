@@ -4,6 +4,9 @@
 
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- B40: video sound; asked at the first recording, and video records without audio when it is refused. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Optional quirks-table refresh from the repository (B11); never required to start. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- B30: LiteRT's merged manifest asks for these; Redline runs depth in-process only. -->

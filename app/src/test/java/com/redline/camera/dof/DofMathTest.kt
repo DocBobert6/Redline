@@ -210,4 +210,74 @@ class DofMathTest {
         assertEquals("depth engine not ready", DofReport.skipKey("depth engine not ready (warming up)"))
         assertEquals("bokeh error", DofReport.skipKey("bokeh error: IllegalStateException: x"))
     }
+
+    // B40: a 60 x 40 scene: background at relative depth 0.05, a person (mask 1) at 0.8 in columns 30..44.
+    private val sw = 60
+    private val sh = 40
+    private val sceneDepth = FloatArray(sw * sh) { i -> if (i % sw in 30..44) 0.8f else 0.05f }
+    private val sceneMask = FloatArray(sw * sh) { i -> if (i % sw in 30..44) 1f else 0f }
+
+    private fun af(diopters: Float) = DofMath.focusDistance(diopters, 2, 50.0, 2.8)
+
+    @Test
+    fun tapOnPersonIsKept() {
+        val c = DofMath.chooseFocus(0.6 to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0.8f))
+        assertEquals(DofMath.POINT_TAP, c.point)
+        assertEquals(0.6, c.x, 1e-9)
+        assertEquals(0.5, c.y, 1e-9)
+    }
+
+    @Test
+    fun tapJustBesidePersonSnapsWhenAfMatchesPerson() {
+        // tap 2 px left of the person (2 / 72 of the diagonal), on the background; AF at 1.25 m, the person's distance
+        val c = DofMath.chooseFocus(28.5 / sw to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0.8f))
+        assertEquals(DofMath.POINT_TAP_SNAPPED, c.point)
+        assertTrue(c.x * sw >= 30 && c.x * sw <= 45)
+        assertEquals(0.5, c.y, 0.05)
+        assertEquals(0.8, c.personDepth!!, 1e-6)
+        assertEquals(0.05, c.tapDepth!!, 1e-6)
+        // the bokeh's own sample at the snapped point is on the person and at its depth
+        assertEquals(1.0, DofMath.windowMedian(sceneMask, sw, sh, c.x, c.y), 1e-9)
+        assertEquals(0.8, DofMath.windowMedian(sceneDepth, sw, sh, c.x, c.y), 1e-6)
+    }
+
+    @Test
+    fun tapOnBackgroundWithAfOnBackgroundIsKept() {
+        // far from the person: never a snap candidate
+        val far = DofMath.chooseFocus(0.1 to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0.03f))
+        assertEquals(DofMath.POINT_TAP, far.point)
+        assertEquals(0.1, far.x, 1e-9)
+        // just beside the person, but the AF reads the background's distance (33 m): the tap was meant
+        val beside = DofMath.chooseFocus(28.5 / sw to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0.03f))
+        assertEquals(DofMath.POINT_TAP, beside.point)
+        assertEquals(28.5 / sw, beside.x, 1e-9)
+        // beside the person without an AF distance (hyperfocal default): kept
+        val noAf = DofMath.chooseFocus(28.5 / sw to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0f))
+        assertEquals(DofMath.POINT_TAP, noAf.point)
+        // just outside the snap radius (6 % of the diagonal = 4.3 px): kept even with AF on the person
+        val wide = DofMath.chooseFocus(25.0 / sw to 0.5, false, sceneDepth, sceneMask, sw, sh, af(0.8f))
+        assertEquals(DofMath.POINT_TAP, wide.point)
+    }
+
+    @Test
+    fun staleTapFallsBackToPerson() {
+        val c = DofMath.chooseFocus(0.1 to 0.5, true, sceneDepth, sceneMask, sw, sh, af(0.03f))
+        assertEquals(DofMath.POINT_TAP_STALE_PERSON, c.point)
+        assertTrue(c.x * sw >= 30 && c.x * sw <= 45)
+        // no person: the stale tap is still better than the centre
+        val none = DofMath.chooseFocus(0.1 to 0.5, true, sceneDepth, FloatArray(sw * sh), sw, sh, af(0.03f))
+        assertEquals(DofMath.POINT_TAP, none.point)
+        // no tap: the person, as before
+        assertEquals(DofMath.POINT_PERSON, DofMath.chooseFocus(null, false, sceneDepth, sceneMask, sw, sh, af(0.8f)).point)
+    }
+
+    @Test
+    fun tapStaleness() {
+        assertTrue(!DofMath.tapStale(2000L, locked = false))
+        assertTrue(DofMath.tapStale(DofMath.TAP_STALE_MS + 1, locked = false))
+        assertTrue(!DofMath.tapStale(60_000L, locked = true))
+        assertTrue(DofMath.tapStale(500L, locked = false, afRescanned = true))
+        assertTrue(DofMath.tapStale(500L, locked = false, panShare = 0.6))
+        assertTrue(!DofMath.tapStale(500L, locked = false, panShare = 0.3))
+    }
 }

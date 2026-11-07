@@ -70,6 +70,7 @@ import com.redline.camera.capture.identitySet
 import com.redline.camera.colour.ColourMath
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.depth.DepthService
+import com.redline.camera.dof.DofMath
 import com.redline.camera.dof.DofStage
 import com.redline.camera.manual.ManualApplied
 import com.redline.camera.manual.ManualCaps
@@ -526,7 +527,9 @@ class ViewfinderController(
         /** B23: the 50/70 mm super-resolution decision (null when it does not apply). */
         val superRes: SuperResDecision? = null,
         /** B24b: the tapped region at the press (the render meters with it), or null. */
-        val meterRegion: NormRect? = null
+        val meterRegion: NormRect? = null,
+        /** B40: the tap is older than the current AF scene at the press (DofMath.tapStale): DOF does not reuse it. */
+        val tapStale: Boolean = false
     ) {
         /** Sensor timestamp of the camera-JPEG frame (matches its JPEG image). */
         var timestamp: Long? = null
@@ -1231,7 +1234,15 @@ class ViewfinderController(
             queuedBehind = inFlight,
             timeline = timeline,
             superRes = srDecision.takeIf { it.applies },
-            meterRegion = touch.region
+            meterRegion = touch.region,
+            tapStale = touch.region != null &&
+                DofMath.tapStale(
+                    ageMs = q.atMs - touch.tapAtMs,
+                    locked = touch.locked,
+                    afRescanned = touch.mode.let { it == TouchMode.FOCUSED || it == TouchMode.NOT_FOCUSED } &&
+                        touch.lastAfState == AfState.SCANNING,
+                    panShare = scene.panShare(stopHfovRad())
+                )
         )
         if (q.memoryWaitSinceMs != null) {
             handler.removeCallbacks(memoryWatchdog)
@@ -1823,6 +1834,7 @@ class ViewfinderController(
             release = { buffers.releaseAll() },
             releaseRaw = { k -> buffers.releaseExcept(k) },
             meterRegion = p.meterRegion,
+            tapStale = p.tapStale,
             formats = saveFormats,
             dngScale = dngScale,
             dngSourceLabel = if (saveFormats?.dngSource == DngSource.MERGE && dngScale == 1f && burst == null) {

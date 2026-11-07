@@ -10,6 +10,7 @@ import com.redline.camera.depth.HardwareDepth
 import com.redline.camera.dof.DofReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualReport
+import com.redline.camera.video.VideoReport
 import com.redline.camera.viewfinder.TouchFocusReport
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
@@ -54,7 +55,9 @@ data class CapabilityState(
     /** B30 depth sidecars: setting, engine (delegate, self-check), per-shot stage timings, confidence, skips. */
     val depth: DepthReport = DepthReport(),
     /** B31 simulated depth of field: setting, aperture, per-shot applied/skip, depth/bokeh ms, preview fps during the work. */
-    val dof: DofReport = DofReport()
+    val dof: DofReport = DofReport(),
+    /** B40 video: setting, session size/fps, codec/bitrate, tonemap, GPU chain timing and gate, recordings, errors. */
+    val video: VideoReport = VideoReport()
 ) {
     fun effectiveCombos(): List<ComboResult> = DebugOverrides.applyCombos(combos.orEmpty(), forced)
 
@@ -94,6 +97,7 @@ object CapabilityReport {
         out["save_formats"] = state.saveFormats.toMap()
         out["depth"] = state.depth.copy(hardware = state.depth.hardware ?: HardwareDepth.of(profile)).toMap()
         out["dof"] = state.dof.toMap()
+        out["video"] = state.video.toMap()
         if (state.forced.isNotEmpty()) out["forced_failures"] = state.forced.sorted()
         return out
     }

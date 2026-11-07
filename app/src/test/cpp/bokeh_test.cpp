@@ -1,7 +1,7 @@
 // B31 simulated depth of field, host tests: the PLAN 19.5 blur table (model and rendered discs), kernel shape
 // (circular wide open, 9 blades stopped down, cat's-eye widths toward the corners), longitudinal CA only at 70 mm f/2.8,
 // a synthetic scene (sharp subject edge without halo, background blurred, highlights brighter than a gamma-space blur,
-// HDR continuation), guided-filter edge alignment, gating, RGBA vs float, band/thread independence, and timings.
+// HDR continuation), no light halo at a blurred near subject's edge (B40), guided-filter edge alignment, gating, RGBA vs float, band/thread independence, and timings.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -762,6 +762,72 @@ void testForegroundSpread() {
     check(at(edge + 3) < 0.75, "the occluded background shows through the foreground's fringe");
 }
 
+// B40: a dark near subject, strongly blurred, over a sharp mid-grey background (the focus plane behind it). [wall]: the
+// frame beyond the grey also holds a bright wall (top and right), at least 40 px from the subject's lower-left edge.
+std::vector<float> haloRender(bool wall, int focal, bool& ok) {
+    const float lo = -14, hi = 1;
+    const std::vector<float> tt = toneTable(256, lo, hi);
+    const redline::BokehTone t = tone(tt, lo, hi);
+    const int w = 360, h = 240, dw = 60, dh = 40, cx = 170, cy = 120;
+    auto inSubj = [&](double x, double y) { return std::pow((x - cx) / 60.0, 2) + std::pow((y - cy) / 80.0, 2) < 1; };
+    std::vector<float> img(static_cast<std::size_t>(w) * h * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            float v = (wall && (y < cy - 10 || x > cx + 20)) ? 1.0f : 0.5f;
+            if (inSubj(x, y)) v = 0.08f;
+            for (int c = 0; c < 3; ++c) img[(static_cast<std::size_t>(y) * w + x) * 3 + c] = v;
+        }
+    std::vector<float> depth(static_cast<std::size_t>(dw) * dh), mask(depth.size());
+    for (int y = 0; y < dh; ++y)
+        for (int x = 0; x < dw; ++x) {
+            const bool s = inSubj((x + 0.5) / dw * w, (y + 0.5) / dh * h);
+            depth[static_cast<std::size_t>(y) * dw + x] = s ? 1.0f : 0.2f;
+            mask[static_cast<std::size_t>(y) * dw + x] = s ? 1.0f : 0.0f;
+        }
+    redline::BokehDepth d;
+    d.depth = depth.data();
+    d.mask = mask.data();
+    d.width = dw;
+    d.height = dh;
+    d.confidence = 0.9f;
+    redline::BokehParams p;
+    p.focalMm = static_cast<float>(focal);
+    p.aperture = 2.8f;
+    p.focusM = 8.0f;
+    p.focusX = 0.03f;
+    p.focusY = 0.97f;
+    p.phoneN = 20.0f;
+    p.threads = 2;
+    redline::BokehStats st;
+    const std::string err = redline::bokehRenderFloat(img.data(), w, h, static_cast<std::size_t>(w) * 3, t, d, p, st);
+    ok = err.empty() && st.applied && st.front;
+    return img;
+}
+
+void testNoHalo() {
+    const int w = 360, h = 240, cx = 170, cy = 120;
+    for (int focal : {35, 50, 70}) {
+        bool ok1 = false, ok2 = false;
+        const std::vector<float> grey = haloRender(false, focal, ok1);
+        const std::vector<float> wall = haloRender(true, focal, ok2);
+        check(ok1 && ok2, "halo scenes render with a front layer at " + std::to_string(focal) + " mm");
+        // two tones: nothing brighter than the brighter of the subject (0.08) and the background (0.5)
+        float mx = 0;
+        for (float v : grey) mx = std::max(mx, v);
+        // the grey side (lower left, >= 40 px from the wall): the wall far away does not change the subject's edge there
+        double diff = 0;
+        for (int y = cy + 30; y < h; ++y)
+            for (int x = 0; x < cx - 30; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    const std::size_t i = (static_cast<std::size_t>(y) * w + x) * 3 + c;
+                    diff = std::max(diff, std::fabs(static_cast<double>(wall[i]) - grey[i]));
+                }
+        std::printf("halo %d mm: two-tone max %.4f, grey-side change from a far bright wall %.4f\n", focal, static_cast<double>(mx), diff);
+        check(mx <= 0.5f + 1.0f / 255.0f, "no rim brighter than both a dark blurred subject and the sharp grey behind it");
+        check(diff < 0.005, "the occluded fill behind a front edge comes from the nearest background, not a far bright wall");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -773,6 +839,7 @@ int main(int argc, char** argv) {
     testGuided();
     testSeamChroma();
     testForegroundSpread();
+    testNoHalo();
     if (!quick) {
         timing(4000, 2667);
         timing(3000, 2000);

@@ -165,3 +165,36 @@ def test_native_parity(tmp_path, focal, n, fx, work, with_gain) -> None:
     assert np.abs(map_n - rho_w.ravel()).max() < 1e-3 * max(1.0, ref.stats["cap"])
     err = np.abs(res - ref.image)
     assert err.max() < 2e-3, float(err.max())
+
+
+def halo_scene(wall: bool):
+    """B40: a dark near subject over a sharp mid-grey background (focus behind it); [wall]: a bright wall beyond the
+    grey (top and right), at least 40 px from the subject's lower-left edge."""
+    h, w = 240, 360
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = 170, 120
+    subj = ((xx - cx) / 60.0) ** 2 + ((yy - cy) / 80.0) ** 2 < 1
+    img = np.full((h, w, 3), 0.5)
+    if wall:
+        img[(yy < cy - 10) | (xx > cx + 20)] = 1.0
+    img[subj] = 0.08
+    dy, dx = np.mgrid[0:40, 0:60]
+    sd = (((dx + 0.5) / 60 * w - cx) / 60.0) ** 2 + (((dy + 0.5) / 40 * h - cy) / 80.0) ** 2 < 1
+    depth = np.where(sd, 1.0, 0.2).astype(np.float32)
+    return img.astype(np.float32), depth, sd.astype(np.float32), (xx < cx - 30) & (yy > cy + 30)
+
+
+@pytest.mark.parametrize("focal", [35, 50, 70])
+def test_no_halo_at_blurred_subject_edge(focal: int) -> None:
+    t = tone_curve()
+    p = bk.Params(focal, 2.8, 8.0, 0.03, 0.97, phone_n=20.0, confidence=0.9)
+    img, depth, mask, grey_side = halo_scene(False)
+    g = bk.render(img, depth, mask, t, p)
+    assert g.applied and g.stats["front"]
+    # two tones: no rim brighter than both the subject and the background
+    assert g.image.max() <= 0.5 + 1 / 255
+    # the occluded fill comes from the nearest background: a far bright wall leaves the grey side unchanged
+    img2, _, _, _ = halo_scene(True)
+    r = bk.render(img2, depth, mask, t, p)
+    assert np.abs(r.image - g.image)[grey_side].max() < 0.005
+

@@ -2,6 +2,7 @@ package com.redline.camera.ui
 
 import android.content.res.Configuration
 import android.os.Build
+import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.TextureView
 import androidx.compose.animation.core.Animatable
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LocalContentColor
@@ -37,8 +39,10 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,12 +63,14 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.redline.camera.capability.Dim
 import com.redline.camera.dof.DofMath
+import com.redline.camera.video.VideoTimer
 import com.redline.camera.viewfinder.PreviewTextureView
 import com.redline.camera.viewfinder.ViewfinderMetrics
 import com.redline.camera.viewfinder.ZoomPlan
 import com.redline.camera.viewfinder.ZoomStop
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 const val VIEWFINDER_TAG = "viewfinder"
@@ -150,8 +156,25 @@ fun ViewfinderScreen(
     /** B31: the simulated aperture (dial f/2.8-f/22 in 1/3 stops), or null to hide the dial; [dofOn] greys it when off. */
     aperture: Float? = null,
     dofOn: Boolean = true,
-    onApertureStep: (Int) -> Unit = {}
+    onApertureStep: (Int) -> Unit = {},
+    /** B40: video mode is offered (setting on, a session size exists); [videoMode] switches the viewfinder to 16:9 video. */
+    videoAvailable: Boolean = false,
+    videoMode: Boolean = false,
+    onToggleVideoMode: () -> Unit = {},
+    /** B40: the record button is live (video session streaming); [recordingSinceMs] (elapsedRealtime) runs the timer. */
+    recordEnabled: Boolean = false,
+    recordingSinceMs: Long? = null,
+    onRecord: () -> Unit = {},
+    videoNote: String? = null
 ) {
+    val recording = recordingSinceMs != null
+    var nowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(recordingSinceMs) {
+        while (recordingSinceMs != null) {
+            nowMs = SystemClock.elapsedRealtime()
+            delay(TIMER_TICK_MS)
+        }
+    }
     val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
     val view = LocalView.current
     val flash = remember { Animatable(0f) }
@@ -174,7 +197,7 @@ fun ViewfinderScreen(
                 Box(
                     modifier = Modifier
                         .align(Alignment.Center)
-                        .aspectRatio(if (portrait) 2f / 3f else 3f / 2f)
+                        .aspectRatio(frameAspect(portrait, videoMode))
                         .clipToBounds()
                         .then(
                             if (onTapFrame != null) {
@@ -217,6 +240,17 @@ fun ViewfinderScreen(
                             ).padding(6.dp).background(Scrim).padding(2.dp).testTag(LOOK_BADGE_TAG)
                         )
                     }
+                    if (recording) {
+                        Text(
+                            "● REC " + VideoTimer.label(nowMs - (recordingSinceMs ?: nowMs)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Accent,
+                            modifier = Modifier.align(
+                                Alignment.TopCenter
+                            ).padding(6.dp).background(Scrim).padding(4.dp).testTag(RECORD_TIMER_TAG)
+                        )
+                    }
                     if (status != null || needsPermission) {
                         Column(
                             modifier = Modifier.align(Alignment.Center).padding(16.dp),
@@ -253,58 +287,131 @@ fun ViewfinderScreen(
                     shutterRefused?.let {
                         Text(it, fontSize = 12.sp, color = Accent, modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp))
                     }
-                    ManualBar(manualUi, manualActions, modifier = Modifier.fillMaxWidth())
+                    videoNote?.let {
+                        Text(
+                            it,
+                            fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().background(Scrim).padding(4.dp).testTag(VIDEO_NOTE_TAG)
+                        )
+                    }
+                    if (videoAvailable) ModeSwitch(videoMode, enabled = !recording, onToggle = onToggleVideoMode)
+                    if (!videoMode) ManualBar(manualUi, manualActions, modifier = Modifier.fillMaxWidth())
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (rawAvailable) {
+                        if (rawAvailable && !videoMode) {
                             OutlinedButton(onClick = onToggleRaw, modifier = Modifier.testTag(RAW_TOGGLE_TAG)) {
                                 Text(saveFormatLabel, color = if (rawOn) Accent else Color.White)
                             }
                         } else {
                             Spacer(modifier = Modifier.size(1.dp))
                         }
-                        Box(
-                            modifier = Modifier
-                                .size(72.dp)
-                                .scale(pulse.value)
-                                .clip(CircleShape)
-                                .background(
-                                    when {
-                                        !shutterEnabled -> Color.Gray
-                                        shutterBusy -> ShutterBusy
-                                        else -> Color.White
-                                    }
-                                )
-                                .border(4.dp, Accent, CircleShape)
-                                .clickable(enabled = shutterEnabled, onClick = onShutter)
-                                .testTag(SHUTTER_TAG),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (shutterBusy) {
-                                CircularProgressIndicator(
-                                    color = Accent,
-                                    strokeWidth = 3.dp,
-                                    modifier = Modifier.size(64.dp).testTag(SHUTTER_BUSY_TAG)
-                                )
-                            }
-                            if (shutterWaiting > 0) {
-                                Text("+$shutterWaiting", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        if (videoMode) {
+                            RecordButton(recording, recordEnabled, onRecord)
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(72.dp)
+                                    .scale(pulse.value)
+                                    .clip(CircleShape)
+                                    .background(
+                                        when {
+                                            !shutterEnabled -> Color.Gray
+                                            shutterBusy -> ShutterBusy
+                                            else -> Color.White
+                                        }
+                                    )
+                                    .border(4.dp, Accent, CircleShape)
+                                    .clickable(enabled = shutterEnabled, onClick = onShutter)
+                                    .testTag(SHUTTER_TAG),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (shutterBusy) {
+                                    CircularProgressIndicator(
+                                        color = Accent,
+                                        strokeWidth = 3.dp,
+                                        modifier = Modifier.size(64.dp).testTag(SHUTTER_BUSY_TAG)
+                                    )
+                                }
+                                if (shutterWaiting > 0) {
+                                    Text("+$shutterWaiting", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                                }
                             }
                         }
-                        if (aperture != null) {
+                        if (aperture != null && !videoMode) {
                             ApertureDial(aperture, dofOn, onApertureStep)
                         } else {
                             Spacer(modifier = Modifier.size(width = 88.dp, height = 1.dp))
                         }
                     }
-                    if (plan != null) {
+                    if (plan != null && !videoMode) {
                         ZoomRing(plan = plan, selected = selectedStop, onSelect = onSelectStop, modifier = Modifier.fillMaxWidth())
                     }
                 }
             }
+        }
+    }
+}
+
+const val RECORD_TAG = "record"
+const val RECORD_TIMER_TAG = "record_timer"
+const val MODE_PHOTO_TAG = "mode_photo"
+const val MODE_VIDEO_TAG = "mode_video"
+const val VIDEO_NOTE_TAG = "video_note"
+private const val TIMER_TICK_MS = 250L
+
+/** B40: 3:2 for stills (2:3 upright), 16:9 for video (9:16 upright). */
+fun frameAspect(portrait: Boolean, video: Boolean): Float = when {
+    video -> if (portrait) 9f / 16f else 16f / 9f
+    else -> if (portrait) 2f / 3f else 3f / 2f
+}
+
+/** B40: the PHOTO / VIDEO switch (locked while recording). */
+@Composable
+private fun ModeSwitch(video: Boolean, enabled: Boolean, onToggle: () -> Unit) {
+    Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.Center) {
+        Text(
+            "PHOTO",
+            fontSize = 13.sp,
+            fontWeight = if (!video) FontWeight.Bold else FontWeight.Normal,
+            color = if (!video) Accent else Color.White,
+            modifier = Modifier
+                .clickable(enabled = enabled && video, onClick = onToggle)
+                .padding(horizontal = 14.dp, vertical = 6.dp)
+                .testTag(MODE_PHOTO_TAG)
+        )
+        Text(
+            "VIDEO",
+            fontSize = 13.sp,
+            fontWeight = if (video) FontWeight.Bold else FontWeight.Normal,
+            color = if (video) Accent else Color.White,
+            modifier = Modifier
+                .clickable(enabled = enabled && !video, onClick = onToggle)
+                .padding(horizontal = 14.dp, vertical = 6.dp)
+                .testTag(MODE_VIDEO_TAG)
+        )
+    }
+}
+
+/** B40: the record button: a red dot to start, a red square while recording. */
+@Composable
+private fun RecordButton(recording: Boolean, enabled: Boolean, onRecord: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(72.dp)
+            .clip(CircleShape)
+            .background(Color.White)
+            .border(4.dp, if (enabled) Accent else Color.Gray, CircleShape)
+            .clickable(enabled = enabled, onClick = onRecord)
+            .testTag(RECORD_TAG),
+        contentAlignment = Alignment.Center
+    ) {
+        if (recording) {
+            Box(modifier = Modifier.size(28.dp).clip(RoundedCornerShape(4.dp)).background(Accent))
+        } else {
+            Box(modifier = Modifier.size(52.dp).clip(CircleShape).background(if (enabled) Accent else Color.Gray))
         }
     }
 }

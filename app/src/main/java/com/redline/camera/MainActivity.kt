@@ -91,6 +91,10 @@ import com.redline.camera.ui.ReeditScreen
 import com.redline.camera.ui.ReeditUi
 import com.redline.camera.ui.TouchBoxUi
 import com.redline.camera.ui.ViewfinderScreen
+import com.redline.camera.video.RecordingRecord
+import com.redline.camera.video.VideoController
+import com.redline.camera.video.VideoReport
+import com.redline.camera.video.VideoSizes
 import com.redline.camera.viewfinder.LookRenderSize
 import com.redline.camera.viewfinder.PreviewLoadReading
 import com.redline.camera.viewfinder.PreviewTextureView
@@ -320,6 +324,125 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // B40 video mode (main thread): the setting, the mode, the session size, the recording and its audio permission.
+    private lateinit var videoController: VideoController
+    private var videoSetting = VideoReport.DEFAULT_ON
+    private val videoMode = mutableStateOf(false)
+    private var videoOpen = false
+    private val videoStream = mutableStateOf<Dim?>(null)
+    private val recordingSince = mutableStateOf<Long?>(null)
+    private val videoNote = mutableStateOf<String?>(null)
+    private var audioAsked = false
+    private val clearVideoNote = Runnable { videoNote.value = null }
+
+    private val audioPermissionRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        updateVideo { it.copy(audioPermission = granted) }
+        startRecordingNow()
+    }
+
+    private val videoListener = object : VideoController.Listener {
+        override fun onReport(change: (VideoReport) -> VideoReport) = updateVideo(change)
+
+        override fun onStreaming(size: Dim?) {
+            runOnUiThread { videoStream.value = size }
+        }
+
+        override fun onRecording(startedAtMs: Long?) {
+            runOnUiThread { recordingSince.value = startedAtMs }
+        }
+
+        override fun onSaved(uri: android.net.Uri?, record: RecordingRecord) {
+            lastVideoUri = uri
+            val text = if (uri != null) {
+                "Saved ${record.durationMs / 1000.0} s to Movies/Redline${if (record.audio) "" else " (no sound)"}"
+            } else {
+                "Recording not saved: ${record.error}"
+            }
+            showVideoNote(text)
+        }
+
+        override fun onError(message: String) {
+            showVideoNote(message)
+        }
+    }
+
+    /** B40 instrumented test: the last saved recording and the report's video section. */
+    @Volatile var lastVideoUri: android.net.Uri? = null
+        private set
+
+    fun videoReportForTest(): VideoReport = state.value.video
+
+    private fun showVideoNote(text: String) {
+        runOnUiThread {
+            videoNote.value = text
+            mainHandler.removeCallbacks(clearVideoNote)
+            mainHandler.postDelayed(clearVideoNote, VIDEO_NOTE_MS)
+        }
+    }
+
+    private fun updateVideo(change: (VideoReport) -> VideoReport) {
+        update { s -> s.copy(video = change(s.video)) }
+    }
+
+    private fun videoAvailable(): Boolean = videoSetting && permissionGranted.value
+
+    private fun toggleVideoMode() {
+        if (recordingSince.value != null) return
+        videoMode.value = !videoMode.value && videoAvailable()
+        syncCamera()
+    }
+
+    private fun toggleVideoSetting() {
+        videoSetting = !videoSetting
+        prefs.edit { putBoolean(PREF_VIDEO, videoSetting) }
+        updateVideo { it.copy(userSetting = videoSetting) }
+        if (!videoSetting) videoMode.value = false
+    }
+
+    private fun pressRecord() {
+        if (recordingSince.value != null) {
+            videoController.stopRecording()
+            return
+        }
+        val granted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        updateVideo { it.copy(audioPermission = granted) }
+        if (!granted && !audioAsked) {
+            // Asked once per launch; refused means the video records without sound (reported).
+            audioAsked = true
+            audioPermissionRequest.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        startRecordingNow()
+    }
+
+    private fun startRecordingNow() {
+        if (!videoOpen || videoStream.value == null) return
+        videoController.startRecording(deviceDegrees, audio = true)
+    }
+
+    /** Camera thread: the stills' Standard look for video, the preview's 33^3 LUT and the fitted tone. */
+    private fun loadVideoLook(): Pair<CubeLut, DoubleArray> {
+        val native = RedlineNative.load()
+        check(native.loaded) { "native module not loaded (${native.error})" }
+        val lut = RedlineNative.parseCube(applicationContext.assets.open(LOOK_LUT_ASSET).use { it.readBytes() })
+        val tone = ColourPipeline.loadTone(
+            applicationContext.assets.open(ColourPipeline.TONE_ASSET).use {
+                it.readBytes()
+            }.toString(Charsets.UTF_8)
+        )
+        return lut to tone
+    }
+
+    /** The viewfinder render size for a video stream size (as [lookRenderSize]), from the view's size now. */
+    private fun videoRenderSizer(setup: ViewfinderSetup): (Dim) -> Dim {
+        val v = previewView
+        val w = v?.width ?: 0
+        val h = v?.height ?: 0
+        val rotation = (v as? PreviewTextureView)?.displayRotationDegrees() ?: 0
+        val sensor = setup.sensorOrientation
+        return { size -> LookRenderSize.choose(size, w, h, sensor, rotation) }
+    }
+
     private val permissionRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         awaitingPermission = false
         permissionGranted.value = granted
@@ -486,6 +609,8 @@ class MainActivity : ComponentActivity() {
         depthService.onChange = { r -> runOnUiThread { state.value = state.value.copy(depth = r) } }
         controller.setDepth(depthService, depthSetting)
         dofSetting = prefs.getBoolean(PREF_DOF, DofReport.DEFAULT_ON)
+        videoSetting = prefs.getBoolean(PREF_VIDEO, VideoReport.DEFAULT_ON)
+        videoController = VideoController(applicationContext, videoListener)
         dofAperture.floatValue = DofMath.snap(prefs.getFloat(PREF_DOF_APERTURE, DofMath.DEFAULT_APERTURE))
         dofStage = DofStage.shared(this)
         dofStage.setAperture(dofAperture.floatValue)
@@ -545,7 +670,8 @@ class MainActivity : ComponentActivity() {
                 detailSettings = detailSetting
             ),
             burst = BurstReport(userSetting = burstSetting),
-            superRes = SuperResReport(userSetting = superResSetting)
+            superRes = SuperResReport(userSetting = superResSetting),
+            video = VideoReport(userSetting = videoSetting)
         )
         colourWorker.execute {
             val prepared = colourPipeline.prepare()
@@ -737,6 +863,7 @@ class MainActivity : ComponentActivity() {
         // The renderer owns the camera's SurfaceTexture on the look path: release it once the camera has closed.
         controller.close().whenComplete { _, _ -> lookRenderer.release() }
         controller.release()
+        videoController.release()
         super.onDestroy()
     }
 
@@ -797,7 +924,7 @@ class MainActivity : ComponentActivity() {
                 plan = setup?.zoomPlan,
                 selectedStop = selectedStop.intValue,
                 onSelectStop = ::selectStop,
-                previewSize = setup?.previewSize,
+                previewSize = if (videoMode.value) videoStream.value ?: VideoSizes.UHD else setup?.previewSize,
                 sensorOrientation = setup?.sensorOrientation ?: DEFAULT_SENSOR_ORIENTATION,
                 textureListener = textureListener,
                 metrics = state.value.viewfinder,
@@ -830,12 +957,19 @@ class MainActivity : ComponentActivity() {
                 ),
                 manualActions = manualActions,
                 onPreviewView = { previewView = it },
-                lookBadge = if (state.value.lookPreview.active) LOOK_BADGE else null,
-                onTapFrame = if (setup?.touch?.enabled == true && streaming.value) ::tapFrame else null,
+                lookBadge = if (state.value.lookPreview.active && !videoMode.value) LOOK_BADGE else null,
+                onTapFrame = if (setup?.touch?.enabled == true && streaming.value && !videoMode.value) ::tapFrame else null,
                 touchBox = touchFocus.value?.let { touchBox(it) },
                 aperture = dofAperture.floatValue,
                 dofOn = state.value.dof.enabled,
-                onApertureStep = ::stepAperture
+                onApertureStep = ::stepAperture,
+                videoAvailable = videoAvailable(),
+                videoMode = videoMode.value,
+                onToggleVideoMode = ::toggleVideoMode,
+                recordEnabled = videoStream.value != null,
+                recordingSinceMs = recordingSince.value,
+                onRecord = ::pressRecord,
+                videoNote = videoNote.value
             )
         } else {
             CapabilityScreen(
@@ -868,6 +1002,7 @@ class MainActivity : ComponentActivity() {
                 onToggleSuperRes = if (state.value.superRes.available == true) ::toggleSuperRes else null,
                 onToggleDepth = ::toggleDepth,
                 onToggleDof = ::toggleDof,
+                onToggleVideo = if (recordingSince.value == null) ::toggleVideoSetting else null,
                 onOpenReedit = ::showReedit,
                 onRunBurstStress = if (state.value.burst.enabled && colourEnabled()) {
                     {
@@ -1371,7 +1506,17 @@ class MainActivity : ComponentActivity() {
             display != null &&
             setup != null &&
             !selfTestOwnsCamera
-        if (cameraOpen && (!base || openedWithLook != look)) {
+        // B40: video mode runs its own session; the stills controller and the look renderer let go of the camera and the view first.
+        val wantVideo = base && videoMode.value && videoAvailable()
+        if (videoOpen && !wantVideo) {
+            videoOpen = false
+            recordingSince.value = null
+            videoStream.value = null
+            lastClose = videoController.close()
+            lastClose.whenComplete { _, _ -> runOnUiThread { syncCamera() } }
+            return lastClose
+        }
+        if (cameraOpen && (!base || wantVideo || openedWithLook != look)) {
             cameraOpen = false
             streaming.value = false
             stressAbort = true
@@ -1381,6 +1526,20 @@ class MainActivity : ComponentActivity() {
             // Once closed, settle the renderer and reopen on the right path if the camera is still wanted.
             lastClose.whenComplete { _, _ -> runOnUiThread { syncCamera() } }
             return lastClose
+        }
+        if (wantVideo) {
+            if (lookAttach != Attach.NONE) {
+                syncRenderer(display, setup, look = false)
+                return CompletableFuture.completedFuture(Unit)
+            }
+            if (!videoOpen && lastDetach.isDone && lastClose.isDone && display != null && setup != null) {
+                videoOpen = true
+                updateLook { it.copy(active = false) }
+                if (status.value != null) status.value = null
+                val ratio = setup.zoomPlan.stop(selectedStop.intValue)?.zoomRatio ?: 1f
+                videoController.open(setup, display, ::loadVideoLook, ratio, videoRenderSizer(setup))
+            }
+            return CompletableFuture.completedFuture(Unit)
         }
         if (!cameraOpen) syncRenderer(display, setup, look)
         val target = when {
@@ -1949,6 +2108,8 @@ class MainActivity : ComponentActivity() {
         private const val PREF_DEPTH = "depth_enabled"
         private const val PREF_DOF = "dof_enabled"
         private const val PREF_DOF_APERTURE = "dof_aperture"
+        private const val PREF_VIDEO = "video_enabled"
+        private const val VIDEO_NOTE_MS = 4_000L
         private const val REEDIT_PREVIEW_PX = 1600
         private const val PREF_DETAIL_VIGNETTE = "detail_vignette"
         private const val PREF_DETAIL_SHARPEN = "detail_sharpen"
