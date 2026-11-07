@@ -204,4 +204,12 @@ class VideoConfigTest {
         assertNotNull(VideoReport(size = "1920x1080", fps = 30).summary())
         assertTrue(abs(12.0 - VideoReport.GATE_MS) < 1e-9)
     }
+
+    @Test
+    fun timerLabel() {
+        assertEquals("00:00", VideoTimer.label(-5))
+        assertEquals("00:03", VideoTimer.label(3999))
+        assertEquals("20:00", VideoTimer.label(1_200_000))
+        assertEquals("1:00:01", VideoTimer.label(3_601_000))
+    }
 }

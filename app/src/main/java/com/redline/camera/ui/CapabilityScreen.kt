@@ -38,6 +38,7 @@ import com.redline.camera.dof.DofReport
 import com.redline.camera.look.LookPreviewReport
 import com.redline.camera.manual.ManualCaps
 import com.redline.camera.manual.ManualMath
+import com.redline.camera.video.VideoReport
 
 @Composable
 fun CapabilityScreen(
@@ -61,6 +62,7 @@ fun CapabilityScreen(
     onToggleSuperRes: (() -> Unit)? = null,
     onToggleDepth: (() -> Unit)? = null,
     onToggleDof: (() -> Unit)? = null,
+    onToggleVideo: (() -> Unit)? = null,
     onOpenReedit: (() -> Unit)? = null,
     onRunBurstStress: (() -> Unit)? = null,
     onBack: (() -> Unit)? = null
@@ -221,6 +223,9 @@ fun CapabilityScreen(
                 }
                 item {
                     DepthCard(state.depth, onToggleDepth)
+                }
+                item {
+                    VideoCard(state.video, onToggleVideo)
                 }
                 item {
                     LookPreviewCard(state.lookPreview, onToggleLook, onCycleLookStrength)
@@ -545,6 +550,43 @@ private fun DepthCard(r: DepthReport, onToggle: (() -> Unit)?) {
         if (onToggle != null) {
             OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(DEPTH_TOGGLE_TAG)) {
                 Text("Turn depth ${if (r.enabled) "off" else "on"} (default on; runs after the photo is saved)")
+            }
+        }
+    }
+}
+
+const val VIDEO_SECTION_TITLE = "Video"
+const val VIDEO_TOGGLE_TAG = "video_toggle"
+const val VIDEO_STATUS_TAG = "video_status"
+
+/** B40: video on/off (default on), what the last session ran at, the chain timing gate and the recordings. */
+@Composable
+private fun VideoCard(r: VideoReport, onToggle: (() -> Unit)?) {
+    SectionCard(VIDEO_SECTION_TITLE) {
+        Text(r.summary(), modifier = Modifier.testTag(VIDEO_STATUS_TAG))
+        val lines = listOfNotNull(
+            r.encoder?.let { "Encoder $it${if (r.encoderHardware == true) " (hardware)" else ""}" },
+            r.tonemapNote?.let { "Tonemap ${r.tonemapMode}: $it (result: ${r.tonemapResultMode ?: "-"})" },
+            r.lookNote?.let { "Look: $it; intermediate ${r.intermediate ?: "-"}" },
+            r.chain?.let { c ->
+                "Chain ${c.framesMeasured} frames: p50 ${c.p50Ms?.let {
+                    "%.2f".format(it)
+                }} / p95 ${c.p95Ms?.let { "%.2f".format(it) }} / " +
+                    "max ${c.maxMs?.let { "%.2f".format(it) }} ms (gate <= ${VideoReport.GATE_MS} ms; ${r.timerMethod})"
+            },
+            r.audio?.let { "Audio: $it" },
+            if (r.recordings.isEmpty()) {
+                null
+            } else {
+                "Recordings: " +
+                    r.recordings.joinToString { "${it.durationMs / 1000.0} s, ${it.framesDropped} dropped" }
+            },
+            r.errors.lastOrNull()?.let { "Last error: $it" }
+        )
+        lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (onToggle != null) {
+            OutlinedButton(onClick = onToggle, modifier = Modifier.padding(top = 8.dp).testTag(VIDEO_TOGGLE_TAG)) {
+                Text("Turn video ${if (r.userSetting) "off" else "on"} (default on)")
             }
         }
     }

@@ -101,11 +101,17 @@ class VideoController(private val context: Context, private val listener: Listen
     val recording: Boolean get() = recorder != null
 
     /**
-     * Opens the camera in video mode. [lut] and [tone] are the stills' Standard look (the preview's LUT and the fitted tone);
-     * [displayOut] gives the viewfinder render size for a stream size.
+     * Opens the camera in video mode. [loadLook] (run on the camera thread) gives the stills' Standard look: the preview's
+     * 33^3 LUT and the fitted tone. [displayOut] gives the viewfinder render size for a stream size.
      */
-    fun open(setup: ViewfinderSetup, display: SurfaceTexture, lut: CubeLut, tone: DoubleArray, zoomRatio: Float, displayOut: (Dim) -> Dim) {
-        handler.post { openOnThread(setup, display, lut, tone, zoomRatio, displayOut) }
+    fun open(
+        setup: ViewfinderSetup,
+        display: SurfaceTexture,
+        loadLook: () -> Pair<CubeLut, DoubleArray>,
+        zoomRatio: Float,
+        displayOut: (Dim) -> Dim
+    ) {
+        handler.post { openOnThread(setup, display, loadLook, zoomRatio, displayOut) }
     }
 
     fun startRecording(deviceDegrees: Int, audio: Boolean) {
@@ -136,8 +142,7 @@ class VideoController(private val context: Context, private val listener: Listen
     private fun openOnThread(
         setup: ViewfinderSetup,
         display: SurfaceTexture,
-        lut: CubeLut,
-        tone: DoubleArray,
+        loadLook: () -> Pair<CubeLut, DoubleArray>,
         zoomRatio: Float,
         displayOut: (Dim) -> Dim
     ) {
@@ -182,6 +187,12 @@ class VideoController(private val context: Context, private val listener: Listen
             return
         }
         if (preparedPlan != tp) {
+            val (lut, tone) = try {
+                loadLook()
+            } catch (e: Exception) {
+                fail("look not loaded: ${e.message ?: e.javaClass.simpleName}")
+                return
+            }
             val gainEv = VideoExposure.gainEv(tone)
             val caps = try {
                 renderer.prepare(lut, tp, tone, gainEv).get(PREPARE_TIMEOUT_S, TimeUnit.SECONDS)

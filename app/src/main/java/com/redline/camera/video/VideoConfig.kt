@@ -349,3 +349,14 @@ object EncoderPick {
         return null
     }
 }
+
+/** The record timer: m:ss under an hour, h:mm:ss after. */
+object VideoTimer {
+    fun label(elapsedMs: Long): String {
+        val s = (elapsedMs.coerceAtLeast(0L) / 1000)
+        val h = s / 3600
+        val m = (s % 3600) / 60
+        val sec = s % 60
+        return if (h > 0) "%d:%02d:%02d".format(java.util.Locale.US, h, m, sec) else "%02d:%02d".format(java.util.Locale.US, m, sec)
+    }
+}
