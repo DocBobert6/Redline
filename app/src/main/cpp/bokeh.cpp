@@ -1188,8 +1188,8 @@ private:
         u[1] = behind ? up : dn;
     }
 
-    // B31.1: the occluded background behind front pixels (see rear_fill in the reference): push-pull of the non-front
-    // pixels' linear colour from 8 x 8 cells.
+    // B31.1: the occluded background behind front pixels (see rear_fill in the reference): the non-front pixels' linear
+    // colour from 8 x 8 cells, B40: each empty cell takes its nearest non-empty cell's (no longer a push-pull).
     void rearFill() {
         const int q = kRearQ;
         const int cw = (w_ + q - 1) / q, chh = (h_ + q - 1) / q;
@@ -1250,36 +1250,51 @@ private:
             nl.ay.planUp(nl.h, h_, q << li);
             nearLv_.push_back(std::move(nl));
         }
-        std::vector<float> v(3);
-        {
-            const double* t = lv.back().c.data();
-            for (int k = 0; k < 3; ++k) v[static_cast<std::size_t>(k)] = t[3] > 0 ? static_cast<float>(t[k] / t[3]) : 0.0f;
+        // B40: the hidden colour of a cell with no non-front pixel is the mean of the NEAREST cell that has some
+        // (two-pass chamfer propagation of the nearest source cell, exact squared distances, fixed scan order; see
+        // rear_fill in the reference). The B31.1 push-pull blended every cell with its coarser levels by the non-front
+        // share, so behind a front edge it pulled in colour from far away (a bright wall beyond a mid-grey door) and lit
+        // a rim brighter than both the subject and the background next to it.
+        const Lv& l0 = lv[0];
+        const int n0 = cw * chh;
+        std::vector<int> src(static_cast<std::size_t>(n0), -1);
+        for (int i = 0; i < n0; ++i)
+            if (l0.c[static_cast<std::size_t>(i) * 5 + 3] > 0) src[static_cast<std::size_t>(i)] = i;
+        const auto d2 = [&](int i, int j) {
+            const long dx = i % cw - j % cw, dy = i / cw - j / cw;
+            return dx * dx + dy * dy;
+        };
+        const auto relax = [&](int i, int nx, int ny) {
+            if (nx < 0 || ny < 0 || nx >= cw || ny >= chh) return;
+            const int c = src[static_cast<std::size_t>(ny) * cw + nx];
+            if (c < 0) return;
+            int& s = src[static_cast<std::size_t>(i)];
+            if (s < 0 || d2(i, c) < d2(i, s)) s = c;
+        };
+        for (int y = 0; y < chh; ++y)
+            for (int x = 0; x < cw; ++x) {
+                const int i = y * cw + x;
+                relax(i, x - 1, y);
+                relax(i, x - 1, y - 1);
+                relax(i, x, y - 1);
+                relax(i, x + 1, y - 1);
+            }
+        for (int y = chh - 1; y >= 0; --y)
+            for (int x = cw - 1; x >= 0; --x) {
+                const int i = y * cw + x;
+                relax(i, x + 1, y);
+                relax(i, x + 1, y + 1);
+                relax(i, x, y + 1);
+                relax(i, x - 1, y + 1);
+            }
+        std::vector<float> v(static_cast<std::size_t>(n0) * 3, 0.0f);
+        for (int i = 0; i < n0; ++i) {
+            const int s = src[static_cast<std::size_t>(i)];
+            if (s < 0) continue;
+            const double* c = l0.c.data() + static_cast<std::size_t>(s) * 5;
+            for (int k = 0; k < 3; ++k) v[static_cast<std::size_t>(i) * 3 + k] = static_cast<float>(c[k] / c[3]);
         }
-        int vw = 1, vh = 1;
-        for (int li = static_cast<int>(lv.size()) - 2; li >= 0; --li) {
-            const Lv& l = lv[static_cast<std::size_t>(li)];
-            Axis ax, ay;
-            ax.planUp(vw, l.w, 2);
-            ay.planUp(vh, l.h, 2);
-            std::vector<float> nv(static_cast<std::size_t>(l.w) * l.h * 3);
-            for (int y = 0; y < l.h; ++y)
-                for (int x = 0; x < l.w; ++x) {
-                    const double* c = l.c.data() + (static_cast<std::size_t>(y) * l.w + x) * 5;
-                    const double a = c[3] / c[4];
-                    for (int k = 0; k < 3; ++k) {
-                        const auto at = [&](int yy, int xx) { return v[(static_cast<std::size_t>(yy) * vw + xx) * 3 + k]; };
-                        const float wx = ax.w[static_cast<std::size_t>(x)], wy = ay.w[static_cast<std::size_t>(y)];
-                        const int x0 = ax.i0[static_cast<std::size_t>(x)], x1 = ax.i1[static_cast<std::size_t>(x)];
-                        const int y0 = ay.i0[static_cast<std::size_t>(y)], y1 = ay.i1[static_cast<std::size_t>(y)];
-                        const double up = (at(y0, x0) * (1 - wx) + at(y0, x1) * wx) * (1 - wy) + (at(y1, x0) * (1 - wx) + at(y1, x1) * wx) * wy;
-                        const double mean = c[3] > 0 ? c[k] / c[3] : 0.0;
-                        nv[(static_cast<std::size_t>(y) * l.w + x) * 3 + k] = static_cast<float>(a * mean + (1.0 - a) * up);
-                    }
-                }
-            v.swap(nv);
-            vw = l.w;
-            vh = l.h;
-        }
+        const int vw = cw, vh = chh;
         rear_.swap(v);
         rearW_ = vw;
         rearH_ = vh;
