@@ -968,12 +968,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
 // RenderSpec table; gain: mean log2 HDR gain (gainW x gainH) or null. depth / mask / conf: depthW x depthH (mask, conf
 // nullable). gainOut (nullable, gainW x gainH): the gain map recomputed from the blurred result (written when applied
 // with the HDR continuation). stats (16 floats): applied, maxRadius, capRadius, rFocus, rBg, scale, phoneFactor, kmax, gathers,
-// onPerson, ca, mapMs, levelsMs, bandsMs, totalMs, peak MB. Returns null when rendered, "skip: <reason>" when gated
-// (the still untouched), else the error.
+// onPerson, ca, mapMs, levelsMs, bandsMs, totalMs, peak MB; B31.1 (36 floats): stage ms (guide, guided filter,
+// upsample + masks, tone invert, occluded fill, linearise, fill, gather, composite, tone re-apply, gain map, write
+// back), threads, worker nice, CPU mask (24 bits), big cores available, front, caller nice, regions, 0. nice: the
+// worker pool's nice (-1000: the caller's); bigCores: pin to the cores above the little cluster. Returns null when
+// rendered, "skip: <reason>" when gated (the still untouched), else the error.
 extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_RedlineNative_nativeBokehRender(
     JNIEnv* env, jclass, jobject bitmap, jfloatArray lens, jfloatArray curve, jfloatArray tone, jfloatArray gain, jint gainW, jint gainH,
     jfloatArray depth, jfloatArray mask, jfloatArray conf, jint depthW, jint depthH, jint workMax, jint threads, jfloatArray stats,
-    jfloatArray gainOut) {
+    jfloatArray gainOut, jint nice, jboolean bigCores) {
     const Floats ln(env, lens), cv(env, curve), tn(env, tone), gn(env, gain), dp(env, depth), mk(env, mask), cf(env, conf);
     if (ln.size() < 9 || tn.size() < 4 || cv.size() < 2) return env->NewStringUTF("lens, tone or curve mis-sized");
     const jsize dn = depthW * depthH;
@@ -983,7 +986,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     if (gain != nullptr && (gainW < 1 || gainH < 1 || gn.size() < gainW * gainH)) return env->NewStringUTF("gain map mis-sized");
     if (gainOut != nullptr && (gain == nullptr || env->GetArrayLength(gainOut) < gainW * gainH)) return env->NewStringUTF("gain out mis-sized");
     std::vector<float> gOut(gainOut != nullptr ? static_cast<std::size_t>(gainW) * static_cast<std::size_t>(gainH) : 0);
-    if (stats == nullptr || env->GetArrayLength(stats) < 16) return env->NewStringUTF("stats needs 16 floats");
+    if (stats == nullptr || env->GetArrayLength(stats) < 36) return env->NewStringUTF("stats needs 36 floats");
     AndroidBitmapInfo info{};
     if (bitmap == nullptr || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
         info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
@@ -1001,6 +1004,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     p.maxCoc = l[7];
     p.workMax = workMax > 0 ? workMax : p.workMax;
     p.threads = threads;
+    p.nice = nice;
+    p.bigCores = bigCores == JNI_TRUE;
     redline::BokehTone t;
     t.curve = cv.get();
     t.curvePoints = cv.size();
@@ -1031,11 +1036,19 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_redline_camera_nativebridge_Redlin
     AndroidBitmap_unlockPixels(env, bitmap);
     if (!err.empty()) return env->NewStringUTF(err.c_str());
     if (gainOut != nullptr && st.applied) env->SetFloatArrayRegion(gainOut, 0, static_cast<jsize>(gOut.size()), gOut.data());
-    const jfloat v[16] = {st.applied ? 1.0f : 0.0f, st.maxRadius, st.capRadius, st.rFocus, st.rBg, st.scale, st.phoneFactor,
+    const jfloat v[36] = {st.applied ? 1.0f : 0.0f, st.maxRadius, st.capRadius, st.rFocus, st.rBg, st.scale, st.phoneFactor,
                           static_cast<jfloat>(st.kmax), static_cast<jfloat>(st.layers), st.onPerson ? 1.0f : 0.0f, st.ca ? 1.0f : 0.0f,
                           static_cast<jfloat>(st.mapMs), static_cast<jfloat>(st.levelsMs), static_cast<jfloat>(st.bandsMs),
-                          static_cast<jfloat>(st.totalMs), static_cast<jfloat>(st.peakBytes / 1e6)};
-    env->SetFloatArrayRegion(stats, 0, 16, v);
+                          static_cast<jfloat>(st.totalMs), static_cast<jfloat>(st.peakBytes / 1e6),
+                          // B31.1: stage timings, threads, worker nice, CPUs, big cores, front, caller nice, regions
+                          static_cast<jfloat>(st.guideMs), static_cast<jfloat>(st.guidedMs), static_cast<jfloat>(st.upsampleMs),
+                          static_cast<jfloat>(st.invertMs), static_cast<jfloat>(st.rearMs), static_cast<jfloat>(st.linMs),
+                          static_cast<jfloat>(st.fillMs), static_cast<jfloat>(st.gatherMs), static_cast<jfloat>(st.compositeMs),
+                          static_cast<jfloat>(st.toneMs), static_cast<jfloat>(st.gainMs), static_cast<jfloat>(st.storeMs),
+                          static_cast<jfloat>(st.threads), static_cast<jfloat>(st.workerNice),
+                          static_cast<jfloat>(st.cpuMask & 0xffffffu), st.bigCoresAvailable ? 1.0f : 0.0f, st.front ? 1.0f : 0.0f,
+                          static_cast<jfloat>(st.callerNice), static_cast<jfloat>(st.regions), 0.0f};
+    env->SetFloatArrayRegion(stats, 0, 36, v);
     if (!st.applied) return env->NewStringUTF(("skip: " + st.reason).c_str());
     return nullptr;
 }

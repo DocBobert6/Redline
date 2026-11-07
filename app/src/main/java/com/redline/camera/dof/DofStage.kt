@@ -14,25 +14,32 @@ import com.redline.camera.capability.Json
 import com.redline.camera.capability.JsonParse
 import com.redline.camera.capture.CaptureMath
 import com.redline.camera.capture.SaveSettings
+import com.redline.camera.capture.WorkerGovernor
 import com.redline.camera.colour.ColourPipeline
 import com.redline.camera.depth.DepthPng
 import com.redline.camera.depth.DepthService
 import com.redline.camera.nativebridge.RedlineNative
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.channels.FileChannel
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * B31: simulated depth of field on the save path, and re-edit after capture.
+ * B31: simulated depth of field, and re-edit after capture.
  *
- * [apply] runs on the store lane on a RAW-rendered still before it is encoded: depth for this shot synchronously on the
- * [DepthService] engine (never compiled or queued for: not ready or busy = the still is saved sharp, the reason
- * recorded), a copy of the sharp render handed to the io thread (files/dof/<base>.sharp.jpg, q95, with the lens and tone
- * in <base>.dof.json, pruned with the depth sidecars), then [RedlineNative.bokehRender] in place. The Ultra HDR gain map
- * is recomputed by the bokeh from the blurred linear result (the same HDR continuation that made the highlights bloom),
- * so the HDR rendition matches the blurred base; it is re-encoded with the B25 headroom rules.
+ * B31.1: DOF is off the shutter-to-saved path. The store lane saves the sharp photo exactly as without DOF, then hands
+ * the rendered still to [enqueue]: a bounded background queue ([DofReport.QUEUE_CAPACITY] waiting; a full queue leaves
+ * the shot sharp, recorded) on its own thread, which waits until the capture pipeline is idle (rapid fire: the queue
+ * drains after the run), then runs [apply] (depth on the [DepthService] lane, the sharp copy for re-edit, the bokeh in
+ * place, the Ultra HDR gain map recomputed from the blurred linear result) and rewrites the same MediaStore item in place
+ * ([Job.replace]). The bokeh runs at the throttle nice ([VF_NICE], [VF_THREADS] threads) while the viewfinder is showing,
+ * else at [WorkerGovernor.IDLE_NICE] with [MAX_THREADS]; its workers are pinned to the cores above the little cluster.
+ * Queued shots beyond the first keep their pixels in an app-private spill file instead of memory.
  *
- * Every failure degrades to a sharp still from our own render (never the camera JPEG). Rapid fire (shots queued behind
- * this one) and memory pressure skip DOF for the shot rather than delay it.
+ * Every failure leaves the sharp photo (our own render, never the camera JPEG) in place.
  */
 class DofStage(context: Context, val depth: DepthService) {
     private val app = context.applicationContext
@@ -50,6 +57,24 @@ class DofStage(context: Context, val depth: DepthService) {
     val report: DofReport get() = synchronized(lock) { state }
 
     @Volatile var onChange: ((DofReport) -> Unit)? = null
+
+    /** B31.1: the capture pipeline has shots capturing or saving (the queue waits for it to go idle). */
+    @Volatile var pipelineBusy: () -> Boolean = { false }
+
+    /** B31.1: the viewfinder is showing (the bokeh runs at the throttle budget). */
+    @Volatile var viewfinderActive: () -> Boolean = { false }
+
+    /** B31.1: the system reports low memory (a job then leaves its shot sharp). */
+    @Volatile var lowMemory: () -> Boolean = { false }
+
+    private val queueLock = Any()
+    private val waiting = ArrayDeque<Job>()
+    private var running = false
+    private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "redline-dof").apply { isDaemon = true } }
+    private val spiller = Executors.newSingleThreadExecutor { r -> Thread(r, "redline-dof-spill").apply { isDaemon = true } }
+    private val spillDir = File(app.cacheDir, SPILL_DIR)
+
+    @Volatile private var jobFpsMin: Double? = null
 
     /** How long the save path waits for this shot's depth (the engine's GPU run is ~160 ms on the baseline phone). */
     @Volatile var syncTimeoutMs: Long = DepthService.SYNC_TIMEOUT_MS
@@ -70,11 +95,14 @@ class DofStage(context: Context, val depth: DepthService) {
 
     /** A preview fps reading: kept (as the window minimum) only while DOF work runs. */
     fun previewFps(v: Double) {
-        if (busy) update { it.fps(v) }
+        if (busy) {
+            jobFpsMin = jobFpsMin?.let { minOf(it, v) } ?: v
+            update { it.fps(v) }
+        }
     }
 
     /** What the save path knows about the shot. */
-    class Request(
+    data class Request(
         val still: Bitmap,
         /** Clockwise degrees to upright (the JPEG orientation). */
         val rotation: Int,
@@ -89,11 +117,215 @@ class DofStage(context: Context, val depth: DepthService) {
         val hdr: ColourPipeline.HdrMap?,
         val threads: Int,
         val nice: Int,
-        /** Shots queued behind this one (presses waiting, capturing or saving). */
-        val queuedBehind: Int,
         val lowMemory: Boolean,
-        val aperture: Float? = null
+        val aperture: Float? = null,
+        /** B31.1: a stress run shot (B22 burst stress when true; with [keep] false and this false, the B13 run). */
+        val stress: Boolean = false,
+        /** B31.1: pin the bokeh workers to the cores above the little cluster. */
+        val bigCores: Boolean = true
     )
+
+    /** B31.1: what rewriting the saved photo in place did. */
+    class ReplaceResult(val ok: Boolean, val ms: Long, val error: String? = null)
+
+    /**
+     * B31.1: one shot for the background queue. [request]'s still is owned by the job from [enqueue] on (recycled
+     * when it is done). [replace] re-encodes the blurred still (with the recomputed gain map and the look tag
+     * suffix, e.g. "simulated DOF f/2.8") into the photo already saved. [sharpSaveMs]: its shutter-to-saved time, set
+     * by the store lane once known.
+     */
+    class Job(val request: Request, val shutterAtMs: Long, val replace: (Bitmap, ColourPipeline.HdrMap?, String) -> ReplaceResult) {
+        @Volatile var sharpSaveMs: Long? = null
+        internal val enqueuedAtMs = SystemClock.elapsedRealtime()
+
+        @Volatile internal var still: Bitmap? = request.still
+
+        @Volatile internal var spill: File? = null
+
+        @Volatile internal var spillDone: CountDownLatch? = null
+        internal val w = request.still.width
+        internal val h = request.still.height
+    }
+
+    /**
+     * B31.1: hands a saved shot to the background queue. True: the job owns [Job.request]'s still from now on. False:
+     * the queue is full ([DofReport.QUEUE_CAPACITY] waiting) or DOF is off; the shot stays sharp (recorded) and the
+     * caller keeps the still. Never blocks on DOF work.
+     */
+    fun enqueue(job: Job): Boolean {
+        if (!enabled) return false
+        val depthNow: Int
+        val spill: Boolean
+        synchronized(queueLock) {
+            if (waiting.size >= DofReport.QUEUE_CAPACITY) {
+                depthNow = -1
+                spill = false
+            } else {
+                spill = waiting.isNotEmpty() || running
+                waiting.addLast(job)
+                depthNow = waiting.size + if (running) 1 else 0
+            }
+        }
+        if (depthNow < 0) {
+            skip(job.request, "${DofReport.SKIP_QUEUE_FULL} (${DofReport.QUEUE_CAPACITY} waiting)", queued = false)
+            update { it.overflowed() }
+            return false
+        }
+        if (spill) spillAsync(job)
+        update { it.enqueued(depthNow) }
+        worker.execute { drainOne() }
+        return true
+    }
+
+    /** B31.1: records a shot that gets no DOF (sharp) with [reason]. */
+    fun skip(r: Request, reason: String, queued: Boolean = false, sharpSaveMs: Long? = null) {
+        update {
+            it.record(
+                DofShot(
+                    base = r.base,
+                    applied = false,
+                    reason = reason,
+                    aperture = r.aperture ?: aperture,
+                    focalMm = r.focalMm,
+                    focusDistanceM = r.focus.metres,
+                    focusSource = r.focus.source,
+                    phoneEquivalentAperture = r.phoneEquivalentAperture,
+                    queued = queued,
+                    shutterToSavedMs = sharpSaveMs
+                )
+            )
+        }
+    }
+
+    /** Jobs waiting or running. */
+    val queueDepth: Int get() = synchronized(queueLock) { waiting.size + if (running) 1 else 0 }
+
+    // The waiting job's pixels to an app-private file (the next jobs wait anyway); restored when it runs.
+    private fun spillAsync(job: Job) {
+        val latch = CountDownLatch(1)
+        job.spillDone = latch
+        runCatching {
+            spiller.execute {
+                try {
+                    runCatching { Process.setThreadPriority(SPILL_NICE) }
+                    val b = job.still ?: return@execute
+                    spillDir.mkdirs()
+                    val f = File(spillDir, "${job.request.base}.rgba")
+                    RandomAccessFile(f, "rw").use { raf ->
+                        val bytes = b.byteCount.toLong()
+                        raf.setLength(bytes)
+                        val map = raf.channel.map(FileChannel.MapMode.READ_WRITE, 0, bytes)
+                        b.copyPixelsToBuffer(map)
+                        map.force()
+                    }
+                    job.spill = f
+                    job.still = null
+                    b.recycle()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "DOF spill failed (kept in memory)", t)
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }.onFailure { latch.countDown() }
+    }
+
+    private fun restore(job: Job): Bitmap? {
+        job.spillDone?.await(SPILL_WAIT_MS, TimeUnit.MILLISECONDS)
+        job.still?.let { return it }
+        val f = job.spill ?: return null
+        return try {
+            val b = Bitmap.createBitmap(job.w, job.h, Bitmap.Config.ARGB_8888)
+            RandomAccessFile(f, "r").use { raf ->
+                val map = raf.channel.map(FileChannel.MapMode.READ_ONLY, 0, raf.length())
+                b.copyPixelsFromBuffer(map)
+            }
+            b
+        } catch (t: Throwable) {
+            Log.w(TAG, "DOF restore failed", t)
+            null
+        } finally {
+            f.delete()
+        }
+    }
+
+    private fun drainOne() {
+        val job = synchronized(queueLock) {
+            waiting.removeFirstOrNull()?.also { running = true }
+        } ?: return
+        try {
+            runJob(job)
+        } catch (t: Throwable) {
+            Log.w(TAG, "DOF job failed; the sharp photo stays", t)
+        } finally {
+            val d = synchronized(queueLock) {
+                running = false
+                waiting.size
+            }
+            update { it.depth(d) }
+        }
+    }
+
+    private fun runJob(job: Job) {
+        // rapid fire: run when the capture pipeline is idle (bounded wait, then at the throttle budget anyway)
+        val w0 = SystemClock.elapsedRealtime()
+        while (runCatching { pipelineBusy() }.getOrDefault(false) && SystemClock.elapsedRealtime() - w0 < MAX_IDLE_WAIT_MS) {
+            Thread.sleep(IDLE_POLL_MS)
+        }
+        val startedAt = SystemClock.elapsedRealtime()
+        val still = restore(job)
+        if (still == null) {
+            skip(job.request, "${DofReport.SKIP_ERROR}: queued pixels lost", queued = true, sharpSaveMs = job.sharpSaveMs)
+            return
+        }
+        try {
+            if (!enabled) {
+                skip(job.request, "DOF turned off before it ran", queued = true, sharpSaveMs = job.sharpSaveMs)
+                return
+            }
+            val vf = runCatching { viewfinderActive() }.getOrDefault(true)
+            val r = job.request.copy(
+                still = still,
+                threads = if (vf) VF_THREADS else MAX_THREADS,
+                nice = if (vf) VF_NICE else WorkerGovernor.IDLE_NICE,
+                lowMemory = runCatching { lowMemory() }.getOrDefault(false)
+            )
+            jobFpsMin = null
+            val out = apply(r)
+            var shot = out.shot ?: return
+            if (shot.applied) {
+                val label = DofMath.label(shot.aperture)
+                val rr = try {
+                    job.replace(still, out.hdr, "simulated DOF $label")
+                } catch (t: Throwable) {
+                    ReplaceResult(false, 0, "${t.javaClass.simpleName}: ${t.message}")
+                }
+                shot = shot.copy(
+                    replaced = rr.ok,
+                    replaceMs = rr.ms,
+                    replaceError = rr.error,
+                    timeToFinalMs = if (rr.ok) SystemClock.elapsedRealtime() - job.shutterAtMs else null
+                )
+            } else if (!out.depthHandled && r.keep) {
+                // the sidecar for re-edit, as a shot without DOF gets it
+                runCatching { depth.submit(still, r.rotation, r.base) }
+            }
+            if (out.windowOpen) working.decrementAndGet()
+            update {
+                it.record(
+                    shot.copy(
+                        queued = true,
+                        queueWaitMs = startedAt - job.enqueuedAtMs,
+                        shutterToSavedMs = job.sharpSaveMs,
+                        viewfinderActive = vf,
+                        previewFpsMin = jobFpsMin
+                    )
+                )
+            }
+        } finally {
+            still.recycle()
+        }
+    }
 
     /** [shot] null when DOF is off; [hdr] the (possibly recomputed) gain map; [depthHandled] the sidecar is on its way. */
     class Outcome(val shot: DofShot?, val hdr: ColourPipeline.HdrMap?, val depthHandled: Boolean, internal val windowOpen: Boolean)
@@ -122,8 +354,7 @@ class DofStage(context: Context, val depth: DepthService) {
             open
         )
         when {
-            !r.keep -> return skip(DofReport.SKIP_NOT_KEPT)
-            r.queuedBehind > 0 -> return skip("${DofReport.SKIP_RAPID_FIRE} (${r.queuedBehind} queued)")
+            !r.keep -> return skip(DofReport.notKeptReason(r.stress))
             r.lowMemory -> return skip(DofReport.SKIP_MEMORY)
             r.tone == null -> return skip(DofReport.SKIP_NO_TONE)
             r.phoneEquivalentAperture == null -> return skip(DofReport.SKIP_NO_LENS)
@@ -171,7 +402,18 @@ class DofStage(context: Context, val depth: DepthService) {
             )
             val bd = RedlineNative.BokehDepth(maps.depth, maps.mask, maps.confidenceMap, maps.width, maps.height, maps.confidence)
             val b0 = SystemClock.elapsedRealtime()
-            val res = withNice(r.nice) { RedlineNative.bokehRender(r.still, lens, bt, bd, threads = r.threads, workMax = WORK_MAX) }
+            val res = withNice(r.nice) {
+                RedlineNative.bokehRender(
+                    r.still,
+                    lens,
+                    bt,
+                    bd,
+                    threads = r.threads,
+                    workMax = WORK_MAX,
+                    nice = r.nice,
+                    bigCores = r.bigCores
+                )
+            }
             val bokehMs = SystemClock.elapsedRealtime() - b0
             var hdr = r.hdr
             var gainNote: String? = if (r.hdr?.bytes == null) "no gain map" else null
@@ -205,7 +447,11 @@ class DofStage(context: Context, val depth: DepthService) {
                 nice = r.nice,
                 sharpCopy = copy != null,
                 gainMap = gainNote,
-                delegate = maps.delegate
+                delegate = maps.delegate,
+                stagesMs = if (res.applied) res.stagesMs.mapValues { Math.round(it.value) } else null,
+                cpus = res.cpus.takeIf { res.applied },
+                workerNice = res.workerNice.takeIf { res.applied },
+                bigCores = res.bigCoresAvailable && r.bigCores
             )
             return Outcome(shot, hdr, depthHandled = true, windowOpen = true)
         } catch (t: Throwable) {
@@ -214,7 +460,10 @@ class DofStage(context: Context, val depth: DepthService) {
         }
     }
 
-    /** Records the shot with its shutter-to-saved time and closes its preview-fps window. Never throws. */
+    /**
+     * Records the shot with its shutter-to-saved time and closes its preview-fps window, for a caller that ran [apply]
+     * itself (tests); the background queue records its own. Never throws.
+     */
     fun finish(o: Outcome, shutterToSavedMs: Long?) {
         if (o.windowOpen) working.decrementAndGet()
         val s = o.shot ?: return
@@ -223,7 +472,7 @@ class DofStage(context: Context, val depth: DepthService) {
 
     private fun focusPoint(tap: Pair<Double, Double>?, maps: DepthService.SyncDepth): Triple<String, Double, Double> {
         if (tap != null) return Triple(DofMath.POINT_TAP, tap.first, tap.second)
-        val c = DofMath.maskCentroid(maps.mask, maps.width, maps.height)
+        val c = DofMath.personFocusPoint(maps.mask, maps.width, maps.height)
         if (c != null) return Triple(DofMath.POINT_PERSON, c.first, c.second)
         return Triple(DofMath.POINT_CENTRE, 0.5, 0.5)
     }
@@ -346,7 +595,7 @@ class DofStage(context: Context, val depth: DepthService) {
                 )
                 val bd = RedlineNative.BokehDepth(png.channel(0), png.channel(1), png.channel(2), png.width, png.height, conf)
                 val b0 = SystemClock.elapsedRealtime()
-                val res = RedlineNative.bokehRender(still, lens, tone, bd, threads = threads, workMax = WORK_MAX)
+                val res = RedlineNative.bokehRender(still, lens, tone, bd, threads = threads, workMax = WORK_MAX, bigCores = true)
                 val bokehMs = SystemClock.elapsedRealtime() - b0
                 val rot = (m["rotation"] as? Number)?.toInt() ?: 0
                 val name = "${base}_${DofMath.label(n).replace("/", "").replace(".", "")}_${System.currentTimeMillis() % 100000}.jpg"
@@ -383,8 +632,19 @@ class DofStage(context: Context, val depth: DepthService) {
         /** The guided-filter / matte grid's long side (the bokeh core's default). */
         const val WORK_MAX = 1024
 
-        /** The DOF stage's own thread cap (the governor lowers it to 3 under load). */
+        /** The DOF stage's own thread cap (viewfinder hidden). */
         const val MAX_THREADS = 4
+
+        /** B31.1: the throttle budget while the viewfinder is showing (the preview's threads win every contended core). */
+        const val VF_THREADS = 3
+        const val VF_NICE = 10
+
+        /** B31.1: how long a queued job waits for the capture pipeline to go idle before it runs anyway. */
+        const val MAX_IDLE_WAIT_MS = 20_000L
+        const val IDLE_POLL_MS = 50L
+        private const val SPILL_DIR = "dof-queue"
+        private const val SPILL_NICE = 10
+        private const val SPILL_WAIT_MS = 30_000L
 
         @Volatile private var instance: DofStage? = null
 

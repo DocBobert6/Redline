@@ -86,20 +86,13 @@ class DofMathTest {
 
     @Test
     fun focusPointMapping() {
-        // The centre of the field of view is the centre of the still at any zoom.
-        val c = DofMath.focusInStill(0.5, 0.5, 4000, 3000, 1.4)
-        assertEquals(0.5, c.first, 1e-3)
-        assertEquals(0.5, c.second, 1e-3)
-        // 1x on 4:3: x is unchanged, y is stretched around the centre by the 3:2 crop (2667 of 3000 rows).
-        val p = DofMath.focusInStill(0.25, 0.4, 4000, 3000, 1.0)
-        val crop = com.redline.camera.colour.ColourMath.rawCrop(4000, 3000, 1.0)
-        assertEquals(0.25, p.first, 1e-3)
-        assertEquals((0.4 * 3000 - crop[1]) / crop[3], p.second, 1e-6)
-        assertEquals((0.4 * 3000 - 166.7) / 2666.7, p.second, 2e-3)
-        // Outside the crop: clamped.
-        assertEquals(0.0, DofMath.focusInStill(0.0, 0.0, 4000, 3000, 2.0).first, 1e-9)
+        // B31.1: the tap is a frame region (normalised in the stop's 3:2 frame = the still), so it maps as is at every
+        // zoom (alpha.1 pushed it through the zoomed RAW crop again: a tap at 0.25 landed at 0 at 50 mm).
+        assertEquals(0.25 to 0.4, DofMath.tapInStill(0.25, 0.4))
+        assertEquals(0.5 to 0.5, DofMath.tapInStill(0.5, 0.5))
+        assertEquals(0.0 to 1.0, DofMath.tapInStill(-0.1, 1.3))
         // Upright <-> still for every rotation.
-        for (rot in listOf(0, 90, 180, 270)) {
+        for (rot in listOf(0, 90, 180, 270, -90, 450)) {
             val (x, y) = DofMath.uprightToStill(0.2, 0.7, rot)
             val (u, v) = DofMath.stillToUpright(x, y, rot)
             assertEquals(0.2, u, 1e-12)
@@ -107,6 +100,69 @@ class DofMathTest {
         }
         // 90 degrees clockwise to upright: the still's top-left is the upright top-right.
         assertEquals(1.0 to 0.0, DofMath.stillToUpright(0.0, 0.0, 90))
+    }
+
+    /**
+     * B31.1: a re-edit tap on the upright picture lands on the same scene point in the still (and so in the depth map,
+     * which depth_post rotates back to the still's orientation: x = v, y = H - 1 - u at 90, etc.) for 90/180/270. A
+     * marker at still (0.1, 0.2) (a face near the still's top-left) is found where the upright picture shows it.
+     */
+    @Test
+    fun reeditTapFollowsTheRotation() {
+        val still = 0.1 to 0.2
+        val upright = mapOf(
+            90 to (0.8 to 0.1), // the still's left edge is the upright top (turned clockwise)
+            180 to (0.9 to 0.8),
+            270 to (0.2 to 0.9),
+            0 to (0.1 to 0.2)
+        )
+        for ((rot, uv) in upright) {
+            val (u, v) = DofMath.stillToUpright(still.first, still.second, rot)
+            assertEquals("rot $rot u", uv.first, u, 1e-12)
+            assertEquals("rot $rot v", uv.second, v, 1e-12)
+            val (x, y) = DofMath.uprightToStill(uv.first, uv.second, rot)
+            assertEquals("rot $rot x", still.first, x, 1e-12)
+            assertEquals("rot $rot y", still.second, y, 1e-12)
+        }
+        // The same convention as depth_post's uprightToSensor on a W x H still (pixel centres): upright (u, v) of the
+        // rotated picture -> still pixel.
+        val w = 30
+        val h = 20
+        for (rot in listOf(90, 180, 270)) {
+            val uw = if (rot == 180) w else h
+            val uh = if (rot == 180) h else w
+            for ((pu, pv) in listOf(3 to 4, 0 to 0, uw - 1 to uh - 1)) {
+                val (sx, sy) = when (rot) {
+                    90 -> pv to h - 1 - pu
+                    180 -> w - 1 - pu to h - 1 - pv
+                    else -> w - 1 - pv to pu
+                }
+                val (x, y) = DofMath.uprightToStill((pu + 0.5) / uw, (pv + 0.5) / uh, rot)
+                assertEquals("rot $rot x", (sx + 0.5) / w, x, 1e-9)
+                assertEquals("rot $rot y", (sy + 0.5) / h, y, 1e-9)
+            }
+        }
+    }
+
+    /** B31.1: no tap: the focus lands on the main person, never between two masked regions. */
+    @Test
+    fun personFocusPointStaysOnThePerson() {
+        val w = 60
+        val h = 40
+        val m = FloatArray(w * h)
+        // a child in the middle-left and a near adult leg along the right edge, both masked
+        for (y in 12 until 30) for (x in 14 until 30) m[y * w + x] = 1f
+        for (y in 0 until 40) for (x in 50 until 60) m[y * w + x] = 1f
+        val c = DofMath.maskCentroid(m, w, h)!!
+        val cx = (c.first * w).toInt()
+        val cy = (c.second * h).toInt()
+        assertTrue("the plain centroid falls between them", m[cy * w + cx] < 0.5f)
+        val p = DofMath.personFocusPoint(m, w, h)!!
+        val px = (p.first * w).toInt()
+        val py = (p.second * h).toInt()
+        assertTrue("on the mask", m[py * w + px] >= 0.5f)
+        assertTrue("on the central person", px in 14 until 30 && py in 12 until 30)
+        assertNull(DofMath.personFocusPoint(FloatArray(w * h), w, h))
     }
 
     @Test
